@@ -24,7 +24,7 @@ entry
 ReceiveCommand
 mainLoop                                
                                 mov         payloadAddr, addr
-                                mov         payloadSize, #4
+                                mov         payloadSize, #40
                                 call        #SendFinalAndReturn
 
                                 mov         cnt, cnt
@@ -42,35 +42,63 @@ pause               long    4_000_000
 
 
 
+
 { txSendBytes }
 { Helper routine  used to send bytes. It also updates the running F16 checksum. It assumes
     the tx pin is already an output. Bytes are sent from the hub.
-  This lowest bitPeriod supported by this routine is 61 clocks.
+  This lowest bitPeriod supported by this routine is 32 or 33 clocks (32 clocks requires that
+    the stopBitPeriod be a multiple of 2 to avoid worst case timing for hub reads).
   Usage:    mov     _txAddr, <hub address of bytes>
             mov     _txCount, <number to send != 0>
             call    #txSendBytes
-  Both _txAddr and _txCount are modified by txSendBytes. }
+  After retuning _txCount will be zero and _txAddr will point to the address immediately
+    after the last byte sent.
+}
 txSendBytes
-                                mov         cnt, cnt                            'get synced
+                                rdbyte      _txByte, _txAddr
+                                
+                                mov         cnt, cnt
                                 add         cnt, #9
-:txByteLoop                     waitcnt     cnt, bitPeriod                      'send start bit
-                                andn        outa, txMask                    
-                                rdbyte      _txByte, _txAddr                    'read next byte
-                                add         _txAddr, #1
-                                add         _txF16L, _txByte                    'calculate running F16
+
+:txByteLoop                     waitcnt     cnt, bitPeriod                      'start bit
+                                andn        outa, txMask
+
+                                add         _txF16L, _txByte                    'F16 calculation
                                 cmpsub      _txF16L, #255
                                 add         _txF16U, _txF16L
                                 cmpsub      _txF16U, #255
-                                mov         inb, #8
+
+                                shr         _txByte, #1                 wc
+                                waitcnt     cnt, bitPeriod                      'bit0
+                                muxc        outa, txMask
+
+                                mov         inb, #6
+                                add         _txAddr, #1
+
 :txBitLoop                      shr         _txByte, #1                 wc
-                                waitcnt     cnt, bitPeriod                      'send data bit
+                                waitcnt     cnt, bitPeriod                      'bits1-6
                                 muxc        outa, txMask
                                 djnz        inb, #:txBitLoop
-                                waitcnt     cnt, stopBitDuration                'send stop bit
+            
+                                shr         _txByte, #1                 wc
+                                
+                                waitcnt     cnt, bitPeriod                      'bit7
+                                muxc        outa, txMask
+
+                                rdbyte      _txNextByte, _txAddr
+
+                                waitcnt     cnt, stopBitDuration                'stop bit
                                 or          outa, txMask
+
+                                mov         _txByte, _txNextByte
+
                                 djnz        _txCount, #:txByteLoop
+
                                 waitcnt     cnt, #0                             'ensure line is high for a full stop bit duration
-txSendBytes_ret                 ret
+txSendBytes_ret                 ret 
+
+
+
 
 
 { Sending Routines 
@@ -161,9 +189,9 @@ txSendAndResetF16_ret           ret
 
 
 
-bitPeriod           long    694
+bitPeriod           long    32
 txMask              long    |< 30
-stopBitDuration     long    1041
+stopBitDuration     long    34
 maxPayloadSize      long    2047
 hubScratch          long    20000
 
@@ -177,6 +205,7 @@ _tmp            res
 _txAddr         res
 _txCount        res
 
+_txNextByte     res
 _txByte         res
 _txF16L         res
 _txF16U         res
