@@ -1,3 +1,11 @@
+{
+======================================
+PropCrow
+Version 0
+March 2018 - Chris Siedell
+http://siedell.com/projects/Crow
+======================================
+}
 
 con
     _clkmode = xtal1 + pll16x
@@ -54,6 +62,166 @@ mainLoop
 addr                long    60000 
 pause               long    4_000_000
 shortPause          long    1_000
+
+
+
+
+{ ReceiveCommand
+  This routine contains the receive loop used to receive and process bytes. Processing is done using
+    shifted parsing instructions, which are explained in more detail in the "Parsing Instructions" 
+    section below.
+  This routine supports a minimum bitPeriod of 33.
+  There are two exits from this routine: either to RecoveryMode when framing or parsing errors occur, or to
+    ReceiveCommandFinish when all bytes of a successfully* parsed packet have been received (this exit
+    occurs at rxStartWait, and is determined in the parsing group rxF16C1). (*There are few remaining
+    parsing steps performed in ReceiveCommandFinish to completely verify the packet's validity.)
+}
+ReceiveCommand
+                                { pre-loop initialization}
+                                mov         rxStartWait, rxContinue                 'loop until all bytes received
+                                movs        rxMovA, #rxFirstParsingGroup            'prepare shifted parsing code
+                                movs        rxMovB, #rxFirstParsingGroup+1
+                                movs        rxMovC, #rxFirstParsingGroup+2
+                                movs        rxMovD, #rxFirstParsingGroup+3
+                                mov         _rxResetOffset, #0
+                                mov         _rxWait0, startBitWait                  'prepare wait counter
+                                waitpne     rxMask, rxMask                          'wait for start bit edge
+                                add         _rxWait0, cnt
+                                waitcnt     _rxWait0, bitPeriod0                    'wait to sample start bit (for initial byte only)
+                                test        rxMask, ina                     wc      'c=1 framing error; c=0 continue, with parser reset
+                        if_c    jmp         #RecoveryMode
+
+                                { the receive loop -- c=0 reset parser}
+
+rxBit0                          waitcnt     _rxWait0, bitPeriod1
+                                testn       rxMask, ina                     wz
+                                muxz        _rxByte, #%0000_0001
+                                mov         _rxWait1, _rxWait0                      'Wait 2
+                                mov         _rxWait0, startBitWait                  'Wait 3
+                        if_nc   mov         _rxF16L, #0                             'F16 1 - see page 90
+                        if_c    add         _rxF16L, _rxPrevByte                    'F16 2
+
+rxBit1                          waitcnt     _rxWait1, bitPeriod0
+                                testn       rxMask, ina                     wz
+                                muxz        _rxByte, #%0000_0010
+                        if_c    cmpsub      _rxF16L, #255                           'F16 3
+                        if_nc   mov         _rxF16U, #0                             'F16 4
+                        if_c    add         _rxF16U, _rxF16L                        'F16 5
+                        if_c    cmpsub      _rxF16U, #255                           'F16 6
+
+rxBit2                          waitcnt     _rxWait1, bitPeriod1
+                                testn       rxMask, ina                     wz
+                                muxz        _rxByte, #%0000_0100
+                        if_nc   mov         _rxOffset, _rxResetOffset               'Shift 1 - go back to first parsing group on reset (see page 93)
+                                subs        _rxResetOffset, _rxOffset               'Shift 2 - adjust reset offset
+                                adds        rxMovA, _rxOffset                       'Shift 3 - (next four) offset addresses for next parsing group
+                                adds        rxMovB, _rxOffset                       'Shift 4
+
+rxBit3                          waitcnt     _rxWait1, bitPeriod0
+                                testn       rxMask, ina                     wz
+                                muxz        _rxByte, #%0000_1000
+                                adds        rxMovC, _rxOffset                       'Shift 5
+                                adds        rxMovD, _rxOffset                       'Shift 6
+                                mov         _rxOffset, #4                           'Shift 7 - restore default offset (must be done before shifted instructions)
+rxMovA                          mov         rxShiftedA, 0-0                         'Shift 8 - (next two) shift parsing instructions A and B into place
+
+rxBit4                          waitcnt     _rxWait1, bitPeriod1
+                                testn       rxMask, ina                     wz
+                                muxz        _rxByte, #%0001_0000
+rxMovB                          mov         rxShiftedB, 0-0                         'Shift 9
+                        if_nc   andn        _rxFlags, #Flag_WriteByte               'Write 1 - clear write flag on reset
+                                test        _rxFlags, #Flag_WriteByte       wc      'Write 2 - c=1 => write byte
+                        if_c    add         _rxAddr, #1                             'Write 3 - increment address (pre-increment by necessity)
+
+rxBit5                          waitcnt     _rxWait1, bitPeriod0
+                                testn       rxMask, ina                     wz
+                        if_c    wrbyte      _rxPrevByte, _rxAddr                    'Write 4 - wrbyte takes all five remaining slots
+
+rxBit6                          waitcnt     _rxWait1, bitPeriod1
+                                test        rxMask, ina                     wc
+                                muxz        _rxByte, #%0010_0000
+                                muxc        _rxByte, #%0100_0000
+                                sub         _rxCountdown, #1                wz      'Countdown - used by parsing code to determine when F16 follows payload bytes
+rxShiftedA                      long    0-0                                         'Shift 10 - (next two) the shifted parsing instructions A and B
+rxShiftedB                      long    0-0                                         'Shift 11
+
+rxBit7                          waitcnt     _rxWait1, bitPeriod0
+                                test        rxMask, ina                     wc
+                                muxc        _rxByte, #%1000_0000
+rxMovC                          mov         rxShiftedC, 0-0                         'Shift 12 - (next two) shift parsing instructions C and D into place
+rxMovD                          mov         rxShiftedD, 0-0                         'Shift 13
+rxShiftedC                      long    0-0                                         'Shift 14 - (next two) the shifted parsing instructions C and D
+rxShiftedD                      long    0-0                                         'Shift 15
+
+rxStopBit                       waitcnt     _rxWait1, bitPeriod0                    'see page 98
+                                testn       rxMask, ina                     wz      'z=0 framing error
+
+rxStartWait                     long    0-0                                         'wait for start bit, or exit loop
+                        if_z    add         _rxWait0, cnt                           'Wait 1
+
+rxStartBit              if_z    waitcnt     _rxWait0, bitPeriod0
+                        if_z    test        rxMask, ina                     wz      'z=0 framing error
+                        if_z    mov         phsb, _rxWait0                          'Timeout 1 - phsb used as scratch since ctrb should be off
+                        if_z    sub         phsb, _rxWait1                          'Timeout 2 - see page 98 for timeout notes
+                        if_z    cmp         phsb, timeout                   wc      'Timeout 3 - c=0 reset, c=1 no reset
+                        if_z    mov         _rxPrevByte, _rxByte                    'Handoff
+                        if_z    jmp         #rxBit0
+
+                    { fall through to recovery mode for framing errors }
+
+{ Parsing Instructions
+  There are four parsing instructions per received byte, labelled A-D. These instructions are shifted
+    into the receive loop at rxShiftedA-D. Each group must take four registers with no gaps between
+    them (use nops if necessary).
+  rxFirstParsingGroup identifies the first parsing group to be executed on parser reset.
+  Parsing groups are identified by the byte being received when they execute.
+  Instructions A and B are executed consecutively during the interval after bit[6] has been sampled, but
+    before bit[7] is sampled. Instructions C and D are executed consecutively after bit[7], but before
+    the stop bit. (This arrangement was found most conducive for parsing a Crow header.)
+  _rxOffset determines the parsing group to be executed for the next byte. It is automatically set to
+    four before instruction A, which means the default is to execute the following parsing group
+    during the next byte. Parsing code can change _rxOffset to change the next group (it is a signed
+    value, and should always be a multiple of four).
+  The Flag_WriteByte bit of _rxFlags determines whether the current byte will be written to the hub (this
+    actually occurs when the next byte is received). This flag is automatically cleared on parser
+    reset, and it must be manually set or cleared after that.
+  If Flag_WriteByte is set then the byte will be written to ++_rxAddr -- i.e. _rxAddr is automatically
+    incremented BEFORE writing the byte (_rxAddr is not changed unless the byte is written). This means
+    _rxAddr must initially be set to the desired address minus one. _rxAddr is undefined on parser reset.
+  Before instruction A, _rxCountdown is decremented and the z flag indicates whether the countdown is
+    zero. _rxCountdown is undefined on parser reset.
+  Before instruction A the c flag is set to bit[6]. Before instruction C the c flag is set to bit[7].
+  Parsing code may change the flags (but remember c will be set to bit[7] between B and C).
+  Parsing code MUST NOT change the value of _rxByte. Doing so will cause the checksums to be bad.
+  The F16 checksums are automatically calculated in the receive loop, but checking their validity
+    must be done by the parsing code. This must be done in the parsing group immediately after F16 C1 is
+    received (which will always be a payload byte, except for the very last checkbyte of the packet,
+    which is verified in ReceiveCommandFinish). Immediately after F16 C1 is received and processed
+    both running checksums (_rxF16U and _rxF16L) should be zero.
+  Summary:
+    On parser reset:
+      (parsing group rxFirstParsingGroup is selected for the first byte)
+      _rxFlags[Flags_WriteByte] := 0    (don't write to hub)
+      _rxF16U := _rxF16L := 0           (F16 checksums are reset, as per Crow specification)
+      _rxCountdown = <undefined>        (so z will be undefined at rxFirstParsingGroup instruction A) 
+      _rxPrevByte = <undefined>
+      _rxAddr = <undefined>
+    Before A and B:
+      _rxPrevByte is the byte received before this one (upper bytes are zero); it may be changed
+      _rxByte (READ-ONLY) is complete to bit[6], but bit[7] is undefined (upper bytes are zero)
+      _rxF16U and _rxF16L (READ-ONLY) are calculated up to the previous byte
+      _rxCountdown := _rxCountdown - 1
+      z := _rxCountdown==0
+      c := bit[6]
+    Before C and D:
+      (z is not changed, so it maintains whatever value it had after B)
+      c := bit[7]
+      _rxByte (READ-ONLY) is complete (upper bytes are zero)
+}
+rxFirstParsingGroup
+rxH0
+
+
 
 
 
