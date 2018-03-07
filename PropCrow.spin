@@ -174,7 +174,6 @@ rxStartBit              if_z    waitcnt     _rxWait0, bitPeriod0
     into the receive loop at rxShiftedA-D. Each group must take four registers with no gaps between
     them (use nops if necessary).
   rxFirstParsingGroup identifies the first parsing group to be executed on parser reset.
-  Parsing groups are identified by the byte being received when they execute.
   Instructions A and B are executed consecutively during the interval after bit[6] has been sampled, but
     before bit[7] is sampled. Instructions C and D are executed consecutively after bit[7], but before
     the stop bit. (This arrangement was found most conducive for parsing a Crow header.)
@@ -182,17 +181,16 @@ rxStartBit              if_z    waitcnt     _rxWait0, bitPeriod0
     four before instruction A, which means the default is to execute the following parsing group
     during the next byte. Parsing code can change _rxOffset to change the next group (it is a signed
     value, and should always be a multiple of four).
-  The Flag_WriteByte bit of _rxFlags determines whether the current byte will be written to the hub (this
-    actually occurs when the next byte is received). This flag is automatically cleared on parser
-    reset, and it must be manually set or cleared after that.
-  If Flag_WriteByte is set then the byte will be written to ++_rxAddr -- i.e. _rxAddr is automatically
-    incremented BEFORE writing the byte (_rxAddr is not changed unless the byte is written). This means
-    _rxAddr must initially be set to the desired address minus one. _rxAddr is undefined on parser reset.
+  The Flag_WriteByte bit of _rxFlags determines whether the current byte will be written to the hub.
+    This flag is automatically cleared on parser reset, and it must be manually set or cleared after that.
+  If Flag_WriteByte is set then the byte will be written to ++_rxAddr. Note that _rxAddr is automatically
+    incremented BEFORE writing the byte (_rxAddr is not incremented unless the byte will be written). This
+    means _rxAddr must initially be set to the desired address minus one. _rxAddr is undefined on parser reset.
   Before instruction A, _rxCountdown is decremented and the z flag indicates whether the countdown is
     zero. _rxCountdown is undefined on parser reset.
   Before instruction A the c flag is set to bit[6]. Before instruction C the c flag is set to bit[7].
   Parsing code may change the flags (but remember c will be set to bit[7] between B and C).
-  Parsing code MUST NOT change the value of _rxByte. Doing so will cause the checksums to be bad.
+  Parsing code MUST NOT change the value of _rxByte. Doing so will cause the checksums to fail.
   The F16 checksums are automatically calculated in the receive loop, but checking their validity
     must be done by the parsing code. This must be done in the parsing group immediately after F16 C1 is
     received (which will always be a payload byte, except for the very last checkbyte of the packet,
@@ -200,7 +198,7 @@ rxStartBit              if_z    waitcnt     _rxWait0, bitPeriod0
     both running checksums (_rxF16U and _rxF16L) should be zero.
   Summary:
     On parser reset:
-      (parsing group rxFirstParsingGroup is selected for the first byte)
+      parsing group rxFirstParsingGroup is selected
       _rxFlags[Flags_WriteByte] := 0    (don't write to hub)
       _rxF16U := _rxF16L := 0           (F16 checksums are reset, as per Crow specification)
       _rxCountdown = <undefined>        (so z will be undefined at rxFirstParsingGroup instruction A) 
@@ -211,22 +209,62 @@ rxStartBit              if_z    waitcnt     _rxWait0, bitPeriod0
       _rxByte (READ-ONLY) is complete to bit[6], but bit[7] is undefined (upper bytes are zero)
       _rxF16U and _rxF16L (READ-ONLY) are calculated up to the previous byte
       _rxCountdown := _rxCountdown - 1
+      _rxOffset := 4                    (this is a signed value, and it determines the next group executed)
       z := _rxCountdown==0
       c := bit[6]
     Before C and D:
-      (z is not changed, so it maintains whatever value it had after B)
-      c := bit[7]
       _rxByte (READ-ONLY) is complete (upper bytes are zero)
+      z is not changed, so it maintains whatever value it had after B
+      c := bit[7]
+  See "The Command Header" section of "Crow Specification v1.txt". See also page 113.
+  The parsing groups are labelled by the byte being received when they execute.
 }
 rxFirstParsingGroup
-rxH0
+rxH0                            test        _rxByte, #%0010_1000        wz      'A - z=1 if reserved bits 3 and 5 are zero, as required
+                if_nc_or_nz     jmp         #RecoveryMode                       ' B - exit for bad reserved bits; c (bit 6) must be 1
+                        if_c    jmp         #RecoveryMode                       ' C - exit for bad reserved bit; c (bit 7) must be 0
+                                mov         ina, _rxByte                        ' D - save T flag (command type) in sh-ina
+rxH1                            mov         payloadSize, _rxPrevByte            'A - extract payload size
+                                and         payloadSize, #$7                    ' B
+                                shl         payloadSize, #8                     ' C
+                                or          payloadSize, _rxByte                ' D
+rxH2                            mov         _rxRemaining, payloadSize           'A - _rxRemaining keeps track of how many payload bytes are left to receive
+                                mov         _rxAddr, commandPayloadMinusOne     ' B - reset address for writing to hub
+                                mov         protocol, #0                        ' C - set implicit protocol
+                                mov         token, _rxByte                      ' D
+rxH3                            test        _rxByte, #%0010_0000        wz      'A - z=1 if reserved bit 5 is zero, as required
+                        if_nz   jmp         #RecoveryMode                       ' B - exit for bad reserved bit
+                                mov         packetInfo, _rxByte                 ' C - preserve Crow address and mute flag
+                        if_nc   mov         _rxOffset, #12                      ' D - skip rxH4 and rxH5 if using implicit protocol
+rxH4                            nop                                             'A - spacer nop
+                                nop                                             ' B - spacer nop
+                                mov         protocol, _rxByte                   ' C
+                                shl         protocol, #8                        ' D
+rxH5                            nop                                             'A - spacer nop
+                                nop                                             ' B - spacer nop
+                                nop                                             ' C - spacer nop
+                                or          protocol, _rxByte                   ' D
+rxF16C0                         andn        _rxFlags, #Flag_WriteByte           'A - turn off writing to hub
+                                mov         _rxCountdown, _rxRemaining          ' B - _rxCountdown used to keep track of payload bytes left in chunk 
+                                max         _rxCountdown, #128                  ' C - chunks are limited to 128 data bytes
+                                nop                                             ' D - spacer nop
+rxF16C1                         add         _rxCountdown, #1            wz      'A - undo automatic decrement; check if _rxCountdown==0 (next chunk empty)
+                        if_z    mov         rxStartWait, rxExit                 ' B - exit receive loop if no bytes in next chunk (all bytes received)
+                                sub         _rxRemaining, _rxCountdown          ' C - _rxRemaining is number of payload bytes after the following chunk
+                                nop                                             ' D - spacer nop
+rxP_VerifyF16                   or          _rxFlags, #Flags_WriteByte          'A - turn on writing to hub
+                        if_z    subs        _rxOffset, #12                      ' B - if _rxCountdown==0 then chunk's payload bytes done, go to rxF16C0
+                                or          _rxF16U, _rxF16L            wz      ' C - should have F16U == F16L == 0
+                        if_nz   jmp         #RecoveryMode                       ' D - exit for bad checksums
+rxP_Repeat              if_z    subs        _rxOffset, #16                      'A - go to rxF16C0 if all of chunk's payload bytes are received
+                        if_nz   subs        _rxOffset, #4                       ' B - ...otherwise, repeat this group
+                                nop                                             ' C - spacer nop
+                                nop                                             ' D - spacer nop
 
-
-
-
-
-
-
+commandPayloadMinusOne      res
+protocol                    res
+token                       res
+packetInfo                  res
 
 { txSendBytes }
 { Helper routine  used to send bytes. It also updates the running F16 checksum. It assumes
