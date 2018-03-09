@@ -15,25 +15,131 @@ con
     Flag_WriteByte  = %0_1000_0000
 
     Flag_Mute       = %0_0100_0000
-  
+
+    AddressMask     = %0001_1111
+    MuteFlag        = %0100_0000
+    CommandTypeFlag = %0001_0000
+
+    conMaxPayloadSize = 2047     'Must not exceed 2047
+    MaxUserProtocols = 10       'Must not exceed 255, UserProtocolsTable takes 4*MaxUserProtocols bytes
+
+
+    PropCrowID  = $80   'must be single byte value
+
+
 
 
 pub new
-    
-    cognew(@entry, 0)
+   
+    word[@ControlBlock + 8] := @entry
+    word[@ControlBlock + 10] := @entry 
+    cognew(@entry, @ControlBlock)
 
+pub chowder(clams, potatoes)
+    return 1
 
 dat
+
+{ ControlBlock
+}
+
+
+ControlBlock
+long 0
+deviceAddress   byte    1
+byte 0[3]
+word 0
+word 0
+'DeviceInfoTemplate
+deviceInfo0     long    $00000100 | (PropCrowID << 24)                                                      'Crow v1, implementationID = PropCrowID (assumed to be one byte value)
+deviceInfo1     long    $00020000 | ((conMaxPayloadSize & $ff) << 8) | ((conMaxPayloadSize & $700) >> 8)    'MaxPayloadLength, 2 admin protocols, numUserProtocols in top byte
+deviceInfo2     long    $00000000 | (PropCrowID << 24)                                                      'supports admin protocols numbers 0 and PropCrowID
+txScratch       long    0
+
+{ UserProtocols
+  User commands are processed by code in other cogs. This table consists of a list of long
+    values, where the first word of each long is a supported user protocol number, and the
+    second long is the hub address of the control block for processing that protocol's commands.
+  The number of defined user protocols is stored in the device info template (top byte of deviceInfo1).
+  Summary:
+    protocolNumber[i] = word[@UserProtocols + 2*i]
+    protocolAddr[i] = word[@UserProtocols + 2*i + 2]
+    for i in [0, numUserProtocols)
+  The PropCrow implementation allows the user protocols list to change dynamically, but access must be
+    locked during the change.
+  Order is not important, but there should be no redundancies. If removing an entry be sure to shift the rest down.
+}
+UserProtocolsTable
+long 0[MaxUserProtocols]
+
+
 org 0
 entry
-                                or          dira, txMask
+_initTmp
+                                or          outa, txMask
+_initAddr
+                                or          outa, pin26
+                                or          dira, pin26
+
+                                or          dira, pin27
+
+                                mov         userProtocolsTableAddr, par
+
+                                add         userProtocolsTableAddr, #4
+
+
+                                rdbyte      _initTmp, userProtocolsTableAddr
+                                movs        rxVerifyAddress, _initTmp
+
+                                'todo fix
+                                movs        rcvyLowCounterMode, #31
+                                mov         frqb, #1
+
+                                add         userProtocolsTableAddr, #4
+                                rdword      rxPayloadAddr, userProtocolsTableAddr
+
+                                mov         rxPayloadAddrMinusOne, rxPayloadAddr
+                                sub         rxPayloadAddrMinusOne, #1
+
+                                add         userProtocolsTableAddr, #2
+                                rdword      txPayloadAddr, userProtocolsTableAddr
                                 
-                                'set token to 178
-                                mov         0, #178
-                                mov         _tmp, hubScratch
-                                add         _tmp, #2
-                                wrbyte      0, _tmp
-ReceiveCommand
+                                add         userProtocolsTableAddr, #2
+                                mov         deviceInfoTemplateAddr, userProtocolsTableAddr
+
+                                add         userProtocolsTableAddr, #7
+                                mov         numUserProtocolsAddr, userProtocolsTableAddr
+
+                                add         userProtocolsTableAddr, #5
+                                mov         txScratchAddr, userProtocolsTableAddr 
+
+                                add         userProtocolsTableAddr, #4                          'userProtocolsTableAddr is now correct
+
+                                'test
+                                mov         0, #3
+                                wrbyte      0, numUserProtocolsAddr
+                                mov         _initAddr, userProtocolsTableAddr
+                                mov         0, #511
+                                wrword      0, _initAddr
+                                mov         0, #13
+                                add         _initAddr, #4
+                                wrword      0, _initAddr
+                                mov         0, #235
+                                add         _initAddr, #4
+                                wrword      0, _initAddr
+
+{
+                                mov         packetInfo, #0
+                                wrword      rxPayloadAddr, #0
+                                wrword      txPayloadAddr, #2
+                                mov         payloadAddr, #0
+                                mov         payloadSize, #4
+                                jmp         #SendFinalResponse
+}
+
+                                jmp         #ReceiveCommand 
+                               
+{ 
 mainLoop                                
                                 mov         payloadAddr, addr
                                 mov         payloadSize, #4
@@ -62,9 +168,33 @@ mainLoop
 addr                long    60000 
 pause               long    4_000_000
 shortPause          long    1_000
+}
 
+pin26               long    |< 26
+pin27               long    |< 27
 
+rxPayloadAddr           long 0
+rxPayloadAddrMinusOne   long 0
+txPayloadAddr           long 0
+txScratchAddr           long 0
 
+numUserProtocolsAddr    long 0
+userProtocolsTableAddr  long 0
+deviceInfoTemplateAddr  long 0
+
+maxPayloadSize          long conMaxPayloadSize
+stopBitDuration         long 698
+rcvyLowCounterMode      long    $3000_0000 'nop
+breakMultiple           long 3602
+recoveryTime            long 11104
+timeout                 long 80_000
+startBitWait            long 337
+rxMask                  long |< 31
+txMask                  long |< 30
+
+bitPeriod0      long 694
+bitPeriod1      long 694
+bitPeriod       long 694
 
 { ReceiveCommand
   This routine contains the receive loop used to receive and process bytes. Processing is done using
@@ -77,6 +207,9 @@ shortPause          long    1_000
     parsing steps performed in ReceiveCommandFinish to completely verify the packet's validity.)
 }
 ReceiveCommand
+                                xor         outa, pin26
+                                or          outa, pin27
+
                                 { pre-loop initialization}
                                 mov         rxStartWait, rxContinue                 'loop until all bytes received
                                 movs        rxMovA, #rxFirstParsingGroup            'prepare shifted parsing code
@@ -105,9 +238,9 @@ rxBit1                          waitcnt     _rxWait1, bitPeriod0
                                 testn       rxMask, ina                     wz
                                 muxz        _rxByte, #%0000_0010
                         if_c    cmpsub      _rxF16L, #255                           'F16 3
-                        if_nc   mov         _rxF16U, #0                             'F16 4
-                        if_c    add         _rxF16U, _rxF16L                        'F16 5
-                        if_c    cmpsub      _rxF16U, #255                           'F16 6
+                        if_nc   mov         inb, #0                                 'F16 4 - during receiving, sh-inb is F16U
+                        if_c    add         inb, _rxF16L                            'F16 5
+                        if_c    cmpsub      inb, #255                               'F16 6
 
 rxBit2                          waitcnt     _rxWait1, bitPeriod1
                                 testn       rxMask, ina                     wz
@@ -169,7 +302,47 @@ rxStartBit              if_z    waitcnt     _rxWait0, bitPeriod0
 
                     { fall through to recovery mode for framing errors }
 
-{ Parsing Instructions
+
+{ RecoveryMode
+  When framing or parsing errors occur the implementation enters recovery mode. In this mode the implementation
+    waits for the rx line to be in high-idle for a certain period of time before attempting to receive another
+    command. If the line is low for long enough then the implementation determines that a break condition has occurred.
+  See page 99.
+}
+RecoveryMode
+                                mov         ctrb, rcvyLowCounterMode
+                                mov         cnt, recoveryTime
+                                add         cnt, cnt
+                                mov         _rcvyPrevPhsb, phsb                     'first interval always recoveryTime+1 counts, so at least one loop for break 
+                                mov         inb, breakMultiple                      'sh-inb is countdown to break detection
+rcvyLoop                        waitcnt     cnt, recoveryTime
+                                mov         _rcvyCurrPhsb, phsb
+                                cmp         _rcvyPrevPhsb, _rcvyCurrPhsb    wz      'z=1 line always high, so exit
+                        if_z    mov         ctrb, #0                                'ctrb must be off before exit
+                        if_z    jmp         #ReceiveCommand                         '...exit: line is idle -- ready for next command
+                                mov         par, _rcvyPrevPhsb
+                                add         par, recoveryTime
+                                cmp         par, _rcvyCurrPhsb              wz      'z=0 line high at some point
+                        if_nz   mov         inb, breakMultiple                      'reset break detection countdown
+                                mov         _rcvyPrevPhsb, _rcvyCurrPhsb
+                                djnz        inb, #rcvyLoop
+                                mov         ctrb, #0                                'ctrb must be off before exit
+
+                        { fall through when a break is detected }
+
+
+{ DetectBaud
+  PropCrow interprets the break condition as a command to enter baud detection mode.
+}
+DetectBaud
+
+BreakHandler
+                                waitpeq     rxMask, rxMask                          'wait for break to end
+                                { todo }
+                                jmp         #ReceiveCommand
+
+
+{ Parsing Instructions, used by ReceiveCommand
   There are four parsing instructions per received byte, labelled A-D. These instructions are shifted
     into the receive loop at rxShiftedA-D. Each group must take four registers with no gaps between
     them (use nops if necessary).
@@ -229,8 +402,8 @@ rxH1                            mov         payloadSize, _rxPrevByte            
                                 shl         payloadSize, #8                     ' C
                                 or          payloadSize, _rxByte                ' D
 rxH2                            mov         _rxRemaining, payloadSize           'A - _rxRemaining keeps track of how many payload bytes are left to receive
-                                mov         _rxAddr, commandPayloadMinusOne     ' B - reset address for writing to hub
-                                mov         protocol, #0                        ' C - set implicit protocol
+                                mov         _rxAddr, rxPayloadAddrMinusOne     ' B - reset address for writing to hub
+                                mov         par, #0                             ' C - set implicit protocol; sh-par used to store protocol
                                 mov         token, _rxByte                      ' D
 rxH3                            test        _rxByte, #%0010_0000        wz      'A - z=1 if reserved bit 5 is zero, as required
                         if_nz   jmp         #RecoveryMode                       ' B - exit for bad reserved bit
@@ -238,12 +411,12 @@ rxH3                            test        _rxByte, #%0010_0000        wz      
                         if_nc   mov         _rxOffset, #12                      ' D - skip rxH4 and rxH5 if using implicit protocol
 rxH4                            nop                                             'A - spacer nop
                                 nop                                             ' B - spacer nop
-                                mov         protocol, _rxByte                   ' C
-                                shl         protocol, #8                        ' D
+                                mov         par, _rxByte                        ' C
+                                shl         par, #8                             ' D
 rxH5                            nop                                             'A - spacer nop
                                 nop                                             ' B - spacer nop
                                 nop                                             ' C - spacer nop
-                                or          protocol, _rxByte                   ' D
+                                or          par, _rxByte                        ' D
 rxF16C0                         andn        _rxFlags, #Flag_WriteByte           'A - turn off writing to hub
                                 mov         _rxCountdown, _rxRemaining          ' B - _rxCountdown used to keep track of payload bytes left in chunk 
                                 max         _rxCountdown, #128                  ' C - chunks are limited to 128 data bytes
@@ -252,19 +425,143 @@ rxF16C1                         add         _rxCountdown, #1            wz      
                         if_z    mov         rxStartWait, rxExit                 ' B - exit receive loop if no bytes in next chunk (all bytes received)
                                 sub         _rxRemaining, _rxCountdown          ' C - _rxRemaining is number of payload bytes after the following chunk
                                 nop                                             ' D - spacer nop
-rxP_VerifyF16                   or          _rxFlags, #Flags_WriteByte          'A - turn on writing to hub
+rxP_VerifyF16                   or          _rxFlags, #Flag_WriteByte           'A - turn on writing to hub
                         if_z    subs        _rxOffset, #12                      ' B - if _rxCountdown==0 then chunk's payload bytes done, go to rxF16C0
-                                or          _rxF16U, _rxF16L            wz      ' C - should have F16U == F16L == 0
+                                or          inb, _rxF16L                wz      ' C - should have F16U == F16L == 0; sh-inb is F16U
                         if_nz   jmp         #RecoveryMode                       ' D - exit for bad checksums
 rxP_Repeat              if_z    subs        _rxOffset, #16                      'A - go to rxF16C0 if all of chunk's payload bytes are received
                         if_nz   subs        _rxOffset, #4                       ' B - ...otherwise, repeat this group
                                 nop                                             ' C - spacer nop
                                 nop                                             ' D - spacer nop
 
-commandPayloadMinusOne      res
-protocol                    res
-token                       res
-packetInfo                  res
+
+
+{ Receive Loop Continue / Exit Instructions
+  These instructions are shifted to rxStartWait in the receive loop to either receive more bytes
+    or exit the loop and finish processing the packet. }
+rxContinue              if_z    waitpne     rxMask, rxMask
+rxExit                  if_z    jmp         #ReceiveCommandFinish
+
+
+{ ReceiveCommandFinish
+  This code runs when all  }
+ReceiveCommandFinish
+                                { verify checksums for last byte }
+                                add         _rxF16L, _rxByte                        'compute F16L for last byte
+                                cmpsub      _rxF16L, #255                           '(computing F16U unnecessary since it should be zero)
+                                or          inb, _rxF16L                    wz
+                        if_nz   jmp         #RecoveryMode                           '...bad F16
+
+                                { verify the address }
+                                mov         cnt, packetInfo                         'sh-cnt used for scratch; packetInfo is CH3
+                                and         cnt, #AddressMask               wz      'z=1 broadcast address (0)
+                                test        packetInfo, #MuteFlag           wc      'c=1 mute response
+                    if_z_and_nc jmp         #RecoveryMode                           '...broadcast must mute (invalid packet)
+rxVerifyAddress         if_nz   cmp         cnt, #0-0                       wz      'verify non-broadcast address; s-field set at initialization
+                        if_nz   jmp         #ReceiveCommand                         '...wrong non-broadcast address
+
+                                { at this point the packet is completely valid at the Crow level, so recovery mode is not used }
+
+                                { todo: recalibrate }
+
+                                { check command type, exit if user command }
+                                test        ina, #CommandTypeFlag           wc      'c=1 user command; sh-ina is CH0
+                        if_c    jmp         #UserCommand
+                                
+                                { check admin protocol, exit if supported }
+                                cmp         par, #0                         wz      'sh-par is protocol (from rxH2 or rxH5)
+                        if_z    jmp         #UniversalAdminCommand
+                                cmp         par, #PropCrowID                wz      'PropCrowID assumed to be 9-bit or less
+                        if_z    jmp         #PropCrowAdminCommand
+
+                                jmp         #ReceiveCommand
+
+
+{ UniversalAdminCommand
+  The universal admin commands (admin protocol 0) are defined in "Crow Specification v1.txt".
+  There are two commands: ping, and getDeviceInfo.
+}
+UniversalAdminCommand
+
+                                xor         outa, pin26
+                                andn          outa, pin27
+
+                                { admin protocol 0 with no payload is ping }
+                                cmp         payloadSize, #0                 wz      'z=1 ping command
+                        if_nz   jmp         #:getDeviceInfo
+                                jmp         #SendFinalResponse                      'send ping response (payloadSize==0), then go to ReceiveCommand
+
+                                { other admin protocol 0 command, getDeviceInfo, has 0x00 as payload }
+:getDeviceInfo                  cmp         payloadSize, #1                 wz      'z=0 wrong payload size for getDeviceInfo (1)
+                        if_z    rdbyte      cnt, rxPayloadAddr                      'load payload byte into sh-cnt
+                        if_z    cmp         cnt, #$00                       wz      'z=0 wrong payload for getDeviceInfo
+                        if_nz   jmp         #ReceiveCommand                         '...command not getDeviceInfo or ping
+
+                                { perform getDeviceInfo }
+
+                                call        #LockSharedAccess                       'the user protocols list is allowed to change
+
+                                rdbyte      _tmpCount, numUserProtocolsAddr         'get number of user protocols
+
+                                mov         payloadSize, _tmpCount                  'response payload size is 12 + 2*numUserProtocols (assuming 2 admin protocols)
+                                shl         payloadSize, #1
+                                add         payloadSize, #12
+
+                                call        #SendFinalHeader
+
+                                mov         payloadAddr, deviceInfoTemplateAddr     'send first 12 bytes of device info response
+                                mov         payloadSize, #12
+                                call        #SendPayloadBytes
+
+                                cmp         _tmpCount, #0                   wz
+                        if_z    jmp         #:finish
+
+                                mov         payloadAddr, userProtocolsTableAddr     'send the user protocol numbers directly from the table
+                                sub         payloadAddr, #3
+
+:loop                           add         payloadAddr, #4                         'MSB             
+                                mov         payloadSize, #1
+                                call        #SendPayloadBytes
+                                sub         payloadAddr, #2                         'LSB
+                                mov         payloadSize, #1
+                                call        #SendPayloadBytes
+
+                                djnz        _tmpCount, #:loop       
+
+:finish                         call        #FinishSending
+ 
+                                call        #UnlockSharedAccess
+                                
+                                jmp         #ReceiveCommand
+
+
+{ PropCrowAdminCommand
+
+}
+PropCrowAdminCommand
+                                mov         payloadAddr, rxPayloadAddr
+                                jmp         #SendFinalResponse
+
+{ UserCommand
+}
+UserCommand
+                                mov         payloadAddr, rxPayloadAddr
+                                jmp         #SendFinalResponse
+
+{ LockSharedAccess
+  A call to LockSharedAcccess must be followed by a call to UnlockSharedAccess.
+}
+LockSharedAccess
+                                nop
+LockSharedAccess_ret            ret
+
+{ UnlockSharedAccess
+}
+UnlockSharedAccess
+                                nop
+UnlockSharedAccess_ret          ret
+
+
 
 { txSendBytes }
 { Helper routine  used to send bytes. It also updates the running F16 checksum. It assumes
@@ -322,7 +619,7 @@ txSendBytes_ret                 ret
 
 
 { SendFinalHeader, SendIntermediateHeader (Partial Sending Routines)
-  The partial sending routines exist to allow user code to send payload bytes from multiple random
+  The partial sending routines exist to allow sending payload bytes from multiple random
     locations of hub RAM without buffering them first. If sending from a single contiguous block
     of hub RAM then it is easier to use the Complete Sending Routines.
   Usage:    mov     payloadSize, <number of bytes total in payload>
@@ -342,18 +639,20 @@ SendIntermediateHeader
                                 movs        txApplyTemplate, #$80
 
                                 { checks: ensure not muted, and ensure payload size is within buffer size }
-txPerformChecks                 test        flags, #Flag_Mute           wc
+txPerformChecks                 test        packetInfo, #Flag_Mute           wc 
                         if_c    jmp         SendHeader_ret
                                 max         payloadSize, maxPayloadSize
 
-                                { compose header bytes RH0-RH1; RH2 (token) is already set }
+                                { compose header bytes RH0-RH2 }
                                 mov         par, payloadSize                    'shadow PAR used to compose first byte of header
                                 shr         par, #8                             '(assumes payloadLength <= 2047)
 txApplyTemplate                 or          par, #0-0
-                                mov         _txAddr, hubScratch                      
+                                mov         _txAddr, txScratchAddr                      
                                 wrbyte      par, _txAddr
                                 add         _txAddr, #1
                                 wrbyte      payloadSize, _txAddr
+                                add         _txAddr, #1
+                                wrbyte      token, _txAddr
 
                                 { reset F16 }
                                 mov         _txF16L, #0
@@ -363,7 +662,7 @@ txApplyTemplate                 or          par, #0-0
 txRetainLine                    or          dira, txMask
 
                                 { send RH0-RH2 }
-                                mov         _txAddr, hubScratch
+                                mov         _txAddr, txScratchAddr
                                 mov         _txCount, #3
                                 call        #txSendBytes
 
@@ -371,7 +670,7 @@ txRetainLine                    or          dira, txMask
                                 call        #txSendAndResetF16
 
                                 { prepare for sending payload bytes }
-                                andn        flags, #Flag_SendCheck              'the SendCheck flag is set when payload bytes are sent
+                                andn        packetInfo, #Flag_SendCheck              'the SendCheck flag is set when payload bytes are sent
                                 mov         _txMaxChunkRemaining, #128          'the maximum number of bytes for a full chunk (the last may be partial)
 SendHeader_ret
 SendFinalHeader_ret
@@ -381,44 +680,42 @@ SendIntermediateHeader_ret      ret
 { SendPayloadBytes (Partial Sending Routine)
   This routine sends payload bytes for an response packet that has been started with a
     call to SendFinalHeader or SendIntermediateHeader.
-  Note that the total number of bytes
-    to send must still be known before sending the header. The total sum of bytes sent using
-    one or more SendPayloadBytes calls must exactly match the payloadSize passed to the header
-    sending routine -- if it does not, then the Crow host (i.e. PC) will experience some sort
-    of error (e.g. timeout, unexpected number of bytes, bad checksum).
+  Note that the total number of bytes to send must still be known before sending the header.
+    The total sum of bytes sent using one or more SendPayloadBytes calls must exactly match the
+    payloadSize passed to the header sending routine -- if it does not, then the Crow host (i.e. PC)
+    will experience some sort of error (e.g. timeout, unexpected number of bytes, bad checksum).
   Usage:
             mov     payloadSize, <number of bytes to send with this call, may be zero>
             mov     payloadAddr, <base address of bytes to send>
             call    #SendPayloadBytes
-  After this call payloadSize will be zero and payloadAddr will point to the address after
-    the last byte sent.
+  After this call payloadSize will be zero and payloadAddr will point to the address after the last byte sent.
 }
 SendPayloadBytes
-                                test        flags, #Flag_Mute               wc  'skip if responses muted
+                                test        packetInfo, #Flag_Mute               wc      'skip if responses muted
                         if_c    jmp         SendPayloadBytes_ret
 :loop
                                 mov         _txCount, payloadSize           wz
-                        if_z    jmp         SendPayloadBytes_ret                'exit: nothing to send
+                        if_z    jmp         SendPayloadBytes_ret                    'exit: nothing to send
                                 max         _txCount, _txMaxChunkRemaining
                                 sub         payloadSize, _txCount
-                                sub         _txMaxChunkRemaining, _txCount  wz  'z=0 implies txCount < _txMaxChunkRemaining, and also that
-                                                                                ' payloadSize is now zero -- in other words, this is the last bit of payload data
-                                                                                ' to send with this call, but the chunk is not full
+                                sub         _txMaxChunkRemaining, _txCount  wz      'z=0 implies _txCount < _txMaxChunkRemaining, and also that
+                                                                                    ' payloadSize is now zero -- in other words, this is the last bit of payload data
+                                                                                    ' to send with this call, but the chunk is not full
                                 mov         _txAddr, payloadAddr
 
                                 call        #txSendBytes
-                                or          flags, #Flag_SendCheck              'if any payload bytes have been sent then a checksum must follow eventually
+                                or          packetInfo, #Flag_SendCheck                  'if any payload bytes have been sent then a checksum must follow eventually
 
                                 mov         payloadAddr, _txAddr
 
-                        if_nz   jmp         SendPayloadBytes_ret                'exit: chunk is not finished, but all bytes for this call have been sent 
+                        if_nz   jmp         SendPayloadBytes_ret                    'exit: chunk is not finished, but all bytes for this call have been sent 
 
                                 { chunk is finished, but there may be more payload bytes to send, so send checksum now }
 
                                 call        #txSendAndResetF16
 
                                 { prep for next chunk }
-                                andn        flags, #Flag_SendCheck
+                                andn        packetInfo, #Flag_SendCheck
                                 mov         _txMaxChunkRemaining, #128
  
                                 jmp         #:loop 
@@ -432,9 +729,9 @@ SendPayloadBytes_ret            ret
     even if there are no payload bytes.
 }
 FinishSending
-                                test        flags, #Flag_Mute               wc      'skip if responses muted
+                                test        packetInfo, #Flag_Mute               wc      'skip if responses muted
                         if_c    jmp         FinishSending_ret
-                                test        flags, #Flag_SendCheck          wc      'send final payload checksum if necessary
+                                test        packetInfo, #Flag_SendCheck          wc      'send final payload checksum if necessary
                         if_c    call        #txSendAndResetF16
 txReleaseLine                   andn        dira, txMask                            'this instruction may be deleted in some circumstances (along
 FinishSending_ret               ret                                                 ' with txRetainLine) -- see "PropCrow User Guide.txt"
@@ -450,6 +747,7 @@ FinishSending_ret               ret                                             
   Both payloadSize and payloadAddr are modified by these routines. 
 }
 SendFinalResponse
+
                                 movs        Send_ret, #ReceiveCommand
 SendFinalAndReturn
                                 movs        txApplyTemplate2, #$90
@@ -458,28 +756,30 @@ SendIntermediate
                                 movs        txApplyTemplate2, #$80
 
                                 { checks: ensure not muted, and ensure payload size is within buffer size }
-txPerformChecks2                 test        flags, #Flag_Mute        wc  'c=1 muted
+txPerformChecks2                test        packetInfo, #Flag_Mute              wc      'c=1 muted
                         if_c    jmp         Send_ret
                                 max         payloadSize, maxPayloadSize
 
-                                { compose header bytes RH0-RH1; RH2 (token) is already set }
-                                mov         par, payloadSize                    'shadow PAR used to compose first byte of header
-                                shr         par, #8                             '(assumes payloadLength <= 2047)
-txApplyTemplate2                 or          par, #0-0
-                                mov         _txAddr, hubScratch                      
+                                { compose header bytes RH0-RH2 }
+                                mov         par, payloadSize                            'sh-par used to compose first byte of header
+                                shr         par, #8                                     'assumes payloadSize <= 2047
+txApplyTemplate2                or          par, #0-0
+                                mov         _txAddr, txScratchAddr                      
                                 wrbyte      par, _txAddr
                                 add         _txAddr, #1
                                 wrbyte      payloadSize, _txAddr
+                                add         _txAddr, #1
+                                wrbyte      token, _txAddr
 
                                 { reset F16 }
                                 mov         _txF16L, #0
                                 mov         _txF16U, #0
 
                                 { retain line }
-                    or          dira, txMask
+                                or          dira, txMask
 
                                 { send RH0-RH2 }
-                                mov         _txAddr, hubScratch
+                                mov         _txAddr, txScratchAddr
                                 mov         _txCount, #3
                                 call        #txSendBytes
 
@@ -487,17 +787,17 @@ txApplyTemplate2                 or          par, #0-0
                                 call        #txSendAndResetF16
 
                                 { send packet body (chunks of payload bytes with checksums) }
-txPayloadLoop                   mov         _txCount, payloadSize           wz
+txPayloadLoop                   mov         _txCount, payloadSize               wz      'z=1 => nothing left to send
                         if_z    jmp         #txLoopExit
-                                max         _txCount, #128                      'next chunk size (max of 128 bytes)
+                                max         _txCount, #128                              'next chunk size (max of 128 bytes)
                                 sub         payloadSize, _txCount
                                 mov         _txAddr, payloadAddr
                                 call        #txSendBytes
-                                mov         payloadAddr, _txAddr                'preserve payload address for next chunk
+                                mov         payloadAddr, _txAddr                        'preserve payload address for next chunk
                                 call        #txSendAndResetF16
                                 jmp         #txPayloadLoop
 txLoopExit
-                   andn        dira, txMask
+                                andn        dira, txMask
 Send_ret
 SendFinalAndReturn_ret
 SendIntermediate_ret            ret
@@ -509,14 +809,14 @@ SendIntermediate_ret            ret
     also resets the checksum after sending. }
 txSendAndResetF16
                                 { save F16 to hub }
-                                mov         _txAddr, hubScratch
+                                mov         _txAddr, txScratchAddr
                                 wrbyte      _txF16U, _txAddr
                                 add         _txAddr, #1
                                 mov         _txCount, #2                        'sending prep
                                 wrbyte      _txF16L, _txAddr
                             
                                 { send F16 }
-                                mov         _txAddr, hubScratch
+                                mov         _txAddr, txScratchAddr
                                 call        #txSendBytes
 
                                 { reset F16 }
@@ -528,27 +828,43 @@ txSendAndResetF16_ret           ret
 
 
 
-bitPeriod           long    32
-txMask              long    |< 30
-stopBitDuration     long    32
-maxPayloadSize      long    2047
-hubScratch          long    20000
 
-flags               long    0
+
+protocol                    res
+token                       res
+packetInfo                  res
 
 payloadSize     res
 payloadAddr     res
 
 _tmp            res
 
-_txMaxChunkRemaining    res
+_rcvyPrevPhsb
+_rcvyCurrPhsb
 
+_txMaxChunkRemaining    res
 _txAddr         res
 _txCount        res
-
 _txNextByte     res
 _txByte         res
 _txF16L         res
 _txF16U         res
+
+_rxByte             res 
+_rxPrevByte         res
+_rxF16L             res
+_rxOffset           res
+_rxResetOffset      res
+_rxWait0            res
+_rxWait1            res
+_rxCountdown        res
+_rxAddr             res
+_rxFlags            res
+_rxRemaining        res
+
+
+_tmpCount       res
+
+fit 496
 
 
