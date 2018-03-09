@@ -12,15 +12,26 @@ con
     _xinfreq = 5_000_000
 
     Flag_SendCheck  = %1_0000_0000
-    Flag_WriteByte  = %0_1000_0000
 
     Flag_Mute       = %0_0100_0000
 
+
+    'Notes on RxFlags
+    '  Shadow-ina is used to hold some receiving flags. On reset it is cleared, and in rxH0 the first
+    '    header byte CH0 is or'd into it to save the T flag (command type). From the spec:
+    '           |7|6|5|4|3|2|1|0|   Notes: Su is upper bits of payload size. Bit 3 should be avoided since 
+    '     ------|---------------|          any increases in max permitted payload size in future specs
+    '      CH0  |0|1|0|T|0| Su  |          would use this bit.
+    '  Since the upper bytes of _rxByte are guaranteed zero bit 8 will be zero. This means we can
+    '    safely use bits 5, 7, and 8 for flags (bit 6 would depend on circumstances).
+    RxFlag_CommandType  = %0_0001_0000  'command type, from packet
+    RxFlag_WriteByte    = %1_0000_0000  'indicates whether to write previously received byte to hub
+    RxFlag_BadPayload   = %0_1000_0000  'indicates whether the payload size exceeds capacity (reportable error)
+
     AddressMask     = %0001_1111
     MuteFlag        = %0100_0000
-    CommandTypeFlag = %0001_0000
 
-    conMaxPayloadSize = 2047     'Must not exceed 2047
+    conMaxPayloadSize = 4     'Must not exceed 2047 (spec limit); must be at least 2 (implementation requirement)
     MaxUserProtocols = 10       'Must not exceed 255, UserProtocolsTable takes 4*MaxUserProtocols bytes
 
 
@@ -196,6 +207,8 @@ bitPeriod0      long 694
 bitPeriod1      long 694
 bitPeriod       long 694
 
+kCrowPayloadLimit       long 2047   'The payload size limit imposed by the specification (11 bits in v1 and v2).
+
 { ReceiveCommand
   This routine contains the receive loop used to receive and process bytes. Processing is done using
     shifted parsing instructions, which are explained in more detail in the "Parsing Instructions" 
@@ -238,7 +251,7 @@ rxBit1                          waitcnt     _rxWait1, bitPeriod0
                                 testn       rxMask, ina                     wz
                                 muxz        _rxByte, #%0000_0010
                         if_c    cmpsub      _rxF16L, #255                           'F16 3
-                        if_nc   mov         inb, #0                                 'F16 4 - during receiving, sh-inb is F16U
+                        if_nc   mov         inb, #0                                 'F16 4 - during receiving, sh-inb is rxF16U
                         if_c    add         inb, _rxF16L                            'F16 5
                         if_c    cmpsub      inb, #255                               'F16 6
 
@@ -262,8 +275,8 @@ rxBit4                          waitcnt     _rxWait1, bitPeriod1
                                 testn       rxMask, ina                     wz
                                 muxz        _rxByte, #%0001_0000
 rxMovB                          mov         rxShiftedB, 0-0                         'Shift 9
-                        if_nc   andn        _rxFlags, #Flag_WriteByte               'Write 1 - clear write flag on reset
-                                test        _rxFlags, #Flag_WriteByte       wc      'Write 2 - c=1 => write byte
+                        if_nc   mov         ina, #0                                 'RxFlags - also Write 1 (clears write flag); see notes on RxFlags in CON section
+                                test        ina, #RxFlag_WriteByte          wc      'Write 2 - c=1 => write byte; sh-ina is RxFlags
                         if_c    add         _rxAddr, #1                             'Write 3 - increment address (pre-increment by necessity)
 
 rxBit5                          waitcnt     _rxWait1, bitPeriod0
@@ -354,25 +367,27 @@ BreakHandler
     four before instruction A, which means the default is to execute the following parsing group
     during the next byte. Parsing code can change _rxOffset to change the next group (it is a signed
     value, and should always be a multiple of four).
-  The Flag_WriteByte bit of _rxFlags determines whether the current byte will be written to the hub.
+  The RxFlag_WriteByte bit of sh-ina (RxFlags) determines whether the current byte will be written to the hub.
     This flag is automatically cleared on parser reset, and it must be manually set or cleared after that.
-  If Flag_WriteByte is set then the byte will be written to ++_rxAddr. Note that _rxAddr is automatically
+  If RxFlag_WriteByte is set then the byte will be written to ++_rxAddr. Note that _rxAddr is automatically
     incremented BEFORE writing the byte (_rxAddr is not incremented unless the byte will be written). This
     means _rxAddr must initially be set to the desired address minus one. _rxAddr is undefined on parser reset.
   Before instruction A, _rxCountdown is decremented and the z flag indicates whether the countdown is
     zero. _rxCountdown is undefined on parser reset.
   Before instruction A the c flag is set to bit[6]. Before instruction C the c flag is set to bit[7].
-  Parsing code may change the flags (but remember c will be set to bit[7] between B and C).
+  Parsing code may change the z and c flags (but remember c will be set to bit[7] between B and C).
   Parsing code MUST NOT change the value of _rxByte. Doing so will cause the checksums to fail.
   The F16 checksums are automatically calculated in the receive loop, but checking their validity
     must be done by the parsing code. This must be done in the parsing group immediately after F16 C1 is
     received (which will always be a payload byte, except for the very last checkbyte of the packet,
     which is verified in ReceiveCommandFinish). Immediately after F16 C1 is received and processed
     both running checksums (_rxF16U and _rxF16L) should be zero.
+  The parsing code must ensure that the payload buffer is not exceeded. The RxFlag_BadPayload is used
+    for that purpose (it is cleared on reset).
   Summary:
     On parser reset:
       parsing group rxFirstParsingGroup is selected
-      _rxFlags[Flags_WriteByte] := 0    (don't write to hub)
+      sh-ina (RxFlags) is cleared       (so turn off writing to hub, and reset excessive payload size flag)
       _rxF16U := _rxF16L := 0           (F16 checksums are reset, as per Crow specification)
       _rxCountdown = <undefined>        (so z will be undefined at rxFirstParsingGroup instruction A) 
       _rxPrevByte = <undefined>
@@ -394,9 +409,9 @@ BreakHandler
 }
 rxFirstParsingGroup
 rxH0                            test        _rxByte, #%0010_1000        wz      'A - z=1 if reserved bits 3 and 5 are zero, as required
-                if_nc_or_nz     jmp         #RecoveryMode                       ' B - exit for bad reserved bits; c (bit 6) must be 1
-                        if_c    jmp         #RecoveryMode                       ' C - exit for bad reserved bit; c (bit 7) must be 0
-                                mov         ina, _rxByte                        ' D - save T flag (command type) in sh-ina
+                if_nc_or_nz     jmp         #RecoveryMode                       ' B - ...exit for bad reserved bits; c (bit 6) must be 1
+                        if_c    jmp         #RecoveryMode                       ' C - ...exit for bad reserved bit; c (bit 7) must be 0
+                                or          ina, _rxByte                        ' D - save T flag in sh-ina (RxFlags); or'd to preserve other flags; see RxFlags notes 
 rxH1                            mov         payloadSize, _rxPrevByte            'A - extract payload size
                                 and         payloadSize, #$7                    ' B
                                 shl         payloadSize, #8                     ' C
@@ -406,7 +421,7 @@ rxH2                            mov         _rxRemaining, payloadSize           
                                 mov         par, #0                             ' C - set implicit protocol; sh-par used to store protocol
                                 mov         token, _rxByte                      ' D
 rxH3                            test        _rxByte, #%0010_0000        wz      'A - z=1 if reserved bit 5 is zero, as required
-                        if_nz   jmp         #RecoveryMode                       ' B - exit for bad reserved bit
+                        if_nz   jmp         #RecoveryMode                       ' B - ...exit for bad reserved bit
                                 mov         packetInfo, _rxByte                 ' C - preserve Crow address and mute flag
                         if_nc   mov         _rxOffset, #12                      ' D - skip rxH4 and rxH5 if using implicit protocol
 rxH4                            nop                                             'A - spacer nop
@@ -417,22 +432,22 @@ rxH5                            nop                                             
                                 nop                                             ' B - spacer nop
                                 nop                                             ' C - spacer nop
                                 or          par, _rxByte                        ' D
-rxF16C0                         andn        _rxFlags, #Flag_WriteByte           'A - turn off writing to hub
+rxF16C0                         andn        ina, #RxFlag_WriteByte              'A - turn off writing to hub (don't write F16 bytes); sh-ina is RxFlags
                                 mov         _rxCountdown, _rxRemaining          ' B - _rxCountdown used to keep track of payload bytes left in chunk 
                                 max         _rxCountdown, #128                  ' C - chunks are limited to 128 data bytes
-                                nop                                             ' D - spacer nop
+                                sub         _rxRemaining, _rxCountdown          ' D - _rxRemaining is number of payload bytes after the coming chunk
 rxF16C1                         add         _rxCountdown, #1            wz      'A - undo automatic decrement; check if _rxCountdown==0 (next chunk empty)
-                        if_z    mov         rxStartWait, rxExit                 ' B - exit receive loop if no bytes in next chunk (all bytes received)
-                                sub         _rxRemaining, _rxCountdown          ' C - _rxRemaining is number of payload bytes after the following chunk
-                                nop                                             ' D - spacer nop
-rxP_VerifyF16                   or          _rxFlags, #Flag_WriteByte           'A - turn on writing to hub
+                        if_z    mov         rxStartWait, rxExit                 ' B - ...exit receive loop if no bytes in next chunk (all bytes received)
+                                cmp         payloadSize, maxPayloadSize wz, wc  ' C - check if command payload size exceeds buffer capacity
+                if_nc_and_nz    or          ina, #RxFlag_BadPayload             ' D - ...if so, set flag (see rxP_Repeat); sh-ina is RxFlags
+rxP_VerifyF16                   or          ina, #RxFlag_WriteByte              'A - turn on writing to hub; sh-ina is RxFlags
                         if_z    subs        _rxOffset, #12                      ' B - if _rxCountdown==0 then chunk's payload bytes done, go to rxF16C0
-                                or          inb, _rxF16L                wz      ' C - should have F16U == F16L == 0; sh-inb is F16U
-                        if_nz   jmp         #RecoveryMode                       ' D - exit for bad checksums
+                                or          inb, _rxF16L                wz      ' C - should have F16U == F16L == 0; sh-inb is rxF16U
+                        if_nz   jmp         #RecoveryMode                       ' D - ...exit for bad checksums
 rxP_Repeat              if_z    subs        _rxOffset, #16                      'A - go to rxF16C0 if all of chunk's payload bytes are received
                         if_nz   subs        _rxOffset, #4                       ' B - ...otherwise, repeat this group
-                                nop                                             ' C - spacer nop
-                                nop                                             ' D - spacer nop
+                                test        ina, #RxFlag_BadPayload     wc      ' C - check if payload size exceeds capacity (from rxF16C1); sh-ina is RxFlags
+                        if_c    mov         _rxAddr, rxPayloadAddrMinusOne      ' D - ...if so, keep resetting address to prevent overrun (command discarded anyway)
 
 
 
@@ -460,12 +475,18 @@ ReceiveCommandFinish
 rxVerifyAddress         if_nz   cmp         cnt, #0-0                       wz      'verify non-broadcast address; s-field set at initialization
                         if_nz   jmp         #ReceiveCommand                         '...wrong non-broadcast address
 
-                                { at this point the packet is completely valid at the Crow level, so recovery mode is not used }
+                                { at this point the packet has no non-reportable errors, so recovery mode is not used;
+                                    it is also correctly addressed, so error responses may be sent for reportable errors (it is safe
+                                    to call the sending code if the command was broadcast -- responses are muted) }
+
+                                { check if payload size exceeded capacity -- a reportable error condition }
+                                test        ina, #RxFlag_BadPayload         wc      'sh-ina is RxFlags
+                        if_c    jmp         #ReceiveCommand
 
                                 { todo: recalibrate }
 
                                 { check command type, exit if user command }
-                                test        ina, #CommandTypeFlag           wc      'c=1 user command; sh-ina is CH0
+                                test        ina, #RxFlag_CommandType        wc      'c=1 user command; sh-ina is RxFlags 
                         if_c    jmp         #UserCommand
                                 
                                 { check admin protocol, exit if supported }
@@ -641,18 +662,18 @@ SendIntermediateHeader
                                 { checks: ensure not muted, and ensure payload size is within buffer size }
 txPerformChecks                 test        packetInfo, #Flag_Mute           wc 
                         if_c    jmp         SendHeader_ret
-                                max         payloadSize, maxPayloadSize
+                                max         payloadSize, kCrowPayloadLimit      'do not allow payloadSize to exceed spec limit
 
                                 { compose header bytes RH0-RH2 }
-                                mov         par, payloadSize                    'shadow PAR used to compose first byte of header
-                                shr         par, #8                             '(assumes payloadLength <= 2047)
+                                mov         par, payloadSize                    'sh-par used for scratch
+                                shr         par, #8                             '(assumes payloadSize does not exceed spec limit)
 txApplyTemplate                 or          par, #0-0
                                 mov         _txAddr, txScratchAddr                      
-                                wrbyte      par, _txAddr
+                                wrbyte      par, _txAddr                        'RH0
                                 add         _txAddr, #1
-                                wrbyte      payloadSize, _txAddr
+                                wrbyte      payloadSize, _txAddr                'RH1
                                 add         _txAddr, #1
-                                wrbyte      token, _txAddr
+                                wrbyte      token, _txAddr                      'RH2
 
                                 { reset F16 }
                                 mov         _txF16L, #0
@@ -859,7 +880,6 @@ _rxWait0            res
 _rxWait1            res
 _rxCountdown        res
 _rxAddr             res
-_rxFlags            res
 _rxRemaining        res
 
 
