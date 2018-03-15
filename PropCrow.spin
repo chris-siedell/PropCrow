@@ -14,13 +14,17 @@ _xinfreq = 5_000_000
 
 
 { Buffer Size Settings
-    These Max* settings determine the sizes of the reserved buffers.
-    By specification, Crow command payloads may not exceed 2047 bytes (MaxRxPayloadSize). The other restrictions
-      are due to code optimizing assumptions made by this implementation.
+  These cMax* settings determine the sizes of the reserved buffers.
+  By specification, Crow command payloads may not exceed 2047 bytes (MaxRxPayloadSize).
 }
-MaxRxPayloadSize    = 100   'Must be 2-2047. The payload buffer will take this many bytes.
-MaxTxPayloadSize    = 100   'Must be 2-2047.
-MaxUserProtocols    = 10    'Must be 4-127. UserProtocolsTable takes 4*MaxUserProtocols bytes
+cMaxRxPayloadSize   = 300   'may be 2-2047 (lower limit due to mechanism to avoid buffer overruns)
+cMaxTxPayloadSize   = 100   'may be 0-2047
+cMaxUserPorts       = 10    'any two byte value (as memory allows)
+
+
+cRxBufferLongs   = (cMaxRxPayloadSize/4) + 1
+cTxBufferLongs   = (cMaxTxPayloadSize/4) + 1
+cUserPortsLongs  = ((cMaxUserPorts*6) / 4) + 1
 
 { Flags and Masks }
 CommandTypeFlag     = %0001_0000    'for CH0
@@ -28,179 +32,159 @@ AddressMask         = %0001_1111    'for CH3
 MuteFlag            = %0100_0000    'for CH3
 
 { Other Constants }
-PropCrowID          = $80   'Must be single byte value (implementation assumption). $80 is the 'official' value for "PropCrow".
+cPropCrowID         = $80
 
 
     Flag_SendCheck  = %1_0000_0000
 
 
+var
+
+    long    __control[9]
+    long    __userPorts[cUserPortsLongs]
+    long    __rxBuffer[cRxBufferLongs]
+    long    __txBuffer[cTxBufferLongs]
+
 
 pub new
-   
-    word[@ControlBlock + 8] := @entry
-    'word[@ControlBlock + 10] := @entry 
-    cognew(@entry, @ControlBlock)
+
+    __control.word[0] := @DatConstants 
+    __control.byte[2] := 255                'lock id / disable
+    __control.byte[3] := 1                  'crow device address 
+    __control.word[2] := @__rxBuffer
+    __control.word[3] := @__txBuffer
+    __control[2] := 115200                  'baudrate
+    __control.word[6] := 250                'interbyte timeout ms
+    __control.word[7] := 100                'break threshold ms
+    __control.word[8] := 0                  'options bitfield
+    __control.byte[18] := 31                'rx pin
+    __control.byte[19] := 30                'tx pin
+    __control.word[10] := 0                 'numUserPorts
+    __control.word[11] := cMaxUserPorts
+    __control.word[12] := @__userPorts
+    __control.word[13] := cMaxRxPayloadSize 
+
+    cognew(@Entry, @__control)
+
+
+{ Control Block
+
+  The control block stores both initialization and runtime settings to control an instance
+  of PropCrow.
+
+  The block must be long-aligned.
+
+  Format:
+    pos  len  con  value
+    0    2    Y    DatConstants address (shared by all instances)
+    2    1    Y    accessLockID, values 8-255 => lock is disabled
+    3    1    Y    crow device address, must be 1 to 31, and unique to comm channel
+    4    2    Y    rxBufferAddr
+    6    2    Y    txBufferAddr, may be identical to rxBufferAddr
+    8    4         baudrate
+    12   2         interbyte timeout in milliseconds
+    14   2         break threshold in milliseconds
+    16   2         options bitfield (described below)
+    18   1    Y    rx pin
+    19   1    Y    tx pin
+    20   2         numUserPorts
+    22   2    Y    maxNumUserPorts
+    24   2    Y    userPortsTableAddr
+    26   2    Y    maxRxPayloadSize
+    28   1    Y    cogID (set by PropCrow cog at initialization)
+    29   3         ...
+    32   4    -    txScratch (used for composing response headers)
+
+  The values with con=Y are assumed by the code to be constant and must not be changed after
+  the cog launches. The other values may be changed by any cog, which is why an access lock
+  is used. If enabled, the lock must be used for reading and writing the mutable values. 
+  The lock may be safely disabled if the values do not change after launch.
+
+  Note: PropCrow assumes hub[0:4] is the clock frequency, and hub[4] is the clock mode.
+  It considers these settings to be protected by the access lock. 
+}
+
+
+{ User Ports Table
+
+  Each entry in this table defines a port opened by user code.
+
+  The table must be word-aligned.
+
+  Entry format:
+    pos  len  value
+    0    2    port number
+    2    1    user code type (0: uses port control block; 1-127: uses code page with this length)
+    3    1    <not used>
+    4    2    address (either of port control block, or of code page)
+
+  Rules:
+    - access lock (if enabled) must be used to read and write
+    - valid entries start at index 0
+    - no gaps
+    - sorted by ascending port number
+    - all port numbers unique (can't be opened twice)
+    - values at index numUserPorts and above are undefined
+    - numUserPorts in [0, maxNumUserPorts)
+}
 
 
 dat
 
-{ ControlBlock
+DatConstants
+
+{ DeviceInfoTemplate (@DatConstants + 0)
+  A template for sending getDeviceInfo responses. The mutable parts (for user ports) are
+  sent separately.
 }
+long    $0000_0100 | ((cPropCrowID & $ff) << 24) | ((cPropCrowID & $ff00) << 8)             'Crow v1, implementationID = cPropCrowID
+long    $0003_0000 | ((cMaxRxPayloadSize & $ff) << 8) | ((cMaxRxPayloadSize & $700) >> 8)   'max commmand payload size, 3 admin ports (upper byte not sent) 
+long    $0100_0000                                                                          'admin ports 0 and 1
+long    $0000_0000 | ((cPropCrowID & $ff) << 8) | ((cPropCrowID & $ff00) >> 8)              'admin port cPropCrowID (upper word not sent)
 
-
-ControlBlock
-long 0
-deviceAddress   byte    1
-byte 0[3]
-word 0  'rxPayloadBufferAddr
-word 20_000  'txPayloadBufferAddr
-
-'Settings = par + 12
-baudrate            long    115200      'must not exceed 3e6, or be zero
-interbyteTimeoutMS  word    250
-breakThresholdMS    word    100
-options             long    0
-
-
-'DeviceInfoTemplate = par + 24
-deviceInfo0     long    $0000_0100 | (PropCrowID << 24)                                                      'Crow v1, implementationID = PropCrowID (assumed to be one byte value)
-deviceInfo1     long    $0002_0000 | ((MaxRxPayloadSize & $ff) << 8) | ((MaxRxPayloadSize & $700) >> 8)    'MaxPayloadLength, 2 admin protocols, numUserProtocols in top byte
-deviceInfo2     long    $0000_0000 | (PropCrowID << 24)                                                      'supports admin protocols numbers 0 and PropCrowID
-txScratch       long    0
-
-{ UserProtocols
-  User commands are processed by code in other cogs. This table consists of a list of long
-    values, where the first word of each long is a supported user protocol number, and the
-    second long is the hub address of the control block for processing that protocol's commands.
-  The number of defined user protocols is stored in the device info template (top byte of deviceInfo1).
-  Summary:
-    protocolNumber[i] = word[@UserProtocols + 2*i]
-    protocolAddr[i] = word[@UserProtocols + 2*i + 2]
-    for i in [0, numUserProtocols)
-  The PropCrow implementation allows the user protocols list to change dynamically, but access must be
-    locked during the change.
-  Order is not important, but there should be no redundancies. If removing an entry be sure to shift the rest down.
+{ NibbleTable (@DatConstants + 16)
+  A table of low bit counts for integers 0 to 15. Used for continuous recalibration.
 }
-UserProtocolsTable
 byte 4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0
-long 0[MaxUserProtocols - 4]
-
 
 
 
 org 0
-entry
-                                or          outa, txMask
-                                or          dira, pin27
 
-                                mov         _addr, par
+Entry
 
-                                add         _addr, #4
+{ The first 16 cog registers will contain a lookup table after initialization is finished (used by
+  the continuous recalibration code). Initially, it contains initialization code. par = address of control block }
+                                 
+                                mov         _addr, par                          'deviceInfoAddr
+                                rdword      deviceInfoAddr, par
 
+                                add         _addr, #2                           'accessLockID
+                                rdbyte      accessLockID, _addr
 
+                                add         _addr, #1                           'crow device address
                                 rdbyte      _x, _addr
-                                movs        rxVerifyAddress, _x 
+                                movs        rxVerifyAddress, _x
 
-                                'todo fix
-                                movs        kLowCounterMode, #31
-                                mov         frqb, #1
+                                add         _addr, #1                           'rxBufferAddr, rxBufferAddrMinusOne
+                                mov         rxBufferAddr, _addr
+                                mov         rxBufferAddrMinusOne, rxBufferAddr
+                                sub         rxBufferAddrMinusOne, #1
+                
+                                add         _addr, #2                           'txBufferAddr
+                                mov         txBufferAddr, _addr
 
-                                add         _addr, #4
-                                rdword      rxPayloadAddr, _addr
-
-                                mov         rxPayloadAddrMinusOne, rxPayloadAddr
-                                sub         rxPayloadAddrMinusOne, #1
-
-                                add         _addr, #2
-                                rdword      txPayloadAddr, _addr
-                                
-                                add         _addr, #2
-                                mov         settingsAddr, _addr
-
-                                add         _addr, #12
-                                mov         deviceInfoTemplateAddr, _addr
+                                add         _addr, #2                           'serSettingsAddr (starts at baudrate)
+                                mov         serSettingsAddr, _addr
 
                                 jmp         #FinishInit
 
+long 0[16-$]
+fit 16
+org 16
 
-kOneInDField        long |< 9
-
-
-rxPayloadAddr           long 0
-rxPayloadAddrMinusOne   long 0
-txPayloadAddr           long 0
-txScratchAddr           long 0
-
-numUserProtocolsAddr    long 0
-userProtocolsTableAddr  long 0
-deviceInfoTemplateAddr  long 0
-settingsAddr            long 0
-
-maxPayloadSize          long    MaxRxPayloadSize
-'stopBitDuration         long 698
-kLowCounterMode         long    $3000_0000 'nop
-'breakMultiple           long 3602
-'recoveryTime            long 11104
-'timeout                 long 80_000
-'startBitWait            long 337
-rxMask                  long |< 31
-txMask                  long |< 30
-pin27                   long |< 27
-
-
-{ Serial Timings 
-bitPeriod0          long    694
-bitPeriod1          long    694
-startBitWait        long    337
-stopBitDuration     long    698
-breakMultiple       long    720
-recoveryTime        long    11104
-ibTimeout           long    2_000_000
-}
-
-'bitPeriod0      long 694
-'bitPeriod1      long 695
-'bitPeriod       long 694
-
-rxPhsbReset     long 1050 ' = 5 + startBitWait + bitPeriod0 + 5 + 4 + 4 + 1 (unsure where the 1 comes from)
-
-kCrowPayloadLimit       long 2047   'The payload size limit imposed by the specification (11 bits in v1 and v2).
-
-
-{ _rxMixed Notes
-    The _rxMixed register contains several pieces of information used by the receiving code:
-        lowBitCount (upper word) - the count of low data bits, used by the auto-recalibration code
-        E (bit 15) - flag used to detect when the command payload exceeds the buffer size, to prevent overruns
-        W (bit 14) - flag used to identify which packet bytes to write to the hub (i.e. payload bytes)
-        I (bit 13) - flag used to record that an interbyte timeout has occurred
-        byteCount (bits 0-12) - the number of packet bytes received, as a negative number (used by auto-recal code)
-    So this is the layout
-        |---lowBitCount--|EWI|--byteCount--|
-    Value after initial reset:
-        |0000000000000000|000|1111111111111|
-    Value after interbyte timeout reset:
-        |0000000000000000|001|1111111111111|
-    Considerations:
-        - The sizes of lowBitCount and byteCount were chosen so that this mechanism will work with payload sizes
-            up to 4095 bytes (the expected maximum allowed in any future Crow revisions).
-        - The placement of the I flag allows the W flag mask to be used as the reset value for _rxMixed, which works
-            because of the djnz at the bottom of the loop.
-        - The byte count mask ($1fff), which is necessary to extract byteCount, also serves as the reset value
-            for the initial pass through the receive loop.
-        - The byte count is made by the djnz at the bottom of the loop -- a jump is required anyway, so the byte
-            count comes for free. _rxMixed never reaches zero since the initial value exceeds any possible
-            packet size (the parser enforces this limit, even if the host keeps sending bytes).
-    See page 114.
-}   
-excPayloadFlag          long    |< 15       'flag in _rxMixed, indicates command payload exceeds buffer capacity
-rxMixedTimoutReset                          'used to reset _rxMixed when an interbyte timeout has occurred
-writeByteFlag           long    |< 14       'flag in _rxMixed, used by parsing code to identify payload bytes to write to hub
-ibTimeoutFlag           long    |< 13       'flag in _rxMixed, used to signify that an interbyte timeout has occurred
-rxMixedInitReset        long    $1fff       'used to reset _rxMixed for the first time through the receive loop
-kOneInUpperWord         long    $1_0000     'used to increment lowBitCount in _rxMixed
-
-
-
+pin27 long |< 27
+                                
 { ReceiveCommand
   This routine contains the receive loop used to receive and process bytes. Processing is done using
     shifted parsing instructions, which are explained in more detail in the "Parsing Instructions" 
@@ -213,7 +197,6 @@ kOneInUpperWord         long    $1_0000     'used to increment lowBitCount in _r
 }
 ReceiveCommand
 
-                                or          outa, pin27
 
 
                                 { pre-loop initialization}
@@ -227,11 +210,9 @@ ReceiveCommand
 
                                 { prepare auto-recalibration }
                                 mov         _rxMixed, rxMixedInitReset              'rxMixed - reset for first pass through loop
-                                mov         ctrb, kLowCounterMode
+'                                mov         ctrb, kLowCounterMode
                                 test        rxMask, ina                     wz      'z=1 rx pin already low -- missed falling edge todo: do phsb check after instead
                                 mov         _rxPrevByte, #$ff                       'so _rxPrevByte contributes no low bits during first pass through loop
-
-                            mov         _rxLowBits2, #0
 
                         if_nz   waitpne     rxMask, rxMask                          'wait for start bit edge
                         if_nz   add         _rxWait0, cnt
@@ -251,18 +232,9 @@ rxBit0                          waitcnt     _rxWait0, bitPeriod1
                         if_nc   mov         _rxF16L, #0                             'F16 1 - see page 90
                         if_c    add         _rxF16L, _rxPrevByte                    'F16 2
 
-                            add         _rxLowBits2, #1
-                    if_nz   add         _rxLowBits2, #1
-
 'bit1 - 34 clocks
 rxBit1                          waitcnt     _rxWait1, bitPeriod0
                                 testn       rxMask, ina                     wz
-
-'                    if_nc   mov         _tmp, phsb
-'                    if_nc   wrlong      _tmp, #504 
-
-                    if_nz   add         _rxLowBits2, #1
-
                                 muxz        _rxByte, #%0000_0010
                         if_c    cmpsub      _rxF16L, #255                           'F16 3
                         if_nc   mov         inb, #0                                 'F16 4 - during receiving, sh-inb is rxF16U
@@ -273,7 +245,6 @@ rxBit1                          waitcnt     _rxWait1, bitPeriod0
 'bit 2 - 34 clocks
 rxBit2                          waitcnt     _rxWait1, bitPeriod1
                                 testn       rxMask, ina                     wz
-                    if_nz   add         _rxLowBits2, #1
                                 muxz        _rxByte, #%0000_0100
                                 subs        _rxResetOffset, _rxOffset               'Shift 2 - adjust reset offset
                                 adds        rxMovA, _rxOffset                       'Shift 3 - (next four) offset addresses for next parsing group
@@ -284,7 +255,6 @@ rxBit2                          waitcnt     _rxWait1, bitPeriod1
 'bit 3 - 34 clocks
 rxBit3                          waitcnt     _rxWait1, bitPeriod0
                                 testn       rxMask, ina                     wz
-                    if_nz   add         _rxLowBits2, #1
                                 muxz        _rxByte, #%0000_1000
                                 mov         _rxWait0, startBitWait                  'Wait 3 - must follow Auto-Recal's saving of _rxWait0
                                 adds        rxMovC, _rxOffset                       'Shift 5
@@ -295,7 +265,6 @@ rxMovA                          mov         rxShiftedA, 0-0                     
 'bit 4 - 34 clocks
 rxBit4                          waitcnt     _rxWait1, bitPeriod1
                                 testn       rxMask, ina                     wz
-                    if_nz   add         _rxLowBits2, #1
                                 muxz        _rxByte, #%0001_0000
 rxMovB                          mov         rxShiftedB, 0-0                         'Shift 9
 rxMovC                          mov         rxShiftedC, 0-0                         'Shift 10
@@ -306,13 +275,11 @@ rxMovD                          mov         rxShiftedD, 0-0                     
 'bit 5 - 33 clocks
 rxBit5                          waitcnt     _rxWait1, bitPeriod0
                                 testn       rxMask, ina                     wz
-                    if_nz   add         _rxLowBits2, #1
                         if_c    wrbyte      _rxPrevByte, _rxAddr                    'Write 3 - wrbyte excludes any other instructions besides testn
 
 'bit 6 - 34 clocks
 rxBit6                          waitcnt     _rxWait1, bitPeriod1
                                 test        rxMask, ina                     wc
-                    if_nc   add         _rxLowBits2, #1
                                 muxz        _rxByte, #%0010_0000
                                 muxc        _rxByte, #%0100_0000
                                 sub         _rxCountdown, #1                wz      'Countdown - used by parsing code to determine when F16 follows payload bytes
@@ -323,7 +290,6 @@ rxAddLowerNibble                add         _rxMixed, kOneInUpperWord           
 'bit 7 - 34 clocks
 rxBit7                          waitcnt     _rxWait1, bitPeriod0
                                 test        rxMask, ina                     wc
-                    if_nc   add         _rxLowBits2, #1
                                 muxc        _rxByte, #%1000_0000
                                 shr         _rxPrevByte, #4                         'Auto-Recal 6 - (next three) determine low bit count in upper nibble
                                 movs        rxAddUpperNibble, _rxPrevByte           'Auto-Recal 7
@@ -358,7 +324,7 @@ rxStartBit              if_z    waitcnt     _rxWait0, bitPeriod0
   See page 99.
 }
 RecoveryMode
-                                mov         ctrb, kLowCounterMode
+'                                mov         ctrb, kLowCounterMode
                                 mov         cnt, recoveryTime
                                 add         cnt, cnt
                                 mov         _rcvyPrevPhsb, phsb                     'first interval always recoveryTime+1 counts, so at least one loop for break 
@@ -366,7 +332,7 @@ RecoveryMode
 rcvyLoop                        waitcnt     cnt, recoveryTime
                                 mov         _rcvyCurrPhsb, phsb
                                 cmp         _rcvyPrevPhsb, _rcvyCurrPhsb    wz      'z=1 line always high, so exit
-                        if_z    mov         ctrb, #0                                'ctrb must be off before exit
+'                        if_z    mov         ctrb, #0                                'ctrb must be off before exit
                         if_z    jmp         #ReceiveCommand                         '...exit: line is idle -- ready for next command
                                 mov         par, _rcvyPrevPhsb
                                 add         par, recoveryTime
@@ -374,7 +340,7 @@ rcvyLoop                        waitcnt     cnt, recoveryTime
                         if_nz   mov         inb, breakMultiple                      'reset break detection countdown
                                 mov         _rcvyPrevPhsb, _rcvyCurrPhsb
                                 djnz        inb, #rcvyLoop
-                                mov         ctrb, #0                                'ctrb must be off before exit
+'                                mov         ctrb, #0                                'ctrb must be off before exit
 
                         { fall through when a break is detected }
 
@@ -445,47 +411,46 @@ BreakHandler
   The parsing groups are labelled by the byte being received when they execute.
 }
 rxFirstParsingGroup
-rxH0                            test        _rxByte, #%0010_1000        wz      'A - z=1 if reserved bits 3 and 5 are zero, as required
-                if_nc_or_nz     jmp         #RecoveryMode                       ' B - ...exit for bad reserved bits; c (bit 6) must be 1
-                        if_c    jmp         #RecoveryMode                       ' C - ...exit for bad reserved bit; c (bit 7) must be 0
-                                mov         ina, _rxByte                        ' D - save T flag in sh-ina
-rxH1                            mov         payloadSize, _rxPrevByte            'A - extract payload size
-                                and         payloadSize, #$7                    ' B
-                                shl         payloadSize, #8                     ' C
-                                or          payloadSize, _rxByte                ' D
-rxH2                            mov         _rxRemaining, payloadSize           'A - _rxRemaining keeps track of how many payload bytes are left to receive
-                                mov         _rxAddr, rxPayloadAddrMinusOne      ' B - reset address for writing to hub
-                                mov         par, #0                             ' C - set implicit protocol; sh-par used to store protocol
-                                mov         token, _rxByte                      ' D
-rxH3                            test        _rxByte, #%0010_0000        wz      'A - z=1 if reserved bit 5 is zero, as required
-                        if_nz   jmp         #RecoveryMode                       ' B - ...exit for bad reserved bit
-                                mov         packetInfo, _rxByte                 ' C - preserve Crow address and mute flag
-                        if_nc   mov         _rxOffset, #12                      ' D - skip rxH4 and rxH5 if using implicit protocol
-rxH4                            nop                                             'A - spacer nop
-                                nop                                             ' B - spacer nop
-                                mov         par, _rxByte                        ' C
-                                shl         par, #8                             ' D
-rxH5                            nop                                             'A - spacer nop
-                                nop                                             ' B - spacer nop
-                                nop                                             ' C - spacer nop
-                                or          par, _rxByte                        ' D
-rxF16C0                         andn        _rxMixed, writeByteFlag             'A - turn off writing to hub (don't write F16 bytes)
-                                mov         _rxCountdown, _rxRemaining          ' B - _rxCountdown used to keep track of payload bytes left in chunk 
-                                max         _rxCountdown, #128                  ' C - chunks are limited to 128 data bytes
-                                sub         _rxRemaining, _rxCountdown          ' D - _rxRemaining is number of payload bytes after the coming chunk
-rxF16C1                         add         _rxCountdown, #1            wz      'A - undo automatic decrement; check if _rxCountdown==0 (next chunk empty)
-                        if_z    mov         rxStartWait, rxExit                 ' B - ...exit receive loop if no bytes in next chunk (all bytes received)
-                                cmp         payloadSize, maxPayloadSize wz, wc  ' C - check if command payload size exceeds buffer capacity
-                if_nc_and_nz    or          _rxMixed, excPayloadFlag            ' D - ...if so, set flag (used in rxP_Repeat)
-rxP_VerifyF16                   or          _rxMixed, writeByteFlag             'A - turn on writing to hub
-                        if_z    subs        _rxOffset, #12                      ' B - if _rxCountdown==0 then chunk's payload bytes done, go to rxF16C0
-                                or          inb, _rxF16L                wz      ' C - should have F16U == F16L == 0; sh-inb is rxF16U
-                        if_nz   jmp         #RecoveryMode                       ' D - ...exit for bad checksums
-rxP_Repeat              if_z    subs        _rxOffset, #16                      'A - go to rxF16C0 if all of chunk's payload bytes are received
-                        if_nz   subs        _rxOffset, #4                       ' B - ...otherwise, repeat this group
-                                test        _rxMixed, excPayloadFlag    wc      ' C - check if payload size exceeds capacity (from rxF16C1)
-                        if_c    mov         _rxAddr, rxPayloadAddrMinusOne      ' D - ...if so, keep resetting address to prevent overrun (command discarded anyway)
-
+rxH0                            test        _rxByte, #%0010_1000            wz      'A - z=1 if reserved bits 3 and 5 are zero, as required
+                if_nc_or_nz     jmp         #RecoveryMode                           ' B - ...exit for bad reserved bits; c (bit 6) must be 1
+                        if_c    jmp         #RecoveryMode                           ' C - ...exit for bad reserved bit; c (bit 7) must be 0
+                                mov         ina, _rxByte                            ' D - save T flag in sh-ina
+rxH1                            mov         payloadSize, _rxPrevByte                'A - extract payload size
+                                and         payloadSize, #$7                        ' B
+                                shl         payloadSize, #8                         ' C
+                                or          payloadSize, _rxByte                    ' D
+rxH2                            mov         _rxRemaining, payloadSize               'A - _rxRemaining keeps track of how many payload bytes are left to receive
+                                mov         _rxAddr, rxBufferAddrMinusOne           ' B - reset address for writing to hub
+                                mov         par, #0                                 ' C - set implicit protocol; sh-par used to store protocol
+                                mov         token, _rxByte                          ' D
+rxH3                            test        _rxByte, #%0010_0000            wz      'A - z=1 if reserved bit 5 is zero, as required
+                        if_nz   jmp         #RecoveryMode                           ' B - ...exit for bad reserved bit
+                                mov         packetInfo, _rxByte                     ' C - preserve Crow address and mute flag
+                        if_nc   mov         _rxOffset, #12                          ' D - skip rxH4 and rxH5 if using implicit protocol
+rxH4                            nop                                                 'A - spacer nop
+                                nop                                                 ' B - spacer nop
+                                mov         par, _rxByte                            ' C
+                                shl         par, #8                                 ' D
+rxH5                            nop                                                 'A - spacer nop
+                                nop                                                 ' B - spacer nop
+                                nop                                                 ' C - spacer nop
+                                or          par, _rxByte                            ' D
+rxF16C0                         andn        _rxMixed, writeByteFlag                 'A - turn off writing to hub (don't write F16 bytes)
+                                mov         _rxCountdown, _rxRemaining              ' B - _rxCountdown used to keep track of payload bytes left in chunk 
+                                max         _rxCountdown, #128                      ' C - chunks are limited to 128 data bytes
+                                sub         _rxRemaining, _rxCountdown              ' D - _rxRemaining is number of payload bytes after the coming chunk
+rxF16C1                         add         _rxCountdown, #1                wz      'A - undo automatic decrement; check if _rxCountdown==0 (next chunk empty)
+                        if_z    mov         rxStartWait, rxExit                     ' B - ...exit receive loop if no bytes in next chunk (all bytes received)
+                                cmp         payloadSize, maxRxPayloadSize   wz, wc  ' C - check if command payload size exceeds buffer capacity
+                if_nc_and_nz    or          _rxMixed, excPayloadFlag                ' D - ...if so, set flag (used in rxP_Repeat)
+rxP_VerifyF16                   or          _rxMixed, writeByteFlag                 'A - turn on writing to hub
+                        if_z    subs        _rxOffset, #12                          ' B - if _rxCountdown==0 then chunk's payload bytes done, go to rxF16C0
+                                or          inb, _rxF16L                    wz      ' C - should have F16U == F16L == 0; sh-inb is rxF16U
+                        if_nz   jmp         #RecoveryMode                           ' D - ...exit for bad checksums
+rxP_Repeat              if_z    subs        _rxOffset, #16                          'A - go to rxF16C0 if all of chunk's payload bytes are received
+                        if_nz   subs        _rxOffset, #4                           ' B - ...otherwise, repeat this group
+                                test        _rxMixed, excPayloadFlag        wc      ' C - check if payload size exceeds capacity (from rxF16C1)
+                        if_c    mov         _rxAddr, rxBufferAddrMinusOne           ' D - ...if so, keep resetting address to prevent overrun (command discarded anyway)
 
 
 { Receive Loop Continue / Exit Instructions
@@ -496,10 +461,9 @@ rxExit                  if_z    jmp         #ReceiveCommandFinish
 
 
 { ReceiveCommandFinish
-  This code runs when all  }
+  This code runs after all packet bytes have been received. }
 ReceiveCommandFinish
-                                mov         ctrb, #0                                'turn off low bit counter
-                            
+                                mov         _tmp, ctrb                              'save number of low bit clock counts
 
                                 { verify checksums for last byte }
                                 add         _rxF16L, _rxByte                        'compute F16L for last byte
@@ -527,7 +491,7 @@ rxVerifyAddress         if_nz   cmp         cnt, #0-0                       wz  
                                 shl         _x, #19
                                 sar         _x, #19
                                 abs         _x, _x
-                                
+ 
                                 mov         _tmp, _rxMixed                          'then add in number of low data bits (up to last byte)
                                 shr         _tmp, #16
                                 add         _x, _tmp
@@ -537,17 +501,6 @@ rxVerifyAddress         if_nz   cmp         cnt, #0-0                       wz  
                         if_nc   add         _x, #1
                                 djnz        inb, #:loop
 
-{
-                            mov         _tmp, phsb
-                            wrlong      _tmp, #4
-                            wrlong      _x, #8
-                            wrlong      _rxLowBits2, #12 
-                            wrlong      _rxByte, #16
-
-                            sub         _rxWait1, _rxLastWait1
-                            wrlong      _rxWait1, #20
-}
-
                                 { check if payload size exceeded capacity -- a reportable error condition }
                                 test        _rxMixed, excPayloadFlag        wc
                         if_c    jmp         #ReceiveCommand
@@ -555,23 +508,25 @@ rxVerifyAddress         if_nz   cmp         cnt, #0-0                       wz  
                                 { check command type, exit if user command }
                                 test        ina, #CommandTypeFlag           wc      'c=1 user command; sh-ina is H0 from rxH0
                         if_c    jmp         #UserCommand
-                                
+
                                 { check admin protocol, exit if supported }
                                 cmp         par, #0                         wz      'sh-par is protocol (from rxH2 or rxH5)
                         if_z    jmp         #UniversalAdminCommand
-                                cmp         par, #PropCrowID                wz      'PropCrowID assumed to be 9-bit or less
+
+                                cmp         par, #1                         wz
+                        if_z    jmp         #AdminPort1Command
+
+                                cmp         par, propCrowAdminPort          wz
                         if_z    jmp         #PropCrowAdminCommand
 
                                 jmp         #ReceiveCommand
 
 
 { UniversalAdminCommand
-  The universal admin commands (admin protocol 0) are defined in "Crow Specification v1.txt".
-  There are two commands: ping, and getDeviceInfo.
+  The universal admin commands (admin port 0) are defined in "Crow Specification v1.txt".
+  There are two commands: ping and getDeviceInfo.
 }
 UniversalAdminCommand
-
-
                                 { admin protocol 0 with no payload is ping }
                                 cmp         payloadSize, #0                 wz      'z=1 ping command
                         if_nz   jmp         #:getDeviceInfo
@@ -579,33 +534,43 @@ UniversalAdminCommand
 
                                 { other admin protocol 0 command, getDeviceInfo, has 0x00 as payload }
 :getDeviceInfo                  cmp         payloadSize, #1                 wz      'z=0 wrong payload size for getDeviceInfo (1)
-                        if_z    rdbyte      cnt, rxPayloadAddr                      'load payload byte into sh-cnt
+                        if_z    rdbyte      cnt, rxBufferAddr                       'load payload byte into sh-cnt
                         if_z    cmp         cnt, #$00                       wz      'z=0 wrong payload for getDeviceInfo
                         if_nz   jmp         #ReceiveCommand                         '...command not getDeviceInfo or ping
 
                                 { perform getDeviceInfo }
 
-                                call        #LockSharedAccess                       'the user protocols list is allowed to change
+                                call        #LockSharedAccess
 
-                                rdbyte      _tmpCount, numUserProtocolsAddr         'get number of user protocols
+                                rdword      _tmpCount, numUserPortsAddr             'get number of open user ports
+                                max         _tmpCount, #255                         'getDeviceInfo limited to reporting 255 user ports
 
-                                mov         payloadSize, _tmpCount                  'response payload size is 12 + 2*numUserProtocols (assuming 2 admin protocols)
+                                mov         payloadSize, _tmpCount                  'response payload size is 14 + 2*numReportedUserPorts (assumes 3 admin protocols)
                                 shl         payloadSize, #1
-                                add         payloadSize, #12
-
+                                add         payloadSize, #14
                                 call        #SendFinalHeader
 
-                                mov         payloadAddr, deviceInfoTemplateAddr     'send first 12 bytes of device info response
-                                mov         payloadSize, #12
-                                call        #SendPayloadBytes
+                                mov         payloadAddr, deviceInfoAddr
+                                mov         payloadSize, #7
+                                call        #SendPayloadBytes                       'send up to num reported user ports
+
+                                wrbyte      _tmpCount, txBufferAddr
+                                mov         payloadAddr, txBufferAddr
+                                mov         payloadSize, #1
+                                call        #SendPayloadBytes                       'send number of reported user ports
+
+                                mov         payloadAddr, deviceInfoAddr
+                                add         payloadAddr, #8
+                                mov         payloadSize, #6
+                                call        #SendPayloadBytes                       'send open admin ports from template
 
                                 cmp         _tmpCount, #0                   wz
-                        if_z    jmp         #:finish                                '...skip if no user protocols
+                        if_z    jmp         #:finish                                '...skip if no user ports
 
-                                mov         payloadAddr, userProtocolsTableAddr     'send the user protocol numbers directly from the table
-                                sub         payloadAddr, #3
+                                mov         payloadAddr, userPortsAddr              'send the user port numbers directly from the table
+                                sub         payloadAddr, #5
 
-:loop                           add         payloadAddr, #4                         'MSB             
+:loop                           add         payloadAddr, #6                         'MSB             
                                 mov         payloadSize, #1
                                 call        #SendPayloadBytes
                                 sub         payloadAddr, #2                         'LSB
@@ -621,16 +586,25 @@ UniversalAdminCommand
                                 jmp         #ReceiveCommand
 
 
-{ PropCrowAdminCommand
+{ AdminPort1Command
+  The admin port 1 protocol (defined in "Crow Specification v2.txt") defines several general admin commands.
+}
+AdminPort1Command
+                                mov         payloadAddr, rxBufferAddr
+                                jmp         #SendFinalResponse
 
+{ PropCrowAdminCommand
+  Admin commands received on this port are specific to PropCrow.
 }
 PropCrowAdminCommand
-                                mov         payloadAddr, rxPayloadAddr
+                                mov         payloadAddr, rxBufferAddr
                                 jmp         #SendFinalResponse
 
 { UserCommand
 }
 UserCommand
+
+{
                                 mov         _addr, txPayloadAddr
                                 movd        :loop2, #bitPeriod0
                                 mov         inb, #7
@@ -639,9 +613,9 @@ UserCommand
                                 add         :loop2, kOneInDField 
                                 add         _addr, #4
                                 djnz        inb, #:loop2
-
+}
                                 mov         payloadSize, #28
-                                mov         payloadAddr, txPayloadAddr
+                                mov         payloadAddr, txBufferAddr
 
                                 jmp         #SendFinalResponse
 
@@ -739,7 +713,7 @@ SendIntermediateHeader
 txPerformChecks                 test        packetInfo, #MuteFlag           wc 
                         if_c    jmp         SendHeader_ret
                                 max         payloadSize, kCrowPayloadLimit      'do not allow payloadSize to exceed spec limit
-
+                                
                                 { compose header bytes RH0-RH2 }
                                 mov         par, payloadSize                    'sh-par used for scratch
                                 shr         par, #8                             '(assumes payloadSize does not exceed spec limit)
@@ -897,14 +871,14 @@ txSendAndResetF16_ret           ret
 CalculateTimings
                                 call        #LockSharedAccess
 
-                                mov         _addr, settingsAddr
+                                mov         _addr, serSettingsAddr              'serSettingsAddr = par + 8
                                 rdlong      _baud, _addr
                                 add         _addr, #4
                                 rdword      _ibTimeoutMS, _addr
                                 add         _addr, #2
                                 rdword      _breakMS, _addr
                                 add         _addr, #2
-                                rdlong      _options, _addr
+                                rdword      _options, _addr
                                 rdlong      _clk, #0
 
                                 call        #UnlockSharedAccess
@@ -925,7 +899,7 @@ CalculateTimings
 
                                 mov         startBitWait, bitPeriod0
                                 shr         startBitWait, #1
-                                sub         startBitWait, #10                   'startBitWait ready; must not be < 5, but won't if bitPeriod0 >= 30
+                                sub         startBitWait, #10                   'startBitWait ready; must not be < 5 (won't if bitPeriod0 >= 34)
             
                                 mov         _x, _clk
                                 mov         _y, #10
@@ -946,7 +920,7 @@ CalculateTimings
                                 mov         _x, _clk
                                 mov         _y, k1000
                                 call        #Divide
-                                mov         _clk, _y                            'clk is now clocks per millisecond
+                                mov         _clk, _y                            '_clk is now clocks per millisecond
 
                                 mov         _x, _ibTimeoutMS
                                 call        #Multiply
@@ -963,6 +937,10 @@ CalculateTimings
                                 call        #Divide
                                 min         _y, #1
                                 mov         breakMultiple, _y                   'breakMultiple ready
+
+                                mov         rxPhsbReset, #19
+                                add         rxPhsbReset, startBitWait
+                                add         rxPhsbReset, bitPeriod0             'rxPhsbReset ready (= 5 + startBitWait + bitPeriod0 + 5 + 4 + 4 + 1)
 
 CalculateTimings_ret            ret
 
@@ -1007,46 +985,120 @@ Divide_ret                      ret
 _rxByte         long 0 
 _rxPrevByte     long 0
 
-k1000   long    1000
+k1000               long    1000
+kCrowPayloadLimit   long    2047   'The payload size limit imposed by the specification (11 bits in v1 and v2).
+kOneInDField        long    |< 9           '(nop)
 
-reset_bitPeriod0          long    694
-reset_stopBitDuration     long    698
+
+
+
+ { Constants (after initialization) }
+lowCounterMode      long    $3000_0000     '(nop) rx pin set at initialization
+rxMask              long    1              'shifted at initialization
+txMask              long    1
+
+
+propCrowAdminPort   long    cPropCrowID
+ 
+
+{ _rxMixed Notes
+    The _rxMixed register contains several pieces of information used by the receiving code:
+        lowBitCount (upper word) - the count of low data bits, used by the auto-recalibration code
+        E (bit 15) - flag used to detect when the command payload exceeds the buffer size, to prevent overruns
+        W (bit 14) - flag used to identify which packet bytes to write to the hub (i.e. payload bytes)
+        I (bit 13) - flag used to record that an interbyte timeout has occurred
+        byteCount (bits 0-12) - the number of packet bytes received, as a negative number (used by auto-recal code)
+    So this is the layout
+        |---lowBitCount--|EWI|--byteCount--|
+    Value after initial reset:
+        |0000000000000000|000|1111111111111|
+    Value after interbyte timeout reset:
+        |0000000000000000|001|1111111111111|
+    Considerations:
+        - The sizes of lowBitCount and byteCount were chosen so that this mechanism will work with payload sizes
+            up to 4095 bytes (the expected maximum allowed in any future Crow revisions).
+        - The placement of the I flag allows the W flag mask to be used as the reset value for _rxMixed, which works
+            because of the djnz at the bottom of the loop.
+        - The byte count mask ($1fff), which is necessary to extract byteCount, also serves as the reset value
+            for the initial pass through the receive loop.
+        - The byte count is made by the djnz at the bottom of the loop -- a jump is required anyway, so the byte
+            count comes for free. _rxMixed never reaches zero since the initial value exceeds any possible
+            packet size (the parser enforces this limit, even if the host keeps sending bytes).
+    See page 114.
+}   
+excPayloadFlag          long    |< 15       'flag in _rxMixed, indicates command payload exceeds buffer capacity
+rxMixedTimoutReset                          'used to reset _rxMixed when an interbyte timeout has occurred
+writeByteFlag           long    |< 14       'flag in _rxMixed, used by parsing code to identify payload bytes to write to hub
+ibTimeoutFlag           long    |< 13       'flag in _rxMixed, used to signify that an interbyte timeout has occurred
+rxMixedInitReset        long    $1fff       'used to reset _rxMixed for the first time through the receive loop
+kOneInUpperWord         long    $1_0000     'used to increment lowBitCount in _rxMixed
+
+
+
+
+
 
 
 '*** Everything past this point will be temporaries
 
+fit 440
+
+
 FinishInit
+                                or          dira, pin27
 
 
-                                add         _addr, #7
-                                mov         numUserProtocolsAddr, _addr
+                                add         _addr, #10                          'rx pin
+                                rdbyte      _x, _addr
+                                shl         rxMask, _x
+                                movs        lowCounterMode, 0
 
-                                add         _addr, #5
-                                mov         txScratchAddr, _addr 
+                                add         _addr, #1                           'tx pin
+                                rdbyte      _x, _addr
+                                shl         txMask, _x
+                                or          outa, txMask
 
-                                add         _addr, #4
-                                mov         userProtocolsTableAddr, _addr
+                                add         _addr, #1                           'numUserPortsAddr
+                                mov         numUserPortsAddr, _addr
 
-                                { load low bit count table from hub into registers 0-15 }
+                                add         _addr, #2                           'maxNumUserPorts
+                                rdword      maxNumUserPorts, _addr
+
+                                add         _addr, #2                           'userPortsAddr
+                                rdword      userPortsAddr, _addr
+
+                                add         _addr, #2                           'maxRxPayloadSize
+                                rdword      maxRxPayloadSize, _addr
+
+                                add         _addr, #2                           'cogID (written to hub)
+                                cogid       _x
+                                wrbyte      _x, _addr
+
+                                add         _addr, #4                           'txScratchAddr
+                                mov         txScratchAddr, _addr
+
+                                { other one-time initializations }
+                                mov         frqb, #1
+                              
+                                { load low bit count table from hub into registers 0-15 (this saves a trivial amount of hub memory) }
                                 mov         inb, #16
-:loop                           rdbyte      15, _addr
-                                shl         15, #16                                 'lowBitCount is in upper word of _rxMixed (see "_rxMixed Notes")
-                                mov         0, 15
+                                mov         _addr, par
+                                add         _addr, #16
+:loop                           rdbyte      _x, _addr
+                                shl         _x, #16                             'lowBitCount is in upper word of _rxMixed (see "_rxMixed Notes")
+                                mov         0-0, _x
                                 add         $-1, kOneInDField
                                 add         _addr, #1
                                 djnz        inb, #:loop
 
                                 call        #CalculateTimings
 
+                                or          outa, pin27
+
                                 jmp         #UserCommand
-
-
-
-
-
+fit 472
 
 org FinishInit
-
 
 _options        res
 _clk            res
@@ -1089,7 +1141,6 @@ _txF16L         res
 _rxResetOffset
 _txF16U         res
 
-_rxLowBits2         res
 
 _rxWait0            res
 _rxWait1            res
@@ -1099,8 +1150,13 @@ _rxRemaining        res
 
 _tmpCount       res
 
+fit 472
+org 472
 
-lowBits         res
+_x      res
+_y      res
+_z      res
+_addr   res
 
 
 { Serial Timings }
@@ -1111,14 +1167,21 @@ stopBitDuration res
 breakMultiple   res
 recoveryTime    res
 ibTimeout       res
+rxPhsbReset     res
 
-_x res
-_y res
-_z res
+{ Constants (after initialization) }
+deviceInfoAddr          res
+accessLockID            res
+rxBufferAddr            res
+rxBufferAddrMinusOne    res
+txBufferAddr            res
+serSettingsAddr         res
+numUserPortsAddr        res
+maxNumUserPorts         res
+userPortsAddr           res
+maxRxPayloadSize        res
+txScratchAddr           res
 
-
-
-_addr res
 
 fit 496
 
