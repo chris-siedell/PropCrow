@@ -26,13 +26,23 @@ cRxBufferLongs   = (cMaxRxPayloadSize/4) + 1
 cTxBufferLongs   = (cMaxTxPayloadSize/4) + 1
 cUserPortsLongs  = ((cMaxUserPorts*6) / 4) + 1
 
-{ Flags and Masks }
+{ flags and masks }
 CommandTypeFlag     = %0001_0000    'for CH0
 AddressMask         = %0001_1111    'for CH3
 MuteFlag            = %0100_0000    'for CH3
 
-{ Other Constants }
-cPropCrowID         = $80
+{ masks used for the serialOptions bitfields }
+cUseSource          = %0000_0001
+cUseBaudDetect      = %0000_0010
+cUseContRecal       = %0000_0100
+cUseTwoStopBits     = %1000_0000
+
+{ masks used for otherOptions bitfield }
+cEnableReset        = %0000_0001
+cAllowRemoteChanges = %0000_0010
+
+{ other }
+cPropCrowID         = $abcd
 
 
     Flag_SendCheck  = %1_0000_0000
@@ -40,7 +50,6 @@ cPropCrowID         = $80
 
 var
 
-    long    __control[9]
     long    __userPorts[cUserPortsLongs]
     long    __rxBuffer[cRxBufferLongs]
     long    __txBuffer[cTxBufferLongs]
@@ -48,61 +57,109 @@ var
 
 pub new
 
-    __control.word[0] := @DatConstants 
-    __control.byte[2] := 255                'lock id / disable
-    __control.byte[3] := 1                  'crow device address 
-    __control.word[2] := @__rxBuffer
-    __control.word[3] := @__txBuffer
-    __control[2] := 115200                  'baudrate
-    __control.word[6] := 250                'interbyte timeout ms
-    __control.word[7] := 100                'break threshold ms
-    __control.word[8] := 0                  'options bitfield
-    __control.byte[18] := 31                'rx pin
-    __control.byte[19] := 30                'tx pin
-    __control.word[10] := 0                 'numUserPorts
-    __control.word[11] := cMaxUserPorts
-    __control.word[12] := @__userPorts
-    __control.word[13] := cMaxRxPayloadSize 
+    __numUserPorts      := 3
+    __userPorts.word[0] := 0
+    __userPorts.word[3] := 1
+    __userPorts.word[6] := 78
 
-    cognew(@Entry, @__control)
+    __userPortsAddr     := @__userPorts
+    __rxBufferAddr      := @__rxBuffer
+    __txBufferAddr      := @__txBuffer
+    __datConstansAddr   := @DatConstants
+
+    cognew(@Entry, @ControlBlock)
 
 
-{ Control Block
+dat
 
-  The control block stores both initialization and runtime settings to control an instance
-  of PropCrow.
+{ ControlBlock
 
-  The block must be long-aligned.
+    The control block stores both initialization and runtime settings to control an instance
+  of PropCrow. It's address is passed to the instance via par.
 
-  Format:
-    pos  len  con  value
-    0    2    Y    DatConstants address (shared by all instances)
-    2    1    Y    accessLockID, values 8-255 => lock is disabled
-    3    1    Y    crow device address, must be 1 to 31, and unique to comm channel
-    4    2    Y    rxBufferAddr
-    6    2    Y    txBufferAddr, may be identical to rxBufferAddr
-    8    4         baudrate
-    12   2         interbyte timeout in milliseconds
-    14   2         break threshold in milliseconds
-    16   2         options bitfield (described below)
-    18   1    Y    rx pin
-    19   1    Y    tx pin
-    20   2         numUserPorts
-    22   2    Y    maxNumUserPorts
-    24   2    Y    userPortsTableAddr
-    26   2    Y    maxRxPayloadSize
-    28   1    Y    cogID (set by PropCrow cog at initialization)
-    29   3         ...
-    32   4    -    txScratch (used for composing response headers)
+    The block must be long-aligned.
 
-  The values with con=Y are assumed by the code to be constant and must not be changed after
+    Format:
+      pos  len  con  value
+      0    4         activeBaudrate
+      4    2         activeInterbyteTimeout, in milliseconds
+      6    2         activeBreakThreshold, in milliseconds
+      8    4         activeSerialOptions, bitfield
+      12   4         resetBaudrate
+      16   2         resetInterbyteTimeout, in milliseconds
+      18   2         resetBreakThreshold, in milliseconds
+      20   4         resetSerialOptions, bitfield
+      24   1         activeSerialSettingsChanged, flag (other cogs set to non-zero, PropCrow sets to zero)
+      25   1         otherOptions, bitfield
+      26   2         numUserPorts
+      28   2    Y    maxUserPorts
+      30   2    Y    userPortsAddr
+      32   1    Y    rxPin
+      33   1    Y    txPin
+      34   2    Y    rxBufferAddr
+      36   2    Y    txBufferAddr
+      38   2    Y    maxRxPayloadSize
+      40   2    Y    maxTxPayloadSize, not currently used by implementation
+      42   2    Y    datConstantsAddr
+      44   2    Y    pageTableAddr
+      46   1    Y    numPages
+      47   1    Y    crowAddress
+      48   1    Y    accessLockID, values 8-255 => lock is disabled
+      49   1    Y    cogID, set by PropCrow at initialization
+      50   2    -    -
+      52   4    -    txScratch, used for composing response headers
+     (56)
+
+    The first four items (baudrate through options bitfield) are the active serial settings used by
+  the implementation when it starts up. The second set of serial settings are those used when the
+  implementation receives a reset command (either a break condition or an explicit command). On reset,
+  the reset settings are copied to the active settings.
+  
+    If another cog changes any of the active serial settings after launch it will need to raise the
+  active serial settings changed flag by setting it to a non-zero value (all under shared access lock).
+  The PropCrow implementation will clear the flag when it incorporates the changes. The implementation
+  will not load the settings from the hub unless it experiences framing or parsing errors, or it is
+  commanded to do so by the host. Framing errors can by induced by other cogs by making the rx pin a
+  brief low output, but make sure the other hardware (i.e. the host's UART) can tolerate this.
+
+    The values with con=Y are assumed by the code to be constant and must not be changed after
   the cog launches. The other values may be changed by any cog, which is why an access lock
   is used. If enabled, the lock must be used for reading and writing the mutable values. 
   The lock may be safely disabled if the values do not change after launch.
 
-  Note: PropCrow assumes hub[0:4] is the clock frequency, and hub[4] is the clock mode.
-  It considers these settings to be protected by the access lock. 
+    PropCrow assumes hub[0:4] is the clock frequency, and hub[4] is the clock mode. It considers
+  these settings to be protected by the access lock. 
 }
+
+ControlBlock
+                    long    115200              'activeBaudrate
+                    word    250                 'activeInterbyteTimeout, in milliseconds
+                    word    100                 'activeBreakThreshold, in milliseconds
+                    long    $0707_0101          'activeSerialOptions
+                    long    115200              'resetBaudrate
+                    word    250                 'resetInterbyteTimeout, in milliseconds
+                    word    100                 'resetBreakThreshold, in milliseconds
+                    long    $0707_0101          'resetSerialOptions
+                    byte    0                   'activeSerialSettingsChanged
+                    byte    1                   'otherOptions
+__numUserPorts      word    0                   'numUserPorts
+                    word    cMaxUserPorts       'maxUserPorts
+__userPortsAddr     word    0-0                 'userPortsAddr
+                    byte    31                  'rxPin
+                    byte    30                  'txPin
+__rxBufferAddr      word    0-0                 'rxBufferAddr
+__txBufferAddr      word    0-0                 'txBufferAddr
+                    word    cMaxRxPayloadSize   'maxRxPayloadSize
+                    word    cMaxTxPayloadSize   'maxTxPayloadSize
+__datConstansAddr   word    0-0                 'datConstantsAddr
+                    word    0-0                 'pageTableAddr
+                    byte    0-0                 'numPages
+                    byte    1                   'crowAddress
+                    byte    255                 'accessLockID
+                    byte    0-0                 'cogID
+                    word    0                   '(unused)
+                    long    0                   'txScratch
+
 
 
 { User Ports Table
@@ -129,9 +186,11 @@ pub new
 }
 
 
-dat
 
 DatConstants
+
+{ This is data that would be the same for all instances of PropCrow. It is kept separate from the
+  control block to make it easier to adapt PropCrow to allow multiple instances. }
 
 { DeviceInfoTemplate (@DatConstants + 0)
   A template for sending getDeviceInfo responses. The mutable parts (for user ports) are
@@ -148,42 +207,42 @@ long    $0000_0000 | ((cPropCrowID & $ff) << 8) | ((cPropCrowID & $ff00) >> 8)  
 byte 4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0
 
 
-
 org 0
 
 Entry
 
-{ The first 16 cog registers will contain a lookup table after initialization is finished (used by
-  the continuous recalibration code). Initially, it contains initialization code. par = address of control block }
-                                 
-                                mov         _addr, par                          'deviceInfoAddr
-                                rdword      deviceInfoAddr, par
+{ The first 16 cog registers will contain a lookup table after initialization. At launch, it
+  contains initialization code. par = address of control block }
+                                
+                                mov         _addr, par
 
-                                add         _addr, #2                           'accessLockID
-                                rdbyte      accessLockID, _addr
+                                add         _addr, #24                          'serSettingsChangedAddr
+                                mov         serSettingsChangedAddr, _addr
 
-                                add         _addr, #1                           'crow device address
+                                add         _addr, #2                           'numUserPortsAddr
+                                mov         numUserPortsAddr, _addr
+
+                                add         _addr, #2                           'maxUserPorts
+                                rdword      maxUserPorts, _addr
+
+                                add         _addr, #2                           'userPortsAddr
+                                rdword      userPortsAddr, _addr
+
+                                add         _addr, #2                           'rxPin
                                 rdbyte      _x, _addr
-                                movs        rxVerifyAddress, _x
+                                shl         rxMask, _x
+                                movs        lowCounterMode, _x
 
-                                add         _addr, #1                           'rxBufferAddr, rxBufferAddrMinusOne
-                                mov         rxBufferAddr, _addr
-                                mov         rxBufferAddrMinusOne, rxBufferAddr
-                                sub         rxBufferAddrMinusOne, #1
-                
-                                add         _addr, #2                           'txBufferAddr
-                                mov         txBufferAddr, _addr
-
-                                add         _addr, #2                           'serSettingsAddr (starts at baudrate)
-                                mov         serSettingsAddr, _addr
+                                add         _addr, #1                           'txPin (finished after jump)
+                                rdbyte      _x, _addr                    
 
                                 jmp         #FinishInit
+
 
 long 0[16-$]
 fit 16
 org 16
 
-pin27 long |< 27
                                 
 { ReceiveCommand
   This routine contains the receive loop used to receive and process bytes. Processing is done using
@@ -463,7 +522,7 @@ rxExit                  if_z    jmp         #ReceiveCommandFinish
 { ReceiveCommandFinish
   This code runs after all packet bytes have been received. }
 ReceiveCommandFinish
-                                mov         _tmp, ctrb                              'save number of low bit clock counts
+                                'mov         _tmp, ctrb                              'save number of low bit clock counts
 
                                 { verify checksums for last byte }
                                 add         _rxF16L, _rxByte                        'compute F16L for last byte
@@ -492,9 +551,9 @@ rxVerifyAddress         if_nz   cmp         cnt, #0-0                       wz  
                                 sar         _x, #19
                                 abs         _x, _x
  
-                                mov         _tmp, _rxMixed                          'then add in number of low data bits (up to last byte)
-                                shr         _tmp, #16
-                                add         _x, _tmp
+                                mov         _y, _rxMixed                          'then add in number of low data bits (up to last byte)
+                                shr         _y, #16
+                                add         _x, _y
 
                                 mov         inb, #8                                 'finally, add in number of low data bits in last byte
 :loop                           shr         _rxByte, #1                     wc
@@ -542,10 +601,10 @@ UniversalAdminCommand
 
                                 call        #LockSharedAccess
 
-                                rdword      _tmpCount, numUserPortsAddr             'get number of open user ports
-                                max         _tmpCount, #255                         'getDeviceInfo limited to reporting 255 user ports
+                                rdword      _x, numUserPortsAddr                    '_x = num open user ports to report
+                                max         _x, #255                                'getDeviceInfo limited to reporting 255 user ports
 
-                                mov         payloadSize, _tmpCount                  'response payload size is 14 + 2*numReportedUserPorts (assumes 3 admin protocols)
+                                mov         payloadSize, _x                         'response payload size is 14 + 2*<num user ports> (assumes 3 admin protocols)
                                 shl         payloadSize, #1
                                 add         payloadSize, #14
                                 call        #SendFinalHeader
@@ -554,7 +613,7 @@ UniversalAdminCommand
                                 mov         payloadSize, #7
                                 call        #SendPayloadBytes                       'send up to num reported user ports
 
-                                wrbyte      _tmpCount, txBufferAddr
+                                wrbyte      _x, txBufferAddr
                                 mov         payloadAddr, txBufferAddr
                                 mov         payloadSize, #1
                                 call        #SendPayloadBytes                       'send number of reported user ports
@@ -564,7 +623,7 @@ UniversalAdminCommand
                                 mov         payloadSize, #6
                                 call        #SendPayloadBytes                       'send open admin ports from template
 
-                                cmp         _tmpCount, #0                   wz
+                                cmp         _x, #0                   wz
                         if_z    jmp         #:finish                                '...skip if no user ports
 
                                 mov         payloadAddr, userPortsAddr              'send the user port numbers directly from the table
@@ -577,7 +636,7 @@ UniversalAdminCommand
                                 mov         payloadSize, #1
                                 call        #SendPayloadBytes
 
-                                djnz        _tmpCount, #:loop       
+                                djnz        _x, #:loop       
 
 :finish                         call        #FinishSending
  
@@ -762,6 +821,9 @@ SendIntermediateHeader_ret      ret
   After this call payloadSize will be zero and payloadAddr will point to the address after the last byte sent.
 }
 SendPayloadBytes
+
+
+
                                 test        packetInfo, #MuteFlag           wc      'skip if responses muted
                         if_c    jmp         SendPayloadBytes_ret
 :loop
@@ -871,14 +933,14 @@ txSendAndResetF16_ret           ret
 CalculateTimings
                                 call        #LockSharedAccess
 
-                                mov         _addr, serSettingsAddr              'serSettingsAddr = par + 8
+                                mov         _addr, par
                                 rdlong      _baud, _addr
                                 add         _addr, #4
                                 rdword      _ibTimeoutMS, _addr
                                 add         _addr, #2
                                 rdword      _breakMS, _addr
                                 add         _addr, #2
-                                rdword      _options, _addr
+                                rdlong      _options, _addr
                                 rdlong      _clk, #0
 
                                 call        #UnlockSharedAccess
@@ -891,15 +953,15 @@ CalculateTimings
 
                                 mov         bitPeriod0, _twoBit
                                 shr         bitPeriod0, #1
-                                min         bitPeriod0, #34                     'bitPeriod0 ready
+                                min         bitPeriod0, #34                         'bitPeriod0 ready
                             
                                 mov         bitPeriod1, bitPeriod0
-                                test        _twoBit, #1                 wc
-                        if_c    add         bitPeriod1, #1                      'bitPeriod1 ready
+                                test        _twoBit, #1                     wc
+                        if_c    add         bitPeriod1, #1                          'bitPeriod1 ready
 
                                 mov         startBitWait, bitPeriod0
                                 shr         startBitWait, #1
-                                sub         startBitWait, #10                   'startBitWait ready; must not be < 5 (won't if bitPeriod0 >= 34)
+                                sub         startBitWait, #10                       'startBitWait ready; must not be < 5 (won't if bitPeriod0 >= 34)
             
                                 mov         _x, _clk
                                 mov         _y, #10
@@ -914,21 +976,20 @@ CalculateTimings
                                 mov         _x, bitPeriod1
                                 shl         _x, #2
                                 sub         stopBitDuration, _x
-                                test        _options, #1                wc
-                        if_c    add         stopBitDuration, bitPeriod1         'stopBitDuration ready                                
+                                test        _options, #cUseTwoStopBits      wc
+                        if_c    add         stopBitDuration, bitPeriod1             'stopBitDuration ready                                
 
                                 mov         _x, _clk
                                 mov         _y, k1000
                                 call        #Divide
-                                mov         _clk, _y                            '_clk is now clocks per millisecond
+                                mov         _clk, _y                                '_clk is now clocks per millisecond
 
                                 mov         _x, _ibTimeoutMS
                                 call        #Multiply
-                                mov         ibTimeout, _x                       'ibTimeout ready
-
+                                mov         ibTimeout, _x                           'ibTimeout ready
 
                                 mov         recoveryTime, _twoBit
-                                shl         recoveryTime, #3                    'recoveryTime ready
+                                shl         recoveryTime, #3                        'recoveryTime ready
 
                                 mov         _x, _clk
                                 mov         _y, _breakMS
@@ -936,11 +997,11 @@ CalculateTimings
                                 mov         _y, recoveryTime
                                 call        #Divide
                                 min         _y, #1
-                                mov         breakMultiple, _y                   'breakMultiple ready
+                                mov         breakMultiple, _y                       'breakMultiple ready
 
                                 mov         rxPhsbReset, #19
                                 add         rxPhsbReset, startBitWait
-                                add         rxPhsbReset, bitPeriod0             'rxPhsbReset ready (= 5 + startBitWait + bitPeriod0 + 5 + 4 + 4 + 1)
+                                add         rxPhsbReset, bitPeriod0                 'rxPhsbReset ready (= 5 + startBitWait + bitPeriod0 + 5 + 4 + 4 + 1)
 
 CalculateTimings_ret            ret
 
@@ -1000,6 +1061,7 @@ txMask              long    1
 
 propCrowAdminPort   long    cPropCrowID
  
+pin27 long |< 27
 
 { _rxMixed Notes
     The _rxMixed register contains several pieces of information used by the receiving code:
@@ -1037,44 +1099,51 @@ kOneInUpperWord         long    $1_0000     'used to increment lowBitCount in _r
 
 
 
-
-
 '*** Everything past this point will be temporaries
 
-fit 440
+fit 437
 
 
 FinishInit
+
                                 or          dira, pin27
 
-
-                                add         _addr, #10                          'rx pin
-                                rdbyte      _x, _addr
-                                shl         rxMask, _x
-                                movs        lowCounterMode, 0
-
-                                add         _addr, #1                           'tx pin
-                                rdbyte      _x, _addr
-                                shl         txMask, _x
+                                shl         txMask, _x                          'txPin (continued)
                                 or          outa, txMask
+                               
+                                add         _addr, #1                           'rxBufferAddr, rxBufferAddrMinusOne
+                                rdword      rxBufferAddr, _addr 
+                                mov         rxBufferAddrMinusOne, rxBufferAddr
+                                sub         rxBufferAddrMinusOne, #1
 
-                                add         _addr, #1                           'numUserPortsAddr
-                                mov         numUserPortsAddr, _addr
-
-                                add         _addr, #2                           'maxNumUserPorts
-                                rdword      maxNumUserPorts, _addr
-
-                                add         _addr, #2                           'userPortsAddr
-                                rdword      userPortsAddr, _addr
+                                add         _addr, #2                           'txBufferAddr
+                                rdword      txBufferAddr, _addr
 
                                 add         _addr, #2                           'maxRxPayloadSize
                                 rdword      maxRxPayloadSize, _addr
 
-                                add         _addr, #2                           'cogID (written to hub)
-                                cogid       _x
-                                wrbyte      _x, _addr
+                                add         _addr, #4                           'deviceInfoAddr
+                                rdword      deviceInfoAddr, _addr
 
-                                add         _addr, #4                           'txScratchAddr
+                                add         _addr, #2                           'pageTableAddr
+'                                rdword      pageTableAddr, _addr
+
+                                add         _addr, #2                           'numPages
+'                                rdbyte      numPages, _addr
+
+                                add         _addr, #1                           'crowAddress
+                                rdbyte      _x, _addr
+                                movs        rxVerifyAddress, _x
+
+
+                                add         _addr, #1                           'accessLockID
+'                                rdbyte      accessLockID, _addr
+
+                                add         _addr, #1                           'cogID (written to hub)
+ '                               cogid       _x
+ '                               wrbyte      _x, _addr
+
+                                add         _addr, #3                           'txScratchAddr
                                 mov         txScratchAddr, _addr
 
                                 { other one-time initializations }
@@ -1091,12 +1160,12 @@ FinishInit
                                 add         _addr, #1
                                 djnz        inb, #:loop
 
+                                mov         packetInfo, #0
                                 call        #CalculateTimings
 
-                                or          outa, pin27
 
                                 jmp         #UserCommand
-fit 472
+fit 471
 
 org FinishInit
 
@@ -1115,7 +1184,6 @@ packetInfo                  res
 payloadSize     res
 payloadAddr     res
 
-_tmp            res
 
 _rcvyPrevPhsb   res
 _rcvyCurrPhsb   res
@@ -1148,10 +1216,9 @@ _rxWait1            res
 _rxRemaining        res
 
 
-_tmpCount       res
 
-fit 472
-org 472
+fit 471
+org 471
 
 _x      res
 _y      res
@@ -1175,12 +1242,15 @@ accessLockID            res
 rxBufferAddr            res
 rxBufferAddrMinusOne    res
 txBufferAddr            res
-serSettingsAddr         res
 numUserPortsAddr        res
-maxNumUserPorts         res
+maxUserPorts            res
 userPortsAddr           res
 maxRxPayloadSize        res
 txScratchAddr           res
+
+serSettingsChangedAddr  res
+pageTableAddr           res
+numPages                res
 
 
 fit 496
