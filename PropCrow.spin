@@ -29,8 +29,8 @@ cUserPortsLongs  = ((cMaxUserPorts*6) / 4) + 1
 
 { flags and masks }
 CommandTypeFlag     = %0001_0000    'for CH0
-AddressMask         = %0001_1111    'for CH3
-MuteFlag            = %0100_0000    'for CH3
+cAddressMask         = %0001_1111    'for CH3
+cMuteFlag            = %0100_0000    'for CH3
 
 { masks used for the serialOptions bitfields }
 cUseSource          = %0000_0001
@@ -41,36 +41,45 @@ cUseTwoStopBits     = %1000_0000
 { masks used for otherOptions bitfield }
 cEnableReset        = %0000_0001
 cAllowRemoteChanges = %0000_0010
+cSendCrowErrors     = %0000_0100
 
 { other }
 cPropCrowID         = $abcd 'must be two byte value
 
 
 { paging constants }
-cPage           = 378
-cPageLimit      = 440
-cPageMaxLen     = cPageLimit - cPage
+cPage           = 385
+cPageMaxSize    = 72
+cPageLimit      = cPage + cPageMaxSize
 
 
-cInvalidPage = 511  'value to signify invalid page / no page loaded
+{ Crow error codes; values from v2 specification }
+cExcPayloadSize         = 0     'The command payload exceeds device's capacity.
+cPortNotOpen            = 1     'The port is not open.
+cCorruptPayloadF16      = 2     'The command payload is corrupt. One or more Fletcher16 checksums is incorrect.
+cImplementationError    = 3     'An implementation specific error has occurred.
 
-{ implementation error codes }
-cErrPageOOB     = 0 'Page index is out-of-bounds.
-cErrZeroPageLen = 1 'Page length is zero.
-cErrExcPageLen  = 2 'Page length exceeds space.
-cErrBadPageSig  = 3 'Bad page signature.
-cErrRunawayPage = 4 'Execution reached end of page.
+{ implementation error codes; must not conflict with Crow error codes }
+cPageOOB        = 20    'Page index is out-of-bounds.
+cEmptyPage      = 21    'Page size is zero.
+cExcPageSize    = 22    'Page size exceeds space.
+cBadPageSig     = 23    'Incorrect page signature.
+cRunawayPage    = 24    'Execution reached end of page.
 
-cPortNotOpen = 8
-
-    Flag_SendCheck  = %1_0000_0000
+{   The cSendChecksums flag indicates whether the F16 checksums for the last payload chunk still need to be sent. It is used
+  in FinishSending. Bit 9 is used because the flag is stored in outb, i.e. header byte CH3, which means bit 9 will be cleared
+  by default, saving an instruction.
+}
+cSendChecksums  = %1_0000_0000
 
 { page indices }
 cCalculateTimings   = 0
 cGetDeviceInfo      = 1
 cUserCommand        = 2
 cPropCrowAdmin      = 3
-
+cReportCrowError    = 4
+cNumPages           = 5     'cNumPages must be 9-bit value <= cInvalidPage
+cInvalidPage        = 511   'signifies no valid page loaded
 
 obj
     peekpoke : "PeekPoke"
@@ -99,6 +108,7 @@ pub new
     word[@PageTable][2] := @GetDeviceInfo
     word[@PageTable][4] := @UserCommand
     word[@PageTable][6] := @PropCrowAdmin
+    word[@PageTable][8] := @ReportCrowError
 
 
     __numUserPorts      := 3
@@ -152,13 +162,16 @@ word    0
 byte    0
 byte    PropCrowAdmin_end - PropCrowAdmin + 1
 
-word    @GetDeviceInfo
+'4: ReportCrowError
+word    0
 byte    0
-byte    0
+byte    ReportCrowError_end - ReportCrowError + 1
 
 
-'long  0[cMaxNumPages]
 
+
+
+  
 { ControlBlock
 
     The control block stores both initialization and runtime settings to control an instance
@@ -243,7 +256,7 @@ __txBufferAddr      word    0-0                 'txBufferAddr
                     word    cMaxTxPayloadSize   'maxTxPayloadSize
 __datConstansAddr   word    0-0                 'datConstantsAddr
 __pageTableAddr     word    0-0                 'pageTableAddr
-                    byte    0-0                 'numPages
+                    byte    cNumPages           'numPages
                     byte    1                   'crowAddress
                     byte    255                 'accessLockID
                     byte    0-0                 'cogID
@@ -299,19 +312,31 @@ byte 4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0
 
 { Strings
 }
-byte    "Code: ", 0
-
+ImpErrorMessageStart    byte    "PropCrow error: ", 0
 
 dat
 
 
 org cPage
+ReportCrowError
+                                jmp         #ReceiveCommand
+ReportCrowError_end             jmp         #RunawayPageHandler
+fit cPageLimit 'Page is too big. Reduce code or increase cPageSize.
+
+
+org cPage
 UserCommand
-                                mov         payloadSize, #4
-                                mov         payloadAddr, #0
+                                'echo the port
+                                mov         _x, dirb
+                                wrword      _x, txBufferAddr
+                                mov         payloadSize, #2
+                                mov         payloadAddr, txBufferAddr
+
                                 jmp         #SendFinalResponse
+
 UserCommand_end                 jmp         #RunawayPageHandler
-fit cPageLimit
+fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
+
 
 org cPage
 PropCrowAdmin
@@ -319,7 +344,8 @@ PropCrowAdmin
                                 mov         payloadSize, #8
                                 jmp         #SendFinalResponse
 PropCrowAdmin_end               jmp         #RunawayPageHandler
-fit cPageLimit
+fit cPageLimit 'Page is too big. Reduce code or increase cPageSize.
+
 
 org cPage
 GetDeviceInfo
@@ -370,7 +396,8 @@ GetDeviceInfo
 
 GetDeviceInfo_end               jmp         #RunawayPageHandler
 
-fit cPageLimit
+fit cPageLimit 'Page is too big. Reduce code or increase cPageSize.
+
 
 
 org cPage
@@ -382,39 +409,42 @@ CalculateTimings
                                 call        #LockSharedAccess
 
                                 mov         _addr, par
-                                rdlong      _baud, _addr
+                                rdlong      _calcBaud, _addr
                                 add         _addr, #4
-                                rdword      _ibTimeoutMS, _addr
+                                rdword      _calcIBTimeout, _addr
                                 add         _addr, #2
-                                rdword      _breakMS, _addr
+                                rdword      _calcBreak, _addr
                                 add         _addr, #2
-                                rdlong      _options, _addr
-                                rdlong      _clk, #0
+                                rdlong      _calcOptions, _addr
+                                rdlong      _calcClk, #0
 
                                 call        #UnlockSharedAccess
                             
-                                mov         _x, _clk                    
+                                mov         _x, _calcClk                    
                                 shl         _x, #1
-                                mov         _y, _baud
+                                mov         _y, _calcBaud
                                 call        #Divide
-                                mov         _twoBit, _y
+                                mov         _calcTwoBit, _y
 
-                                mov         bitPeriod0, _twoBit
+                                mov         bitPeriod0, _calcTwoBit
                                 shr         bitPeriod0, #1
                                 min         bitPeriod0, #34                         'bitPeriod0 ready
                             
                                 mov         bitPeriod1, bitPeriod0
-                                test        _twoBit, #1                     wc
+                                test        _calcTwoBit, #1                     wc
                         if_c    add         bitPeriod1, #1                          'bitPeriod1 ready
+
+                                mov         rxBitPeriod5, bitPeriod0
+                                min         rxBitPeriod5, #33
 
                                 mov         startBitWait, bitPeriod0
                                 shr         startBitWait, #1
                                 sub         startBitWait, #10                       'startBitWait ready; must not be < 5 (won't if bitPeriod0 >= 34)
             
-                                mov         _x, _clk
+                                mov         _x, _calcClk
                                 mov         _y, #10
                                 call        #Multiply
-                                mov         _y, _baud
+                                mov         _y, _calcBaud
                                 call        #Divide
                                 mov         stopBitDuration, _y
                                 mov         _x, bitPeriod0
@@ -424,23 +454,23 @@ CalculateTimings
                                 mov         _x, bitPeriod1
                                 shl         _x, #2
                                 sub         stopBitDuration, _x
-                                test        _options, #cUseTwoStopBits      wc
+                                test        _calcOptions, #cUseTwoStopBits      wc
                         if_c    add         stopBitDuration, bitPeriod1             'stopBitDuration ready                                
 
-                                mov         _x, _clk
+                                mov         _x, _calcClk
                                 mov         _y, k1000
                                 call        #Divide
-                                mov         _clk, _y                                '_clk is now clocks per millisecond
+                                mov         _calcClk, _y                                '_clk is now clocks per millisecond
 
-                                mov         _x, _ibTimeoutMS
+                                mov         _x, _calcIBTimeout
                                 call        #Multiply
                                 mov         ibTimeout, _x                           'ibTimeout ready
 
-                                mov         recoveryTime, _twoBit
+                                mov         recoveryTime, _calcTwoBit
                                 shl         recoveryTime, #3                        'recoveryTime ready
 
-                                mov         _x, _clk
-                                mov         _y, _breakMS
+                                mov         _x, _calcClk
+                                mov         _y, _calcBreak
                                 call        #Multiply
                                 mov         _y, recoveryTime
                                 call        #Divide
@@ -451,15 +481,13 @@ CalculateTimings
                                 add         rxPhsbReset, startBitWait
                                 add         rxPhsbReset, bitPeriod0                 'rxPhsbReset ready (= 5 + startBitWait + bitPeriod0 + 5 + 4 + 4 + 1)
 
-                                jmp         _retAddr
+                                jmp         #RecoveryMode
 
 k1000                           long    1000
 
 CalculateTimings_end            jmp         #RunawayPageHandler
 
-
-
-fit cPageLimit
+fit cPageLimit 'Page is too big. Reduce code or increase cPageSize.
 
 dat 
 org 0
@@ -472,14 +500,14 @@ Entry
                                 mov         _addr, par
 
                                 add         _addr, #24                          'serSettingsChangedAddr
-                                'mov         serSettingsChangedAddr, _addr
-                or  dira, pin27
+                                mov         serSettingsChangedAddr, _addr
+                
                                 add         _addr, #2                           'numUserPortsAddr
                                 mov         numUserPortsAddr, _addr
 
                                 add         _addr, #2                           'maxUserPorts
-                                'rdword      maxUserPorts, _addr
-                or  outa, pin27
+                                rdword      maxUserPorts, _addr
+                                
                                 add         _addr, #2                           'userPortsAddr
                                 rdword      userPortsAddr, _addr
 
@@ -502,12 +530,12 @@ org 16
   here since this position should remain constant in future revisions (for precompiled code pages).
 }
 RunawayPageHandler
-                                mov         _pageError, #cErrRunawayPage
+                                mov         _error, #cRunawayPage
                                 jmp         #ImplementationErrorHandler
 
 { Multiply
-    Algorithm from the Spin interpreter, with sign code removed. It is place here for the benefit of
-  code pages (its position shouldn't move).
+    Algorithm from the Spin interpreter, with sign code removed. It is placed here for the benefit of
+  code pages (its position shouldn't change).
     Before: _x = multiplier
             _y = multiplicand
     After: _x = lower half of product
@@ -525,8 +553,8 @@ Multiply_ret                    ret
 
 
 { Divide 
-    Algorithm from the Spin interpreter, with sign code removed. It is place here for the benefit of
-  code pages (its position shouldn't move).
+    Algorithm from the Spin interpreter, with sign code removed. It is placed here for the benefit of
+  code pages (its position shouldn't change).
     Before: _x = dividend
             _y = divisor
     After: _x = remainder
@@ -544,38 +572,59 @@ Divide
                                 djnz        inb, #:mdiv2
 Divide_ret                      ret
 
+
+
+
+{ Special/Shadow Register Usage
+
+    PropCrow sets up ctrb as a continuously running NEG counter on rx pin with frqb=1. This should not be changed.
+
+    PropCrow does not touch the counter A registers (frqa, ctra, phsa) or the video registers (vcfg, vscl).
+
+    par points to the control block.
+
+    PropCrow does use shadow and reserved registers. Specifically:
+
+    Locally to ReceiveCommand, shifted parsing code, and FinishReceiveCommand:
+      sh-ina = CH0, to save T flag
+      sh-inb = local scratch
+      sh-cnt = rxF16U
+
+    Globally:
+      sh-par = token    'must remain unchanged until final header has been sent
+      dirb   = port     'must remain unchanged until code has finished with port number
+      outb   = CH3      'must remain unchanged until all bytes have been sent, bit 9 used for cSendChecksums flag
+
+}
+
+
                                 
 { ReceiveCommand
   This routine contains the receive loop used to receive and process bytes. Processing is done using
     shifted parsing instructions, which are explained in more detail in the "Parsing Instructions" 
     section below.
-  This routine supports a minimum bitPeriod of 34.
-  There are two exits from this routine: either to RecoveryMode when framing or parsing errors occur, or to
-    ReceiveCommandFinish when all bytes of a successfully* parsed packet have been received (this exit
-    occurs at rxStartWait, and is determined in the parsing group rxF16C1). (*There are few remaining
-    parsing steps performed in ReceiveCommandFinish to completely verify the packet's validity.)
 }
 ReceiveCommand
                             xor     outa, pin27
-'todo (3/16): is value of rxPrevByte a problem if there's an interbyte timeout? (if not, why assign value in pre-loop?)
 
-                                { pre-loop initialization}
-                                mov         rxStartWait, rxContinue                 'loop until all bytes received
-                                movs        rxMovA, #rxFirstParsingGroup            'prepare shifted parsing code
+                                { pre-loop initialization }
+                                mov         rxStartWait, rxContinue
+                                movs        rxMovA, #rxFirstParsingGroup
                                 movs        rxMovB, #rxFirstParsingGroup+1
                                 movs        rxMovC, #rxFirstParsingGroup+2
                                 movs        rxMovD, #rxFirstParsingGroup+3
                                 mov         _rxResetOffset, #0
-                                mov         _rxWait0, startBitWait                  'prepare wait counter
-                                mov         _rxMixed, rxMixedInitReset              'rxMixed - reset for first pass through loop
-                                mov         rxPrevByte, #$ff                        'ensure rxPrevByte contributes no low bits during first pass through loop
+                                mov         _rxWait0, startBitWait
+                                mov         _rxMixed, rxMixedInitReset
+
                                 test        rxMask, ina                     wz      'z=1 => rx pin already low -- missed falling edge
 
                         if_nz   waitpne     rxMask, rxMask                          'wait for start bit edge
                         if_nz   add         _rxWait0, cnt
                         if_nz   waitcnt     _rxWait0, bitPeriod0                    'wait to sample start bit (for initial byte only)
                         if_nz   test        rxMask, ina                     wc      'c=1 framing error; c=0 continue, with parser reset
-                    if_z_or_c   jmp         #RecoveryMode                           '...exit for framing error or missed falling edge
+                        if_z    jmp         #RecoveryMode                           '...exit for missed falling edge (need edge for cont-recal)
+                        if_c    jmp         #FramingError
 
                                 { the receive loop -- c=0 reset parser}
 
@@ -583,76 +632,76 @@ ReceiveCommand
 rxBit0                          waitcnt     _rxWait0, bitPeriod1
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0000_0001
-                        if_nc   mov         phsb, rxPhsbReset                       'Auto-Recal 1 - reset low clocks count; MUST change rxPhsbReset calculation if moved
-                                mov         _rxLastWait1, _rxWait1                  'Auto-Recal 2 - save _rxWait1 for last byte; MUST come before Wait 2 (handoff)
-                                mov         _rxWait1, _rxWait0                      'Wait 2
-                        if_nc   mov         _rxF16L, #0                             'F16 1 - see page 90
-                        if_c    add         _rxF16L, rxPrevByte                     'F16 2
+                        if_nc   mov         phsb, rxPhsbReset                       'Cont-Recal 1 - reset low clocks count on reset; MUST change rxPhsbReset calculation if moved
+                                mov         _rxLastWait1, _rxWait1                  'Cont-Recal 2 - save _rxWait1 for last byte; must come before wait transfer
+                                mov         _rxWait1, _rxWait0                      'Wait 2 - transfer
+                                mov         _rxWait0, startBitWait                  'Wait 3
+                        if_nc   mov         _rxF16L, #0                             'F16 1 - zero checksums on reset; see page 90
 
 'bit1 - 34 clocks
 rxBit1                          waitcnt     _rxWait1, bitPeriod0
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0000_0010
-                        if_c    cmpsub      _rxF16L, #255                           'F16 3
-                        if_nc   mov         inb, #0                                 'F16 4 - during receiving, sh-inb is rxF16U
-                        if_c    add         inb, _rxF16L                            'F16 5
-                        if_c    cmpsub      inb, #255                               'F16 6
-                        if_nc   mov         _rxOffset, _rxResetOffset               'Shift 1 - go back to first parsing group on reset (see page 93)
+                        if_nc   mov         cnt, #0                                 'F16 2 - sh-cnt is rxF16U
+                        if_c    add         _rxF16L, _rxPrevByte                    'F16 3 - this if_c is not optional
+                        if_c    cmpsub      _rxF16L, #255                           'F16 4 - the if_c's are optional from this point on for F16
+                        if_c    add         cnt, _rxF16L                            'F16 5
+                        if_c    cmpsub      cnt, #255                               'F16 6
 
 'bit 2 - 34 clocks
 rxBit2                          waitcnt     _rxWait1, bitPeriod1
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0000_0100
+                        if_nc   mov         _rxOffset, _rxResetOffset               'Shift 1 - go back to first parsing group on reset (see page 93)
                                 subs        _rxResetOffset, _rxOffset               'Shift 2 - adjust reset offset
                                 adds        rxMovA, _rxOffset                       'Shift 3 - (next four) offset addresses for next parsing group
                                 adds        rxMovB, _rxOffset                       'Shift 4
-                                movs        rxAddLowerNibble, rxPrevByte            'Auto-Recal 3 - determine low bit count in lower nibble (of prev byte)
-                                andn        rxAddLowerNibble, #%1_1111_0000         'Auto-Recal 4
+                                adds        rxMovC, _rxOffset                       'Shift 5
 
 'bit 3 - 34 clocks
 rxBit3                          waitcnt     _rxWait1, bitPeriod0
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0000_1000
-                                mov         _rxWait0, startBitWait                  'Wait 3 - must follow Auto-Recal's saving of _rxWait0
-                                adds        rxMovC, _rxOffset                       'Shift 5
                                 adds        rxMovD, _rxOffset                       'Shift 6
                                 mov         _rxOffset, #4                           'Shift 7 - restore default offset (must be done before shifted instructions)
 rxMovA                          mov         rxShiftedA, 0-0                         'Shift 8 - (next four) shift parsing instructions into place
+rxMovB                          mov         rxShiftedB, 0-0                         'Shift 9
+rxMovC                          mov         rxShiftedC, 0-0                         'Shift 10
 
 'bit 4 - 34 clocks
 rxBit4                          waitcnt     _rxWait1, bitPeriod1
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0001_0000
-rxMovB                          mov         rxShiftedB, 0-0                         'Shift 9
-rxMovC                          mov         rxShiftedC, 0-0                         'Shift 10
 rxMovD                          mov         rxShiftedD, 0-0                         'Shift 11
+                                movs        rxAddLowerNibble, rxByte                'Cont-Recal 3 - determine low bit count of lower nibble; must follow mux of bit 3
+                                andn        rxAddLowerNibble, #%1_1111_0000         'Cont-Recal 4 - (spacer required)
                                 test        _rxMixed, writeByteFlag         wc      'Write 1 - c=1 write byte to hub
                         if_c    add         _rxAddr, #1                             'Write 2 - increment address (pre-increment saves re-testing the flag)
 
 'bit 5 - 33 clocks
-rxBit5                          waitcnt     _rxWait1, bitPeriod0
+rxBit5                          waitcnt     _rxWait1, rxBitPeriod5
                                 testn       rxMask, ina                     wz
-                        if_c    wrbyte      rxPrevByte, _rxAddr                     'Write 3 - wrbyte excludes any other instructions besides testn
+                        if_c    wrbyte      _rxPrevByte, _rxAddr                    'Write 3 - wrbyte excludes any other instructions besides testn
 
 'bit 6 - 34 clocks
 rxBit6                          waitcnt     _rxWait1, bitPeriod1
                                 test        rxMask, ina                     wc
                                 muxz        rxByte, #%0010_0000
                                 muxc        rxByte, #%0100_0000
+rxAddLowerNibble                add         _rxMixed, 0-0                           'Cont-Recal 5 - add count of low data bits of current byte's lower nibble
                                 sub         _rxCountdown, #1                wz      'Countdown - used by parsing code to determine when F16 follows payload bytes
-rxShiftedA                      long    0-0                                         'Shift 12
+rxShiftedA                      long    0-0                                         'Shift 12 - (next four) execute shifted instructions
 rxShiftedB                      long    0-0                                         'Shift 13
-rxAddLowerNibble                add         _rxMixed, kOneInUpperWord               'Auto-Recal 5 - add up low bit counts for low nibble
 
 'bit 7 - 34 clocks
 rxBit7                          waitcnt     _rxWait1, bitPeriod0
                                 test        rxMask, ina                     wc
                                 muxc        rxByte, #%1000_0000
-                                shr         rxPrevByte, #4                          'Auto-Recal 6 - (next three) determine low bit count in upper nibble
-                                movs        rxAddUpperNibble, rxPrevByte            'Auto-Recal 7
 rxShiftedC                      long    0-0                                         'Shift 14
 rxShiftedD                      long    0-0                                         'Shift 15
-rxAddUpperNibble                add         _rxMixed, kOneInUpperWord               'Auto-Recal 8
+                                mov         _rxPrevByte, rxByte                     'Handoff
+                                shr         rxByte, #4                              'Cont-Recal 6 - start getting low bits count for upper nibble
+                                movs        rxAddUpperNibble, rxByte                'Cont-Recal 7 - (spacer required)
 
 rxStopBit                       waitcnt     _rxWait1, bitPeriod0                    'see page 98
                                 testn       rxMask, ina                     wz      'z=0 framing error
@@ -664,15 +713,23 @@ rxStartWait                     long    0-0                                     
 'start bit - 34 clocks
 rxStartBit              if_z    waitcnt     _rxWait0, bitPeriod0
                         if_z    test        rxMask, ina                     wz      'z=0 framing error
-                        if_z    mov         phsa, _rxWait0                          'Timeout 1 - sh-phsa used as scratch since ctra should be off
-                        if_z    sub         phsa, _rxWait1                          'Timeout 2 - see page 98 for timeout notes
-                        if_z    cmp         phsa, ibTimeout                 wc      'Timeout 3 - c=0 reset, c=1 no reset
-                        if_z    mov         rxPrevByte, rxByte                      'Handoff
+rxAddUpperNibble        if_z    add         _rxMixed, 0-0                           'Cont-Recal 8 - finish adding low bit count for upper nibble of previous byte
+                        if_z    mov         inb, _rxWait0                           'Timeout 1 - using sh-inb as scratch
+                        if_z    sub         inb, _rxWait1                           'Timeout 2 - see page 98 for timeout notes
+                        if_z    cmp         inb, ibTimeout                 wc       'Timeout 3 - c=0 reset, c=1 no reset
                 if_z_and_nc     mov         _rxMixed, rxMixedTimoutReset            'Mixed - reset due to timeout (takes djnz into account); see "_rxMixed Notes"
-                        if_z    djnz        _rxMixed, #rxBit0                       'Mixed - add to byte count (negative); also finishes reset of _rxMixed on timeout
+                        if_z    djnz        _rxMixed, #rxBit0                       'Mixed - add to byteCount (negative); also finishes reset of _rxMixed on timeout
                     
-                        { fall through to recovery mode for framing errors }
+                        { fall through for framing errors }
 
+FramingError
+                                { todo: add logic }
+                                jmp         #RecoveryMode
+
+
+ParsingError
+                        
+                        { fall through to recovery mode }
 
 { RecoveryMode
   When framing or parsing errors occur the implementation enters recovery mode. In this mode the implementation
@@ -680,6 +737,7 @@ rxStartBit              if_z    waitcnt     _rxWait0, bitPeriod0
     command. If the line is low for long enough then the implementation determines that a break condition has occurred.
   See page 99.
 }
+'todo (3/17): does the removal of the ctrb off code change any timings?
 RecoveryMode
                                 mov         cnt, recoveryTime
                                 add         cnt, cnt
@@ -743,15 +801,15 @@ BreakHandler
   Summary:
     On parser reset:
       parsing group rxFirstParsingGroup is selected
-      _rxMixed is reset                 (specifically, writeByteFlag and excPayloadFlag are cleared)
-      _rxF16U (sh-inb) := _rxF16L := 0           (F16 checksums are reset, as per Crow specification)
+      _rxMixed is reset                 (byteCount and lowBitCount are reset, writeByteFlag and excPayloadFlag are cleared)
+      _rxF16U (sh-inb) := _rxF16L := 0  (F16 checksums are reset, as per Crow specification)
       _rxCountdown = <undefined>        (so z will be undefined at rxFirstParsingGroup instruction A) 
-      _rxPrevByte = <undefined>
+      rxPrevByte = <undefined>
       _rxAddr = <undefined>
     Before A and B:
-      _rxByte (READ-ONLY) is complete to bit[6], but bit[7] is undefined (upper bytes are zero)
+      _rxByte (READ-ONLY) is complete to bit[6], but bit[7] is from previous byte (upper bytes are zero)
       _rxPrevByte (READ-ONLY) is the byte received before this one (upper bytes are zero)
-      _rxF16U (sh-inb) and _rxF16L (READ-ONLY) are calculated up to the previous byte
+      (the F16 checksums are not yet ready for testing)
       _rxCountdown := _rxCountdown - 1
       _rxOffset := 4                    (this is a signed value, and it determines the next group executed)
       z := _rxCountdown==0
@@ -759,6 +817,7 @@ BreakHandler
     Before C and D:
       _rxByte (READ-ONLY) is complete (upper bytes are zero)
       _rxPrevByte (READ-ONLY) has been shifted down by 4 bits
+      _rxF16U (sh-inb) and _rxF16L (READ-ONLY) are calculated up to the previous byte, use or to test
       z is not changed, so it maintains whatever value it had after B
       c := bit[7]
   See "The Command Header" section of "Crow Specification v1.txt". See also page 113.
@@ -766,130 +825,143 @@ BreakHandler
 }
 rxFirstParsingGroup
 rxH0                            test        rxByte, #%0010_1000            wz       'A - z=1 if reserved bits 3 and 5 are zero, as required
-                if_nc_or_nz     jmp         #RecoveryMode                           ' B - ...exit for bad reserved bits; c (bit 6) must be 1
-                        if_c    jmp         #RecoveryMode                           ' C - ...exit for bad reserved bit; c (bit 7) must be 0
+                if_nc_or_nz     mov         rxStartWait, rxParsingErrorExit         ' B - ...exit for bad reserved bits; c (bit 6) must be 1
+                        if_c    mov         rxStartWait, rxParsingErrorExit         ' C - ...exit for bad reserved bit; c (bit 7) must be 0
                                 mov         ina, rxByte                             ' D - save T flag in sh-ina
-rxH1                            mov         payloadSize, rxPrevByte                 'A - extract payload size
+
+rxH1                            mov         payloadSize, _rxPrevByte                'A - extract payload size
                                 and         payloadSize, #$7                        ' B
                                 shl         payloadSize, #8                         ' C
                                 or          payloadSize, rxByte                     ' D
+
 rxH2                            mov         _rxRemaining, payloadSize               'A - _rxRemaining keeps track of how many payload bytes are left to receive
                                 mov         _rxAddr, rxBufferAddrMinusOne           ' B - reset address for writing to hub
-                                mov         port, #0                                ' C - set implicit port
-                                mov         token, rxByte                           ' D
+                                mov         dirb, #0                                ' C - set implicit port; dirb is port
+                                mov         par, rxByte                             ' D - sh-par is token
+
 rxH3                            test        rxByte, #%0010_0000            wz       'A - z=1 if reserved bit 5 is zero, as required
-                        if_nz   jmp         #RecoveryMode                           ' B - ...exit for bad reserved bit
-                                mov         packetInfo, rxByte                      ' C - preserve Crow address and mute flag
+                        if_nz   mov         rxStartWait, rxParsingErrorExit         ' B - ...exit for bad reserved bit
+                                mov         outb, rxByte                            ' C - preserve Crow address and mute flag; outb is CH3
                         if_nc   mov         _rxOffset, #12                          ' D - skip rxH4 and rxH5 if using implicit port
 rxH4
-rxPrevByte                      long    0-0                                         'A - spacer nop; rxPrevByte must have upper bytes zero for low bits calculation
-rxByte                          long    0-0                                         ' B - spacer nop; rxByte must have upper bytes zero for F16 calculation
-                                mov         port, rxByte                            ' C
-                                shl         port, #8                                ' D
+kCrowPayloadLimit               long    2047                                        'A - spacer nop; payload size limit (11 bits in v1 and v2)
+rxByte                          long    0-0                                         ' B - spacer nop; rxByte must have upper bytes zero for F16 and cont-recal
+                                mov         dirb, rxByte                            ' C - start storing explicit port; dirb is port
+                                shl         dirb, #8                                ' D
 rxH5
 lowCounterMode                  long    $3000_0000                                  'A - spacer nop; rx pin set at initialization
 kOneInDField                    long    |< 9                                        ' B - spacer nop
 propCrowAdminPort               long    cPropCrowID                                 ' C - spacer nop; cPropCrowID required to be two byte value
-                                or          port, rxByte                            ' D - finished receiving explicit port
+                                or          dirb, rxByte                            ' D - finished receiving explicit port; dirb is port
+
 rxF16C0                         andn        _rxMixed, writeByteFlag                 'A - turn off writing to hub (don't write F16 bytes)
                                 mov         _rxCountdown, _rxRemaining              ' B - _rxCountdown used to keep track of payload bytes left in chunk 
                                 max         _rxCountdown, #128                      ' C - chunks are limited to 128 data bytes
                                 sub         _rxRemaining, _rxCountdown              ' D - _rxRemaining is number of payload bytes after the coming chunk
+
 rxF16C1                         add         _rxCountdown, #1                wz      'A - undo automatic decrement; check if _rxCountdown==0 (next chunk empty)
                         if_z    mov         rxStartWait, rxExit                     ' B - ...exit receive loop if no bytes in next chunk (all bytes received)
                                 cmp         payloadSize, maxRxPayloadSize   wz, wc  ' C - check if command payload size exceeds buffer capacity
                 if_nc_and_nz    or          _rxMixed, excPayloadFlag                ' D - ...if so, set flag (used in rxP_Repeat)
+
 rxP_VerifyF16                   or          _rxMixed, writeByteFlag                 'A - turn on writing to hub
                         if_z    subs        _rxOffset, #12                          ' B - if _rxCountdown==0 then chunk's payload bytes done, go to rxF16C0
-                                or          inb, _rxF16L                    wz      ' C - should have F16U == F16L == 0; sh-inb is rxF16U
-                        if_nz   jmp         #RecoveryMode                           ' D - ...exit for bad checksums
+                                or          cnt, _rxF16L                    wz      ' C - should have F16U == F16L == 0; sh-cnt is rxF16U
+                        if_nz   mov         rxStartWait, rxParsingErrorExit         ' D - ...exit for bad checksums
+
 rxP_Repeat              if_z    subs        _rxOffset, #16                          'A - go to rxF16C0 if all of chunk's payload bytes are received
                         if_nz   subs        _rxOffset, #4                           ' B - ...otherwise, repeat this group
                                 test        _rxMixed, excPayloadFlag        wc      ' C - check if payload size exceeds capacity (from rxF16C1)
                         if_c    mov         _rxAddr, rxBufferAddrMinusOne           ' D - ...if so, keep resetting address to prevent overrun (command discarded anyway)
 
 
+
 { Receive Loop Continue / Exit Instructions
     These instructions are shifted to rxStartWait in the receive loop to either receive more bytes
-  or exit the loop and finish processing the packet. }
+  or exit the loop. }
 rxContinue              if_z    waitpne     rxMask, rxMask
 rxExit                  if_z    jmp         #ReceiveCommandFinish
-
+rxParsingErrorExit      if_z    jmp         #ParsingError                           'don't exit immediately -- framing error on stop bit takes precedence
 
 { ReceiveCommandFinish
-    This code runs after all packet bytes have been received. }
+    This code runs after all packet bytes have been received.
+}
 ReceiveCommandFinish
-                                'mov         _tmp, ctrb                              'save number of low bit clock counts
+                                { save the number of low clock counts; used by cont-recal and admin commands }
+                                mov         rxLowClocks, phsb
 
                                 { verify checksums for last byte }
-                                add         _rxF16L, rxByte                         'compute F16L for last byte
+                                add         _rxF16L, _rxPrevByte                    'compute F16L for last byte
                                 cmpsub      _rxF16L, #255                           '(computing F16U unnecessary since it should be zero)
-                                or          inb, _rxF16L                    wz
-                        if_nz   jmp         #RecoveryMode                           '...bad F16
+                                or          cnt, _rxF16L                    wz      'sh-cnt is rxF16U
+                        if_nz   jmp         #ParsingError                           '...bad F16
 
-                                { verify the address }
-                                mov         cnt, packetInfo                         'sh-cnt used for scratch; packetInfo is CH3
-                                and         cnt, #AddressMask               wz      'z=1 broadcast address (0)
-                                test        packetInfo, #MuteFlag           wc      'c=1 mute response
-                    if_z_and_nc jmp         #RecoveryMode                           '...broadcast must mute (invalid packet)
-rxVerifyAddress         if_nz   cmp         cnt, #0-0                       wz      'verify non-broadcast address; s-field set at initialization
+                                { extract the address }
+                                mov         inb, outb                               'sh-inb used for address (scratch); outb is CH3
+                                and         inb, #cAddressMask              wz      'z=1 broadcast address (0)
+                                test        outb, #cMuteFlag                wc      'c=1 mute response
+                    if_z_and_nc jmp         #ParsingError                           '...broadcast must mute (invalid packet)
+
+                                { at this point the packet has passed all parsing tests, but may be addressed to different device }
+
+rxVerifyAddress         if_nz   cmp         inb, #0-0                       wz      'verify non-broadcast address; s-field set at initialization
                         if_nz   jmp         #ReceiveCommand                         '...wrong non-broadcast address
 
-                                { at this point the packet has no non-reportable errors, so recovery mode is not used;
-                                    it is also correctly addressed, so error responses may be sent for reportable errors (it is safe
-                                    to call the sending code if the command was broadcast -- responses are automatically muted) }
+                                { calculate the number of low bits; for both cont-recalibration and some extended admin commands }
 
-                                { do auto-recalibration calculations }
+                                shr         _rxPrevByte, #4                         'prepare to add number of low data bits for last nibble
+                                movs        :lastNibble, _rxPrevByte
 
-                                { calculate the number of low bits }
+                                mov         rxLowBits, _rxMixed                     'get number of start bits (byteCount)
+                                shl         rxLowBits, #19
+                                sar         rxLowBits, #19
+                                abs         rxLowBits, rxLowBits
 
-                                mov         _x, _rxMixed                            'first get number of start bits (i.e. the number of bytes)
-                                shl         _x, #19
-                                sar         _x, #19
-                                abs         _x, _x
+:lastNibble                     add         _rxMixed, 0-0                           'add number of low data bits for last nibble to data bit total
  
-                                mov         _y, _rxMixed                          'then add in number of low data bits (up to last byte)
+                                mov         _y, _rxMixed                            'lowBitCount is in upper word of _rxMixed (save _rxMixed for later)
                                 shr         _y, #16
-                                add         _x, _y
 
-                                mov         inb, #8                                 'finally, add in number of low data bits in last byte
-:loop                           shr         rxByte, #1                     wc
-                        if_nc   add         _x, #1
-                                djnz        inb, #:loop
+                                add         rxLowBits, _y                           'byteCount + lowBitCount = num total low bits
+
+                                { check if interbyte timeout occurred; for diagnostics }
+ '                               test        _rxMixed, ibTimeoutFlag         wc
+  '                      if_c    add         diagNumIBTimeouts, #1
 
                                 { check if payload size exceeded capacity -- a reportable error condition }
                                 test        _rxMixed, excPayloadFlag        wc
-                        if_c    jmp         #ReceiveCommand
+                        if_c    mov         _x, #cExcPayloadSize
+                        if_c    mov         _page, #cReportCrowError
+                        if_c    jmp         #ExecutePage
 
                                 { check command type, exit if user command }
                                 test        ina, #CommandTypeFlag           wc      'c=1 user command; sh-ina is H0 from rxH0
                         if_c    mov         _page, #cUserCommand
                         if_c    jmp         #ExecutePage
 
-                                { check admin port }
+                                { check admin port - port is in dirb }
 
-                                cmp         port, #0                        wz      'universal admin (port 0)
-                        if_z    jmp         #UniversalAdminCommand
+                                cmp         dirb, #0                        wz      'universal admin (port 0)
+                        if_z    jmp         #UniversalAdmin
 
-                                cmp         port, #1                        wz      'extended admin (port 1)
-                        if_z    jmp         #AdminPort1Command
+                                cmp         dirb, #1                        wz      'extended admin (port 1)
+                        if_z    jmp         #ExtendedAdmin
     
-                                cmp         port, propCrowAdminPort         wz      'PropCrow specific admin
-    
-                        if_nz   mov         _error, #cPortNotOpen                   'the port not being open is a reportable error
-                        if_nz   jmp         #ReportError
+                                cmp         dirb, propCrowAdminPort         wz      'PropCrow specific admin
+                        if_z    mov         _page, #cPropCrowAdmin
+                        if_z    jmp         #ExecutePage
 
-                                { so the command arrived on the PropCrow admin port }
-
-                                mov         _page, #cPropCrowAdmin
+                                mov         _error, #cPortNotOpen                   'the port not being open is a reportable error
+                                mov         _page, #cReportCrowError
                                 jmp         #ExecutePage
 
 
-{ UniversalAdminCommand
-  The universal admin commands (admin port 0) are defined in "Crow Specification v1.txt".
-  There are two commands: ping and getDeviceInfo.
+{ UniversalAdmin
+    The universal admin commands (admin port 0) are defined in "Crow Specification v1.txt". There are
+  two commands: ping and getDeviceInfo. ping will be taken care of in permanent code, while getDeviceInfo
+  is done with paged code.
 }
-UniversalAdminCommand
+UniversalAdmin
                                 { admin protocol 0 with no payload is ping }
                                 cmp         payloadSize, #0                 wz      'z=1 ping command
                         if_nz   jmp         #:getDeviceInfo
@@ -907,12 +979,13 @@ UniversalAdminCommand
                                 jmp         #ExecutePage
 
 
-{ AdminPort1Command
-  The admin port 1 protocol (defined in "Crow Specification v2.txt") defines several general admin commands.
+{ ExtendedAdmin
+    The extended admin protocol defines several commands on port 1. See "Crow Specification v2.txt". The keepAlive
+  command is taken care of in permanent code, while the rest are done with paged code.
 }
-AdminPort1Command
-                                mov         payloadAddr, rxBufferAddr
-                                jmp         #SendFinalResponse
+ExtendedAdmin
+                                jmp         #ReceiveCommand
+
 
 { LockSharedAccess
   A call to LockSharedAcccess must be followed by a call to UnlockSharedAccess.
@@ -1005,20 +1078,20 @@ SendIntermediateHeader
                                 movs        txApplyTemplate, #$80
 
                                 { checks: ensure not muted, and ensure payload size is within buffer size }
-txPerformChecks                 test        packetInfo, #MuteFlag           wc 
+txPerformChecks                 test        outb, #cMuteFlag            wc      'outb is CH3
                         if_c    jmp         SendHeader_ret
                                 max         payloadSize, kCrowPayloadLimit      'do not allow payloadSize to exceed spec limit
                                 
                                 { compose header bytes RH0-RH2 }
-                                mov         par, payloadSize                    'sh-par used for scratch
-                                shr         par, #8                             '(assumes payloadSize does not exceed spec limit)
-txApplyTemplate                 or          par, #0-0
+                                mov         cnt, payloadSize                    'sh-cnt used for scratch
+                                shr         cnt, #8                             '(assumes payloadSize does not exceed spec limit)
+txApplyTemplate                 or          cnt, #0-0
                                 mov         _txAddr, txScratchAddr                      
-                                wrbyte      par, _txAddr                        'RH0
+                                wrbyte      cnt, _txAddr                        'RH0
                                 add         _txAddr, #1
                                 wrbyte      payloadSize, _txAddr                'RH1
                                 add         _txAddr, #1
-                                wrbyte      token, _txAddr                      'RH2
+                                wrbyte      par, _txAddr                        'RH2; sh-par is token
 
                                 { reset F16 }
                                 mov         _txF16L, #0
@@ -1035,8 +1108,9 @@ txRetainLine                    or          dira, txMask
                                 { send RH3-RH4 (the header F16) }
                                 call        #txSendAndResetF16
 
-                                { prepare for sending payload bytes }
-                                andn        packetInfo, #Flag_SendCheck              'the SendCheck flag is set when payload bytes are sent
+                                { prep for first payload chunk; the flag to indicate whether the last checksums need to be sent
+                                   when FinishSending is called uses bit 9 of outb; outb is set to CH3, and will have bit 9 = 0 by default,
+                                   so we don't need to clear it here (it will be set when payload bytes are sent) }
                                 mov         _txMaxChunkRemaining, #128          'the maximum number of bytes for a full chunk (the last may be partial)
 SendHeader_ret
 SendFinalHeader_ret
@@ -1060,7 +1134,7 @@ SendPayloadBytes
 
 
 
-                                test        packetInfo, #MuteFlag           wc      'skip if responses muted
+                                test        outb, #cMuteFlag           wc      'skip if responses muted; outb is CH3
                         if_c    jmp         SendPayloadBytes_ret
 :loop
                                 mov         _txCount, payloadSize           wz
@@ -1073,7 +1147,7 @@ SendPayloadBytes
                                 mov         _txAddr, payloadAddr
 
                                 call        #txSendBytes
-                                or          packetInfo, #Flag_SendCheck                  'if any payload bytes have been sent then a checksum must follow eventually
+                                or          outb, #cSendChecksums                   'if any payload bytes have been sent then a checksum must follow eventually
 
                                 mov         payloadAddr, _txAddr
 
@@ -1084,7 +1158,7 @@ SendPayloadBytes
                                 call        #txSendAndResetF16
 
                                 { prep for next chunk }
-                                andn        packetInfo, #Flag_SendCheck
+                                andn        outb, #cSendChecksums                   'checksums just sent, so clear flag (bit 9 of outb)
                                 mov         _txMaxChunkRemaining, #128
  
                                 jmp         #:loop 
@@ -1098,9 +1172,9 @@ SendPayloadBytes_ret            ret
     even if there are no payload bytes.
 }
 FinishSending
-                                test        packetInfo, #MuteFlag               wc      'skip if responses muted
+                                test        outb, #cMuteFlag          wc      'skip if responses muted
                         if_c    jmp         FinishSending_ret
-                                test        packetInfo, #Flag_SendCheck          wc      'send final payload checksum if necessary
+                                test        outb, #cSendChecksums          wc      'send final payload checksum if necessary; flag in bit 9 of outb
                         if_c    call        #txSendAndResetF16
 txReleaseLine                   andn        dira, txMask                            'this instruction may be deleted in some circumstances (along
 FinishSending_ret               ret                                                 ' with txRetainLine) -- see "PropCrow User Guide.txt"
@@ -1119,17 +1193,17 @@ FinishSending_ret               ret                                             
 }
 SendFinalResponse               movs        Send_ret, #ReceiveCommand
 
-SendFinalAndReturn              mov         s0, payloadSize
-                                mov         s1, payloadAddr
+SendFinalAndReturn              mov         _x, payloadSize
+                                mov         _y, payloadAddr
                                 call        #SendFinalHeader
                                 jmp         #_SendPayload
 
-SendIntermediate                mov         s0, payloadSize
-                                mov         s1, payloadAddr
+SendIntermediate                mov         _x, payloadSize
+                                mov         _y, payloadAddr
                                 call        #SendIntermediateHeader
 
-_SendPayload                    mov         payloadSize, s0
-                                mov         payloadAddr, s1
+_SendPayload                    mov         payloadSize, _x 
+                                mov         payloadAddr, _y 
                                 call        #SendPayloadBytes 
 
                                 call        #FinishSending
@@ -1137,8 +1211,6 @@ Send_ret
 SendFinalAndReturn_ret
 SendIntermediate_ret            ret
 
-s0 long 0
-s1 long 0 
 
 { txSendAndResetF16
   Helper routine to send the current F16 checksum (upper first, then lower). It 
@@ -1166,19 +1238,7 @@ txSendAndResetF16_ret           ret
 
 
 
-kCrowPayloadLimit   long    2047   'The payload size limit imposed by the specification (11 bits in v1 and v2).
 
-
-
-
- { Constants (after initialization) }
-rxMask              long    1              'shifted at initialization
-txMask              long    1
-
-
-
- 
-pin27 long |< 27
 
 
 
@@ -1233,7 +1293,7 @@ kOneInUpperWord         long    $1_0000     'used to increment lowBitCount in _r
     First, this routine checks to see if the page is already loaded. If so, it won't bother reloading it. This
   routine performs a few checks to ensure the page is valid before it will execute the code. The checks:
     - The _page index must be in the range [0, numPages).
-    - The page length (from the table) must be in the range [1, cPageMaxLen].
+    - The page length (from the table) must be in the range [1, cPageMaxSize].
     - The last register of the page must be "jmp #16" for two reasons: (1) there's an error handler at register 16 
       to catch and report runaway execution from the code page, (2) the register serves as a signature to confirm
       that the code is meant to be executed as a code page.
@@ -1246,12 +1306,12 @@ kOneInUpperWord         long    $1_0000     'used to increment lowBitCount in _r
       - Any errors in the loading process will cause an error handler to be called, aborting the expected thread of execution.
 }
 ExecutePage
-                                cmp         _page, numPages             wc      'see if the page index is within bounds
+                                cmp         _page, #cNumPages           wc      'see if the page index is within bounds
 
 :checkCurr              if_c    cmp         _page, #cInvalidPage        wz      'curr page index stored in s-field (init'ed to cInvalidPage)
                   if_c_and_z    jmp         #cPage                              'if page already loaded and is valid / in-bounds, then go
 
-                        if_nc   mov         _pageError, #cErrPageOOB            'page index must be within table bounds
+                        if_nc   mov         _error, #cPageOOB                   'page index must be within table bounds
                         if_nc   jmp         #ImplementationErrorHandler
 
                                 movd        :load, #cPage
@@ -1261,23 +1321,23 @@ ExecutePage
                                 add         _pageEntryAddr, pageTableAddr 
                                 rdword      _pageAddr, _pageEntryAddr           '_pageAddr = base address of page in hub
                                 add         _pageEntryAddr, #3
-                                rdbyte      _pageLen, _pageEntryAddr    wz      '_pageLen = length of page, in longs
+                                rdbyte      _pageSize, _pageEntryAddr   wz      '_pageSize in longs
 
-                        if_z    mov         _pageError, #cErrZeroPageLen        'page length can not be zero
+                        if_z    mov         _error, #cEmptyPage                 'page size can not be zero
                         if_z    jmp         #ImplementationErrorHandler
 
-                                cmp         _pageLen, #cPageMaxLen      wc, wz  'page length must fit within space
-                if_nc_and_nz    mov         _pageError, #cErrExcPageLen
+                                cmp         _pageSize, #cPageMaxSize    wc, wz  'page size must fit within space
+                if_nc_and_nz    mov         _error, #cExcPageSize
                 if_nc_and_nz    jmp         #ImplementationErrorHandler
 
                                 movs        :verify, #cPage
-                                add         :verify, _pageLen
+                                add         :verify, _pageSize
                                 sub         :verify, #1
  
 :load                           rdlong      0-0, _pageAddr
                                 add         :load, kOneInDField
                                 add         _pageAddr, #4
-                                djnz        _pageLen, #:load
+                                djnz        _pageSize, #:load
 
                                 movs        :checkCurr, _page                   'the page has been changed
 
@@ -1289,7 +1349,7 @@ ExecutePage
 
                                 movs        :checkCurr, #cInvalidPage           'must mark page as invalid
 
-                                mov         _pageError, #cErrBadPageSig
+                                mov         _error, #cBadPageSig
 
                             { fall through to implementation error handler }
 
@@ -1299,9 +1359,6 @@ ImplementationErrorHandler
 :loop                           xor         outa, pin27
                                 waitcnt     cnt, pause
                                 jmp         #:loop
-pause long 8_000_000
-
-PageSignature                   jmp         #16
 
                             { fall through to reportable error handler }
 
@@ -1310,15 +1367,32 @@ ReportError
                                 jmp         #RecoveryMode
 
 
+ { Constants (after initialization) }
+rxMask              long    1              'shifted at initialization
+txMask              long    1
 
-'*** Everything past this point will be paged code / temporaries after initialization
+pin27 long |< 27
 
-fit cPage
+pause long 8_000_000
+
+PageSignature                   jmp         #16                                 'for reference, never executed
 
 
+{ This is the end of permanent code. Initialization code, paged code, and res'd variables follow. }
 
 
+fit cPage 'On error: permanent code exceeds space allotted. Reduce code or increase cPage.
+
+
+{ FinishInit
+    The initialization process started in the first 16 registers, which will be overwritten with a nibble-based
+  low bit count table (for the continuous recalibration code). Initialization continues here, in the code page
+  space. This code will be overwritten when the the first page is executed.
+
+}
 FinishInit
+                                or          dira, pin27
+                                or          outa, pin27
 
                                 add         _addr, #1                           'txPin
                                 rdbyte      _x, _addr      
@@ -1342,19 +1416,16 @@ FinishInit
                                 add         _addr, #2                           'pageTableAddr
                                 rdword      pageTableAddr, _addr
 
-                                add         _addr, #2                           'numPages
-'                                rdbyte      numPages, _addr
-
-                                add         _addr, #1                           'crowAddress
+                                add         _addr, #3                           'crowAddress
                                 rdbyte      _x, _addr
                                 movs        rxVerifyAddress, _x
 
                                 add         _addr, #1                           'accessLockID
-'                                rdbyte      accessLockID, _addr
+                                rdbyte      accessLockID, _addr
 
                                 add         _addr, #1                           'cogID (written to hub)
- '                               cogid       _x
- '                               wrbyte      _x, _addr
+                                cogid       _x
+                                wrbyte      _x, _addr
 
                                 add         _addr, #3                           'txScratchAddr
                                 mov         txScratchAddr, _addr
@@ -1370,35 +1441,15 @@ FinishInit
                                 add         _addr, #1
                                 djnz        inb, #:loop
 
-                            andn        outa, pin27
-
+                                { finally, execute the CalculateTimings page; it will automatically go to RecoveryMode afterwards }
                                 mov         _page, #cCalculateTimings
-                                mov         _retAddr, #RecoveryMode
                                 jmp         #ExecutePage
-                                jmpret      _retAddr, #ExecutePage
-                
-                            or        outa, pin27
-
-                                jmp         #RecoveryMode
-            
 
 
-fit cPageLimit
+fit cPageLimit 'On error: the initialization code exceeds space available. Reduce code, or increase cPage and/or cPageMaxSize.
 
 org cPageLimit
 
-
-_options        res
-_clk            res
-_baud           res
-_ibTimeoutMS    res
-_breakMS        res
-_twoBit         res
-
-
-port                    res
-token                       res
-packetInfo                  res
 
 payloadSize     res
 payloadAddr     res
@@ -1408,47 +1459,49 @@ _rcvyCurrPhsb
 _rxLastWait1
 _txMaxChunkRemaining    res
 
+_calcOptions
+_page
+_rxPrevByte
 _rcvyPrevPhsb
-_rxAddr 
 _txAddr         res
 
+_calcClk
+_pageEntryAddr
 _rxCountdown
 _txCount        res
 
+_calcBaud
+_pageAddr
 _rxMixed  
 _txNextByte     res
 
-_rxOffset
+_calcIBTimeout
+_pageSize
 _txByte         res
 
-_rxF16L
+_calcBreak
 _txF16L         res
 
-_rxResetOffset
-_txF16U         res
-
-
-_rxWait0            res
-_rxWait1            res
-    
+_calcTwoBit
+_pageTmp
+_txF16U
 _rxRemaining        res
 
 
-_page res
-_pageEntryAddr res
-_pageAddr res
-_pageLen res
-_pageTmp res
-
-_error
-_pageError res
-
-
-
-
+{ Global Variables }
+rxLowBits res
+rxLowClocks res
 
 
 { Serial Timings }
+'rxBitPeriodA    res
+'rxBitPeriodB    res
+rxBitPeriod5    res
+
+'txBitPeriodA    res
+'txBitPeriodB    res
+
+
 bitPeriod0      res
 bitPeriod1      res
 startBitWait    res
@@ -1472,15 +1525,42 @@ txScratchAddr           res
 
 serSettingsChangedAddr  res
 pageTableAddr           res
-numPages                res
 
-_x      res
-_y      res
-_z      res
-_addr   res
-_retAddr    res
+fit 490 'On error: too many res variables. Reduce variables, cPage, or cPageMaxSize.
 
-fit 496
+{ Dedicated Temporary Variables
+    Some routines (Divide, Multiply, ReportCrowError) use these registers for arguments and results.
+    Important: the receiving code uses these registers, so their values will be undefined
+  after each command is received.
+    Aliases: _tmp0 through _tmp5, or _x, _y, _z, _addr, _retAddr, and _count.
+}
+org 490
+
+_tmp0
+_x
+_error
+_rxOffset       res
+
+_tmp1
+_y 
+_rxResetOffset  res
+
+_tmp2
+_z
+_rxWait0    res
+
+_tmp3
+_addr
+_rxWait1    res
+
+_tmp4
+_retAddr
+_rxAddr     res
+
+_tmp5
+_count 
+_rxF16L     res
+
 
 
 
