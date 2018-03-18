@@ -41,7 +41,7 @@ cUseTwoStopBits     = %1000_0000
 { masks used for otherOptions bitfield }
 cEnableReset        = %0000_0001
 cAllowRemoteChanges = %0000_0010
-cSendCrowErrors     = %0000_0100
+cReportCrowErrors   = %0000_0100
 
 { other }
 cPropCrowID         = $abcd 'must be two byte value
@@ -56,8 +56,7 @@ cPageLimit      = cPage + cPageMaxSize
 { Crow error codes; values from v2 specification }
 cExcPayloadSize         = 0     'The command payload exceeds device's capacity.
 cPortNotOpen            = 1     'The port is not open.
-cCorruptPayloadF16      = 2     'The command payload is corrupt. One or more Fletcher16 checksums is incorrect.
-cImplementationError    = 3     'An implementation specific error has occurred.
+cImplementationError    = 2     'An implementation specific error has occurred.
 
 { implementation error codes; must not conflict with Crow error codes }
 cPageOOB        = 20    'Page index is out-of-bounds.
@@ -80,6 +79,10 @@ cPropCrowAdmin      = 3
 cReportCrowError    = 4
 cNumPages           = 5     'cNumPages must be 9-bit value <= cInvalidPage
 cInvalidPage        = 511   'signifies no valid page loaded
+
+{ runFlags options }
+
+cOpenTransaction    = %1
 
 obj
     peekpoke : "PeekPoke"
@@ -190,7 +193,7 @@ byte    ReportCrowError_end - ReportCrowError + 1
       18   2    s    resetBreakThreshold, in milliseconds
       20   4    s    resetSerialOptions, bitfield
       24   1    s    activeSerialSettingsChanged, flag (other cogs set to non-zero, PropCrow sets to zero)
-      25   1    s    otherOptions, bitfield
+      25   1    I    otherOptions, bitfield
       26   2    s    numUserPorts
       28   2    I    maxUserPorts
       30   2    I    userPortsAddr
@@ -319,7 +322,18 @@ dat
 
 org cPage
 ReportCrowError
+
+                                mov         inb, #20
+ 
+                                mov         cnt, cnt
+                                add         cnt, pause
+
+:loop                           xor         outa, pin27
+                                waitcnt     cnt, pause
+                                djnz        inb, #:loop
+ 
                                 jmp         #ReceiveCommand
+
 ReportCrowError_end             jmp         #RunawayPageHandler
 fit cPageLimit 'Page is too big. Reduce code or increase cPageSize.
 
@@ -531,7 +545,7 @@ org 16
 }
 RunawayPageHandler
                                 mov         _error, #cRunawayPage
-                                jmp         #ImplementationErrorHandler
+                                jmp         #CrowErrorHandler
 
 { Multiply
     Algorithm from the Spin interpreter, with sign code removed. It is placed here for the benefit of
@@ -739,6 +753,7 @@ ParsingError
 }
 'todo (3/17): does the removal of the ctrb off code change any timings?
 RecoveryMode
+                                andn        runFlags, #cOpenTransaction             'close any open transaction
                                 mov         cnt, recoveryTime
                                 add         cnt, cnt
                                 mov         _rcvyPrevPhsb, phsb                     'first interval always recoveryTime+1 counts, so at least one loop for break 
@@ -907,7 +922,10 @@ ReceiveCommandFinish
 rxVerifyAddress         if_nz   cmp         inb, #0-0                       wz      'verify non-broadcast address; s-field set at initialization
                         if_nz   jmp         #ReceiveCommand                         '...wrong non-broadcast address
 
-                                { calculate the number of low bits; for both cont-recalibration and some extended admin commands }
+                                { if correctly addressed and not broadcast, then a Crow transaction is open (until final response sent, or error) }
+                         if_nc  or          runFlags, #cOpenTransaction
+
+                                { calculate the number of low bits }
 
                                 shr         _rxPrevByte, #4                         'prepare to add number of low data bits for last nibble
                                 movs        :lastNibble, _rxPrevByte
@@ -1312,7 +1330,7 @@ ExecutePage
                   if_c_and_z    jmp         #cPage                              'if page already loaded and is valid / in-bounds, then go
 
                         if_nc   mov         _error, #cPageOOB                   'page index must be within table bounds
-                        if_nc   jmp         #ImplementationErrorHandler
+                        if_nc   jmp         #CrowErrorHandler
 
                                 movd        :load, #cPage
 
@@ -1324,11 +1342,11 @@ ExecutePage
                                 rdbyte      _pageSize, _pageEntryAddr   wz      '_pageSize in longs
 
                         if_z    mov         _error, #cEmptyPage                 'page size can not be zero
-                        if_z    jmp         #ImplementationErrorHandler
+                        if_z    jmp         #CrowErrorHandler
 
                                 cmp         _pageSize, #cPageMaxSize    wc, wz  'page size must fit within space
                 if_nc_and_nz    mov         _error, #cExcPageSize
-                if_nc_and_nz    jmp         #ImplementationErrorHandler
+                if_nc_and_nz    jmp         #CrowErrorHandler
 
                                 movs        :verify, #cPage
                                 add         :verify, _pageSize
@@ -1351,20 +1369,18 @@ ExecutePage
 
                                 mov         _error, #cBadPageSig
 
-                            { fall through to implementation error handler }
+                            { fall through to crow error handler }
 
-ImplementationErrorHandler                  
-                                mov         cnt, cnt
-                                add         cnt, pause
-:loop                           xor         outa, pin27
-                                waitcnt     cnt, pause
-                                jmp         #:loop
+{ CrowErrorHandler
+    This routine simply tests whether crow errors should be reported, and then executes the relevant
+  code page if so. It expects that _error is set.
+}
+CrowErrorHandler
+                                test        otherOptions, #cReportCrowErrors    wc
+                        if_nc   jmp         #RecoveryMode
 
-                            { fall through to reportable error handler }
-
-ReportError
-
-                                jmp         #RecoveryMode
+                                mov         _page, #cReportCrowError
+                                jmp         #ExecutePage
 
 
  { Constants (after initialization) }
@@ -1374,6 +1390,8 @@ txMask              long    1
 pin27 long |< 27
 
 pause long 8_000_000
+
+runFlags    long 0
 
 PageSignature                   jmp         #16                                 'for reference, never executed
 
@@ -1429,6 +1447,11 @@ FinishInit
 
                                 add         _addr, #3                           'txScratchAddr
                                 mov         txScratchAddr, _addr
+
+                                { todo: reorder }
+                                mov         _addr, par
+                                add         _addr, #25
+                                rdbyte      otherOptions, _addr
 
                                 { load low bit count table from hub into registers 0-15 (this saves a trivial amount of hub memory) }
                                 mov         inb, #16
@@ -1510,6 +1533,8 @@ breakMultiple   res
 recoveryTime    res
 ibTimeout       res
 rxPhsbReset     res
+
+otherOptions    res
 
 { Constants (after initialization) }
 deviceInfoAddr          res
