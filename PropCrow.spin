@@ -38,7 +38,7 @@ cUseBaudDetect      = %0000_0010
 cUseContRecal       = %0000_0100
 cUseTwoStopBits     = %1000_0000
 
-{ masks used for otherOptions bitfield }
+{ otherOptions bitfield }
 cEnableReset        = %0000_0001
 cAllowRemoteChanges = %0000_0010
 cReportCrowErrors   = %0000_0100
@@ -48,15 +48,16 @@ cPropCrowID         = $abcd 'must be two byte value
 
 
 { paging constants }
-cPage           = 385
-cPageMaxSize    = 72
+cPage           = 394
+cPageMaxSize    = 62
 cPageLimit      = cPage + cPageMaxSize
 
 
 { Crow error codes; values from v2 specification }
 cExcPayloadSize         = 0     'The command payload exceeds device's capacity.
-cPortNotOpen            = 1     'The port is not open.
-cImplementationError    = 2     'An implementation specific error has occurred.
+cAdminPortNotOpen            = 1     'The port is not open.
+cUserPortNotOpen = 2
+cImplementationError    = 3     'An implementation specific error has occurred.
 
 { implementation error codes; must not conflict with Crow error codes }
 cPageOOB        = 20    'Page index is out-of-bounds.
@@ -77,12 +78,18 @@ cGetDeviceInfo      = 1
 cUserCommand        = 2
 cPropCrowAdmin      = 3
 cReportCrowError    = 4
-cNumPages           = 5     'cNumPages must be 9-bit value <= cInvalidPage
+cBlinky             = 5
+cOtherStandardAdmin = 6
+cNumPages           = 7
 cInvalidPage        = 511   'signifies no valid page loaded
 
 { runFlags options }
 
 cOpenTransaction    = %1
+
+{ special purpose register aliases }
+cPort   = $1F7    'dirb
+cCommandFlags   = $1F5 'outb
 
 obj
     peekpoke : "PeekPoke"
@@ -112,6 +119,11 @@ pub new
     word[@PageTable][4] := @UserCommand
     word[@PageTable][6] := @PropCrowAdmin
     word[@PageTable][8] := @ReportCrowError
+    word[@PageTable][10] := @Blinky
+    word[@PageTable][12] := @OtherStandardAdmin
+
+    __string0Addr := @ImplErrorStart
+    __string0Size := strsize(@ImplErrorStart)
 
 
     __numUserPorts      := 3
@@ -122,7 +134,7 @@ pub new
     __userPortsAddr     := @__userPorts
     __rxBufferAddr      := @__rxBuffer
     __txBufferAddr      := @__txBuffer
-    __datConstansAddr   := @DatConstants
+    __datConstantsAddr  := @DatConstants
     __pageTableAddr     := @PageTable
 
     __objBaseAddr       := @@0
@@ -169,6 +181,18 @@ byte    PropCrowAdmin_end - PropCrowAdmin + 1
 word    0
 byte    0
 byte    ReportCrowError_end - ReportCrowError + 1
+
+'5: Blinky
+word    0
+byte    0
+byte    Blinky_end - Blinky + 1
+
+
+'6: OtherStandardAdmin
+word    0
+byte    0
+byte    OtherStandardAdmin_end - OtherStandardAdmin + 1
+
 
 
 
@@ -247,7 +271,7 @@ ControlBlock
                     word    100                 'resetBreakThreshold, in milliseconds
                     long    $0707_0101          'resetSerialOptions
                     byte    0                   'activeSerialSettingsChanged
-                    byte    1                   'otherOptions
+                    byte    cReportCrowErrors | cAllowRemoteChanges | cEnableReset                   'otherOptions
 __numUserPorts      word    0                   'numUserPorts
                     word    cMaxUserPorts       'maxUserPorts
 __userPortsAddr     word    0-0                 'userPortsAddr
@@ -257,7 +281,7 @@ __rxBufferAddr      word    0-0                 'rxBufferAddr
 __txBufferAddr      word    0-0                 'txBufferAddr
                     word    cMaxRxPayloadSize   'maxRxPayloadSize
                     word    cMaxTxPayloadSize   'maxTxPayloadSize
-__datConstansAddr   word    0-0                 'datConstantsAddr
+__datConstantsAddr  word    0-0                 'datConstantsAddr
 __pageTableAddr     word    0-0                 'pageTableAddr
                     byte    cNumPages           'numPages
                     byte    1                   'crowAddress
@@ -304,51 +328,220 @@ DatConstants
   sent separately.
 }
 long    $0000_0100 | ((cPropCrowID & $ff) << 24) | ((cPropCrowID & $ff00) << 8)             'Crow v1, implementationID = cPropCrowID
-long    $0003_0000 | ((cMaxRxPayloadSize & $ff) << 8) | ((cMaxRxPayloadSize & $700) >> 8)   'max commmand payload size, 3 admin ports (upper byte not sent) 
-long    $0100_0000                                                                          'admin ports 0 and 1
-long    $0000_0000 | ((cPropCrowID & $ff) << 8) | ((cPropCrowID & $ff00) >> 8)              'admin port cPropCrowID (upper word not sent)
+long    $0002_0000 | ((cMaxRxPayloadSize & $ff) << 8) | ((cMaxRxPayloadSize & $700) >> 8)   'max commmand payload size, 3 admin ports (upper byte not sent) 
+long    $0100_0000 | ((cPropCrowID & $ff) << 24) | ((cPropCrowID & $ff00) << 8)             'admin ports 0 and PropCrowID
 
-{ NibbleTable (@DatConstants + 16)
+{ NibbleTable (@DatConstants + 12)
   A table of low bit counts for integers 0 to 15. Used for continuous recalibration.
 }
 byte 4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0
 
+{ StringTable (@DatConstants + 28)
+}
+StringTable
+
+'ImplErrorStart
+__string0Addr word 0
+__string0Size word 0
+
 { Strings
 }
-ImpErrorMessageStart    byte    "PropCrow error: ", 0
+ImplErrorStart    byte    "PropCrow error: ", 0
 
 dat
+
+org cPage
+OtherStandardAdmin
+                                { todo }
+OtherStandardAdmin_end          
+                                jmp         #RecoveryMode
+fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
+
+org cPage
+Blinky
+
+                                mov         inb, #12
+ 
+                                mov         cnt, cnt
+                                add         cnt, blinkyPause
+
+:loop                           xor         outa, pin27
+                                waitcnt     cnt, blinkyPause
+                                djnz        inb, #:loop
+
+                                jmp         #RecoveryMode
+Blinky_end 
+blinkyPause     long 4_000_000
+
 
 
 org cPage
 ReportCrowError
+                                { ReportCrowError assumes _error has been set to Crow (<3) or implementation error number (>=3). }
 
-                                mov         inb, #20
+                                { An error response has bit 5 of the first header byte (RH0) set. Rather than creating a special option
+                                    for sending error responses, we directly modify the header template, and then revert it (clear) when
+                                    we're done. This saves a bit of permanent code. }
  
-                                mov         cnt, cnt
-                                add         cnt, pause
+                                'or          SendFinalHeader, #%0010_0000            'set bit 5 of RH0 (for Crow error)
 
-:loop                           xor         outa, pin27
-                                waitcnt     cnt, pause
-                                djnz        inb, #:loop
- 
-                                jmp         #ReceiveCommand
+                                { Crow error codes:
+                                    0 - excessive command payload
+                                    1 - admin port not open
+                                    2 - user port not open
+                                    3 - implementation error 
 
-ReportCrowError_end             jmp         #RunawayPageHandler
-fit cPageLimit 'Page is too big. Reduce code or increase cPageSize.
+                                  This implementation sets _error > 3 to report implementation errors. That number will be returned
+                                    within the error message. The Crow level error code is always 3 for implementation errors. }
+
+                                cmp         _error, #3                      wc
+                        if_nc   jmp         #:implementation
+
+                                { Errors 0-2 always have three payload bytes, starting with the error code. }
+
+                                mov         payloadSize, #3
+                                call        #SendFinalHeader
+
+                                mov         payloadSize, #1                         'send error code
+                                mov         payloadAddr, txBufferAddr
+                                wrbyte      _error, txBufferAddr
+                                call        #SendPayloadBytes
+
+                                mov         payloadSize, #2                         'next parameter is two bytes
+
+                                cmp         _error, #0                      wz      'value of next parameter depends on error type
+                        if_z    jmp         #:excPayloadSize
+                                
+                                { error is admin/user port closed, parameter is attempted port number }
+
+                                mov         payloadAddr, txBufferAddr               'copy port to buffer, in big-endian order
+                                add         payloadAddr, #1
+                                wrbyte      cPort, payloadAddr
+                                sub         payloadAddr, #1
+                                shr         cPort, #8                               'safe to modify port -- not needed afterwards
+                                wrbyte      cPort, payloadAddr
+
+                                call        #SendPayloadBytes                       'send port
+                                
+                                jmp         #:finish
+
+:excPayloadSize                
+                                { For excessive payload size, the parameter is the supported maximum command payload size, which
+                                    we can send directly from the deviceInfo template. }
+
+                                mov         payloadAddr, deviceInfoAddr
+                                add         payloadAddr, #4
+                                call        #SendPayloadBytes
+
+                                jmp         #:finish
+   
+:implementation                 
+                                { For implementation errors, the payload consists of one byte for Crow error type (3), followed
+                                    by a message string consisting of "PropCrow error: <implementation error number>.". The first
+                                    part of the string is in the strings table. The implementation error number is written to
+                                    the tx buffer before starting (so we'll know the size). 
+                                  The implementation error number is not part of the Crow standard, it is just part of the message
+                                    string sent to the host to help with debugging. }
+                                
+                            wrlong  _error, #8
+                                { Write the implementation error number as a string to the tx buffer. _error aliases _x, so
+                                    we don't need to set that up. } 
+                                mov         _addr, txBufferAddr
+                                call        #Uint32ToStr
+
+
+                                { At this point:
+                                    implementation error string starts at txBufferAddr
+                                    _addr = address after last char (still in tx buffer)
+                                    _count = number of chars for implementation error string
+                                }
+
+                                { Get address and size of ImplErrorStart ("PropCrow error: "). } 
+                                mov         _z, deviceInfoAddr
+                                add         _z, #28'(@StringTable - @DatConstants)
+                                rdword      _y, _z                                  '_y is message start address 
+                                add         _z, #2
+                                rdword      _z, _z                                  '_z is message start size
+
+                                mov         _x, #3                                  'Crow error number = 3 for any implementation error
+                                wrbyte      _x, _addr                               'write crow error number after implementation specific error number string 
+
+                                { So, at this point:
+                                    _addr = address of crow error code in tx buffer
+                                    _y = message start address
+                                    _z = message start size
+                                    txBufferAddr = address of implementation error number string
+                                    _count = size of implementation error number string
+                                }
+
+                                mov         payloadSize, #2                         '2 bytes for crow error number, and final "."
+                                add         payloadSize, _z                         '_z bytes for "PropCrow error: "
+                                add         payloadSize, _count                     '_count bytes for implementation error number
+
+                                call        #SendFinalHeader 
+                               
+                                mov         payloadAddr, _addr 
+                                mov         payloadSize, #1
+                                call        #SendPayloadBytes                       'send Crow error number
+
+                                mov         payloadAddr, _y
+                                mov         payloadSize, _z
+                                call        #SendPayloadBytes                       'send "PropCrow error: "
+
+                                mov         payloadAddr, txBufferAddr
+                                mov         payloadSize, _count 
+                                call        #SendPayloadBytes                       'send Uint32ToStr(_error)
+
+                                mov         _x, #$2e
+                                wrbyte      _x, payloadAddr                         'write "." after number string (where crow error code was)
+                                mov         payloadSize, #1
+                                call        #SendPayloadBytes                       'send "."
+
+:finish                         call        #FinishSending                          'requires all error responses used partial sending routines
+
+                                'andn        SendFinalHeader, #%0010_0000            'revert RH0 template (clear bit 5 for normal responses)
+                                
+ReportCrowError_end             jmp         #RecoveryMode
+
+fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
 
 
 org cPage
 UserCommand
+
+                                'mov         payloadAddr, rxBufferAddr
+                                'jmp         #SendFinalResponse
+
+
+                                rdlong      _error, rxBufferAddr
+                                jmp         #CrowErrorHandler
+
+{
                                 'echo the port
                                 mov         _x, dirb
                                 wrword      _x, txBufferAddr
                                 mov         payloadSize, #2
                                 mov         payloadAddr, txBufferAddr
+}
 
-                                jmp         #SendFinalResponse
+                                'report calibration observations
+                                mov         _addr, txBufferAddr
+                                wrlong      rxLowBits, _addr
+                                add         _addr, #4
+                                wrlong      rxLowClocks, _addr
+                                add         _addr, #4
+                                wrlong      _rxLastWait1, _addr
 
-UserCommand_end                 jmp         #RunawayPageHandler
+                                mov         _x, rxLowClocks
+                                mov         _y, rxLowBits
+                                call        #Divide
+                                add         _addr, #4
+                                wrlong      _y, _addr
+
+                                mov         payloadSize, #16
+                                mov         payloadAddr, rxBufferAddr
+
+UserCommand_end                 jmp         #SendFinalResponse
 fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
 
 
@@ -356,21 +549,20 @@ org cPage
 PropCrowAdmin
                                 mov         payloadAddr, #0
                                 mov         payloadSize, #8
-                                jmp         #SendFinalResponse
-PropCrowAdmin_end               jmp         #RunawayPageHandler
+PropCrowAdmin_end               jmp         #SendFinalResponse
 fit cPageLimit 'Page is too big. Reduce code or increase cPageSize.
-
 
 org cPage
 GetDeviceInfo
-                                call        #LockSharedAccess
+                                'call        #LockSharedAccess
+
 
                                 rdword      _x, numUserPortsAddr                    '_x = num open user ports to report
                                 max         _x, #255                                'getDeviceInfo limited to reporting 255 user ports
 
-                                mov         payloadSize, _x                         'response payload size is 14 + 2*<num user ports> (assumes 3 admin protocols)
+                                mov         payloadSize, _x                         'response payload size is 12 + 2*<num user ports> (assumes 2 admin protocols)
                                 shl         payloadSize, #1
-                                add         payloadSize, #14
+                                add         payloadSize, #12
                                 call        #SendFinalHeader
 
                                 mov         payloadAddr, deviceInfoAddr
@@ -384,7 +576,7 @@ GetDeviceInfo
 
                                 mov         payloadAddr, deviceInfoAddr
                                 add         payloadAddr, #8
-                                mov         payloadSize, #6
+                                mov         payloadSize, #4
                                 call        #SendPayloadBytes                       'send open admin ports from template
 
                                 cmp         _x, #0                   wz
@@ -404,12 +596,9 @@ GetDeviceInfo
 
 :finish                         call        #FinishSending
  
-                                call        #UnlockSharedAccess
+                                'call        #UnlockSharedAccess
                                 
-                                jmp         #ReceiveCommand
-
-GetDeviceInfo_end               jmp         #RunawayPageHandler
-
+GetDeviceInfo_end               jmp         #ReceiveCommand
 fit cPageLimit 'Page is too big. Reduce code or increase cPageSize.
 
 
@@ -420,7 +609,7 @@ org cPage
   This routine calculates the serial timings (in clocks) based on the settings stored in the hub.
 }
 CalculateTimings
-                                call        #LockSharedAccess
+                                'call        #LockSharedAccess
 
                                 mov         _addr, par
                                 rdlong      _calcBaud, _addr
@@ -432,7 +621,8 @@ CalculateTimings
                                 rdlong      _calcOptions, _addr
                                 rdlong      _calcClk, #0
 
-                                call        #UnlockSharedAccess
+                                'call        #UnlockSharedAccess
+
                             
                                 mov         _x, _calcClk                    
                                 shl         _x, #1
@@ -443,13 +633,17 @@ CalculateTimings
                                 mov         bitPeriod0, _calcTwoBit
                                 shr         bitPeriod0, #1
                                 min         bitPeriod0, #34                         'bitPeriod0 ready
-                            
+                           
+                                mov         txBitPeriodA, bitPeriod0
+ 
                                 mov         bitPeriod1, bitPeriod0
                                 test        _calcTwoBit, #1                     wc
                         if_c    add         bitPeriod1, #1                          'bitPeriod1 ready
 
-                                mov         rxBitPeriod5, bitPeriod0
-                                min         rxBitPeriod5, #33
+                                mov         txBitPeriodB, bitPeriod1
+
+                                'mov         rxBitPeriod5, bitPeriod0
+                                'min         rxBitPeriod5, #33
 
                                 mov         startBitWait, bitPeriod0
                                 shr         startBitWait, #1
@@ -496,11 +690,8 @@ CalculateTimings
                                 add         rxPhsbReset, bitPeriod0                 'rxPhsbReset ready (= 5 + startBitWait + bitPeriod0 + 5 + 4 + 4 + 1)
 
                                 jmp         #RecoveryMode
-
+CalculateTimings_end
 k1000                           long    1000
-
-CalculateTimings_end            jmp         #RunawayPageHandler
-
 fit cPageLimit 'Page is too big. Reduce code or increase cPageSize.
 
 dat 
@@ -539,14 +730,6 @@ long 0[16-$]
 fit 16
 org 16
 
-{ RunawayPageHandler
-    Every valid page must end with an unconditional jmp to this handler (i.e. "jmp #16"). It is placed
-  here since this position should remain constant in future revisions (for precompiled code pages).
-}
-RunawayPageHandler
-                                mov         _error, #cRunawayPage
-                                jmp         #CrowErrorHandler
-
 { Multiply
     Algorithm from the Spin interpreter, with sign code removed. It is placed here for the benefit of
   code pages (its position shouldn't change).
@@ -564,7 +747,6 @@ Multiply
                                 rcr         _x, #1              wc
                                 djnz        inb, #:mmul
 Multiply_ret                    ret
-
 
 { Divide 
     Algorithm from the Spin interpreter, with sign code removed. It is placed here for the benefit of
@@ -587,7 +769,53 @@ Divide
 Divide_ret                      ret
 
 
+{ Uint32ToStr
+    Does not write leading spaces/zeroes.
+    Before: _x = unsigned integer to convert
+            _addr = hub address to write ascii characters
+    After: _x = undefined
+           _addr = hub address immediately after last character
+           _count = character length
+}
 
+Uint32ToStr
+                                mov         _utilX, _x                  wz      'free _x for division
+                        if_z    jmp         #:zero
+
+                                mov         _x, kOneBillion
+                                mov         _utilCount, #10
+                                mov         _count, #0
+                                mov         _utilFlags, #0                      'bit 0 indicates if string has started
+:outer
+                                mov         _utilY, #$30
+:inner
+                                cmpsub      _utilX, _x                  wc, wz
+                        if_c    add         _utilY, #1
+                if_c_and_nz     jmp         #:inner
+
+                                test        _utilFlags, #1              wc      'c=1 string previously started
+                                cmp         _utilY, #$30                wz      'z=1 digit is zero
+                if_nc_and_nz    or          _utilFlags, #1                      'if string not previously started, and current digit non-zero, then start
+                    if_c_or_nz  add         _count, #1                          'if string previously started, or current digit non-zero, then write
+                    if_c_or_nz  wrbyte      _utilY, _addr
+                    if_c_or_nz  add         _addr, #1
+
+                                mov         _y, #10
+                                call        #Divide
+                                mov         _x, _y
+                                
+                                djnz        _utilCount, #:outer
+
+                                jmp         UintToStr_ret
+
+:zero                           mov         _x, #$30                            'zero is special case
+                                mov         _count, #1
+                                wrbyte      _x, _addr
+                                add         _addr, #1
+UintToStr_ret
+Uint32ToStr_ret                 ret
+
+kOneBillion long 1_000_000_000
 
 { Special/Shadow Register Usage
 
@@ -619,7 +847,7 @@ Divide_ret                      ret
     section below.
 }
 ReceiveCommand
-                            xor     outa, pin27
+                            xor outa, pin27
 
                                 { pre-loop initialization }
                                 mov         rxStartWait, rxContinue
@@ -693,7 +921,7 @@ rxMovD                          mov         rxShiftedD, 0-0                     
                         if_c    add         _rxAddr, #1                             'Write 2 - increment address (pre-increment saves re-testing the flag)
 
 'bit 5 - 33 clocks
-rxBit5                          waitcnt     _rxWait1, rxBitPeriod5
+rxBit5                          waitcnt     _rxWait1, bitPeriod0
                                 testn       rxMask, ina                     wz
                         if_c    wrbyte      _rxPrevByte, _rxAddr                    'Write 3 - wrbyte excludes any other instructions besides testn
 
@@ -922,55 +1150,53 @@ ReceiveCommandFinish
 rxVerifyAddress         if_nz   cmp         inb, #0-0                       wz      'verify non-broadcast address; s-field set at initialization
                         if_nz   jmp         #ReceiveCommand                         '...wrong non-broadcast address
 
-                                { if correctly addressed and not broadcast, then a Crow transaction is open (until final response sent, or error) }
-                         if_nc  or          runFlags, #cOpenTransaction
+                                { a crow transaction is open if responses aren't muted (until final response sent, or error) }
+                                muxnc       runFlags, #cOpenTransaction
 
-                                { calculate the number of low bits }
-
-                                shr         _rxPrevByte, #4                         'prepare to add number of low data bits for last nibble
-                                movs        :lastNibble, _rxPrevByte
-
-                                mov         rxLowBits, _rxMixed                     'get number of start bits (byteCount)
-                                shl         rxLowBits, #19
-                                sar         rxLowBits, #19
-                                abs         rxLowBits, rxLowBits
-
-:lastNibble                     add         _rxMixed, 0-0                           'add number of low data bits for last nibble to data bit total
- 
-                                mov         _y, _rxMixed                            'lowBitCount is in upper word of _rxMixed (save _rxMixed for later)
-                                shr         _y, #16
-
-                                add         rxLowBits, _y                           'byteCount + lowBitCount = num total low bits
-
-                                { check if interbyte timeout occurred; for diagnostics }
- '                               test        _rxMixed, ibTimeoutFlag         wc
-  '                      if_c    add         diagNumIBTimeouts, #1
+'                                { calculate the number of low bits }
+'
+'                                shr         _rxPrevByte, #4                         'prepare to add number of low data bits for last nibble
+'                                movs        :lastNibble, _rxPrevByte
+'
+'                                mov         rxLowBits, _rxMixed                     'get number of start bits (byteCount)
+'                                shl         rxLowBits, #19
+'                                sar         rxLowBits, #19
+'                                abs         rxLowBits, rxLowBits
+'
+':lastNibble                     add         _rxMixed, 0-0                           'add number of low data bits for last nibble to data bit total
+' 
+'                                mov         _y, _rxMixed                            'lowBitCount is in upper word of _rxMixed (save _rxMixed for later)
+'                                shr         _y, #16
+'
+'                                add         rxLowBits, _y                           'byteCount + lowBitCount = num total low bits
 
                                 { check if payload size exceeded capacity -- a reportable error condition }
                                 test        _rxMixed, excPayloadFlag        wc
-                        if_c    mov         _x, #cExcPayloadSize
-                        if_c    mov         _page, #cReportCrowError
-                        if_c    jmp         #ExecutePage
+                        if_c    mov         _error, #cExcPayloadSize
+                        if_c    jmp         #CrowErrorHandler
 
-                                { check command type, exit if user command }
+                                { if user command, do port lookup elsewhere }
                                 test        ina, #CommandTypeFlag           wc      'c=1 user command; sh-ina is H0 from rxH0
-                        if_c    mov         _page, #cUserCommand
-                        if_c    jmp         #ExecutePage
+                        if_c    jmp         #UserPortLookup
 
-                                { check admin port - port is in dirb }
+                                { check admin port - port is in dirb/cPort }
 
-                                cmp         dirb, #0                        wz      'universal admin (port 0)
-                        if_z    jmp         #UniversalAdmin
-
-                                cmp         dirb, #1                        wz      'extended admin (port 1)
-                        if_z    jmp         #ExtendedAdmin
+                                cmp         cPort, #0                        wz     'Crow standard admin commands (universal and extended)
+                        if_z    jmp         #StandardAdmin
     
-                                cmp         dirb, propCrowAdminPort         wz      'PropCrow specific admin
+                                cmp         cPort, propCrowAdminPort         wz     'PropCrow admin
                         if_z    mov         _page, #cPropCrowAdmin
                         if_z    jmp         #ExecutePage
 
-                                mov         _error, #cPortNotOpen                   'the port not being open is a reportable error
-                                mov         _page, #cReportCrowError
+                                mov         _error, #cAdminPortNotOpen              'the port not being open is a reportable error
+                                jmp         #CrowErrorHandler 
+
+
+{ UserPortLookup
+    Called when a user command has arrived. The 
+}
+UserPortLookup
+                                mov         _page, #cUserCommand
                                 jmp         #ExecutePage
 
 
@@ -979,106 +1205,175 @@ rxVerifyAddress         if_nz   cmp         inb, #0-0                       wz  
   two commands: ping and getDeviceInfo. ping will be taken care of in permanent code, while getDeviceInfo
   is done with paged code.
 }
-UniversalAdmin
-                                { admin protocol 0 with no payload is ping }
-                                cmp         payloadSize, #0                 wz      'z=1 ping command
-                        if_nz   jmp         #:getDeviceInfo
-                                jmp         #SendFinalResponse                      'send ping response (payloadSize==0), then go to ReceiveCommand
+'UniversalAdmin
+'                                { universal admin command with no payload is ping }
+'                                cmp         payloadSize, #0                 wz      'z=1 ping command
+'                        if_nz   jmp         #:getDeviceInfo
+'                                jmp         #SendFinalResponse                      'send ping response (payloadSize==0), then go to ReceiveCommand
+'
+'                                { only other universal admin command, getDeviceInfo, has 0x00 as payload }
+':getDeviceInfo                  cmp         payloadSize, #1                 wz      'z=1 correct payload size
+'                        if_z    rdbyte      cnt, rxBufferAddr               wz      'z=1 correct payload byte
+'                        if_nz   jmp         #ReceiveCommand                         '...command not getDeviceInfo or ping
+'                                mov         _page, #cGetDeviceInfo                  'perform getDeviceInfo
+'                                jmp         #ExecutePage
 
-                                { other admin protocol 0 command, getDeviceInfo, has 0x00 as payload }
-:getDeviceInfo                  cmp         payloadSize, #1                 wz      'z=0 wrong payload size for getDeviceInfo (1)
-                        if_z    rdbyte      cnt, rxBufferAddr                       'load payload byte into sh-cnt
-                        if_z    cmp         cnt, #$00                       wz      'z=0 wrong payload for getDeviceInfo
-                        if_nz   jmp         #ReceiveCommand                         '...command not getDeviceInfo or ping
 
-                                { perform getDeviceInfo }
+{ StandardAdmin
+    This is the first level handler for admin commands defined by the Crow standards. The commands ping
+  and echo use permanent code, the other commands use paged code.
+}
+StandardAdmin
+                                { ping() }
+                                cmp         payloadSize, #0                 wz
+                        if_z    jmp         #SendFinalResponse
+                        
+                                { for all other commands, first byte is command code }
+                                rdbyte      _x, rxBufferAddr                wz
 
+                                { getDeviceInfo(), code = 0x00 } 
+                        if_nz   jmp         #:echo
+                                cmp         payloadSize, #1                 wz      'z=0 payload size incorrect (require exactly one byte)
+                                test        runFlags, #cOpenTransaction     wc      'c=0 no open transaction (command was muted)
+                    if_nc_or_nz jmp         #ReceiveCommand
                                 mov         _page, #cGetDeviceInfo
                                 jmp         #ExecutePage
 
+                                { echo(numIntermediates=0, bytes=[]), code = 0x01 }
+:echo
+                                cmp         _x, #1                          wz
+                        if_nz   mov         _page, #cOtherStandardAdmin             'all other standard admin commands taken care of with paged code
+                        if_nz   jmp         #ExecutePage
 
-{ ExtendedAdmin
-    The extended admin protocol defines several commands on port 1. See "Crow Specification v2.txt". The keepAlive
-  command is taken care of in permanent code, while the rest are done with paged code.
-}
-ExtendedAdmin
-                                jmp         #ReceiveCommand
+                                cmp         payloadSize, #2                 wc      'c=1 payload size too small (require 2+ bytes)
+                                test        runFlags, #cOpenTransaction     wz      'z=1 no open transaction (command was muted)
+                    if_c_or_z   jmp         #ReceiveCommand
+
+                                mov         _y, rxBufferAddr
+                                add         _y, #1
+                                rdbyte      _x, _y                          wz      '_x = number of intermediate responses is second byte
+                                add         _y, #1                                  '_y = address of bytes to echo (starting at third byte, if provided)
+                                mov         _z, payloadSize
+                                sub         _z, #2                                  '_z = number of bytes to echo
+
+                        if_z    jmp         #:finalEcho
+
+:intermediateEcho               mov         payloadAddr, _y
+                                mov         payloadSize, _z
+                                call        #SendIntermediate
+                                djnz        _x, #:intermediateEcho
+
+:finalEcho                      mov         payloadAddr, _y
+                                mov         payloadSize, _z
+                                jmp        #SendFinalResponse
+
 
 
 { LockSharedAccess
   A call to LockSharedAcccess must be followed by a call to UnlockSharedAccess.
 }
-LockSharedAccess
-                                or      outa, pin27
-LockSharedAccess_ret            ret
+'LockSharedAccess
+                                'or      outa, pin27
+'LockSharedAccess_ret            ret
 
 { UnlockSharedAccess
 }
-UnlockSharedAccess
-                                andn    outa, pin27
-UnlockSharedAccess_ret          ret
+'UnlockSharedAccess
+                                'andn    outa, pin27
+'UnlockSharedAccess_ret          ret
 
 
 
-{ txSendBytes }
-{ Helper routine  used to send bytes. It also updates the running F16 checksum. It assumes
-    the tx pin is already an output. Bytes are sent from the hub.
-  This lowest bitPeriod supported by this routine is 32 or 33 clocks (32 clocks requires that
-    the stopBitPeriod be a multiple of 2 to avoid worst case timing for hub reads).
+{ TxSendBytes
+    Helper routine used to send bytes. It also updates the running F16 checksum. It assumes
+  the tx pin is already an output. Bytes are sent from the hub.
+    This routine should not be called by user code -- use the complete or partial sending routines.
+    The lowest bitPeriod supported by this routine is 32 or 33 clocks (32 clocks requires that
+  the stopBitPeriod be a multiple of 2 to avoid worst case timing for hub reads).
   Usage:    mov     _txAddr, <hub address of bytes>
             mov     _txCount, <number to send != 0>
-            call    #txSendBytes
+            call    #TxSendBytes
   After retuning _txCount will be zero and _txAddr will point to the address immediately
     after the last byte sent.
 }
-txSendBytes
+TxSendBytes
+                                test        runFlags, #cOpenTransaction     wc      'do not send if no open transaction
+                        if_nc   jmp         TxSendBytes_ret
+
                                 rdbyte      _txByte, _txAddr
                                 
                                 mov         cnt, cnt
                                 add         cnt, #9
 
-:txByteLoop                     waitcnt     cnt, bitPeriod0                      'start bit
+:byteLoop                       waitcnt     cnt, txBitPeriodA                       'start bit
                                 andn        outa, txMask
 
-                                add         _txF16L, _txByte                    'F16 calculation
+                                add         _txF16L, _txByte                        'F16 calculation
                                 cmpsub      _txF16L, #255
                                 add         _txF16U, _txF16L
                                 cmpsub      _txF16U, #255
 
-                                shr         _txByte, #1                 wc
-                                waitcnt     cnt, bitPeriod0                      'bit0
+                                shr         _txByte, #1                     wc
+                                waitcnt     cnt, txBitPeriodB                       'bit0
                                 muxc        outa, txMask
 
                                 mov         inb, #6
                                 add         _txAddr, #1
 
-:txBitLoop                      shr         _txByte, #1                 wc
-                                waitcnt     cnt, bitPeriod0                      'bits1-6
+:bitLoop                        shr         _txByte, #1                     wc
+:twiddle                        waitcnt     cnt, txBitPeriodA                       'bits1-6
                                 muxc        outa, txMask
-                                djnz        inb, #:txBitLoop
+                                xor         :twiddle, #1
+                                djnz        inb, #:bitLoop
             
-                                shr         _txByte, #1                 wc
+                                shr         _txByte, #1                     wc
                                 
-                                waitcnt     cnt, bitPeriod0                      'bit7
+                                waitcnt     cnt, txBitPeriodA                       'bit7
                                 muxc        outa, txMask
 
                                 rdbyte      _txNextByte, _txAddr
 
-                                waitcnt     cnt, stopBitDuration                'stop bit
+                                waitcnt     cnt, stopBitDuration                    'stop bit
                                 or          outa, txMask
 
                                 mov         _txByte, _txNextByte
 
-                                djnz        _txCount, #:txByteLoop
+                                djnz        _txCount, #:byteLoop
 
-                                waitcnt     cnt, #0                             'ensure line is high for a full stop bit duration
-txSendBytes_ret                 ret 
+                                waitcnt     cnt, #0                                 'ensure line is high for a full stop bit duration
+
+TxSendBytes_ret                 ret 
+
+
+{ TxSendAndResetF16
+    Helper routine to send the current F16 checksum (upper first, then lower). It 
+  also resets the checksum after sending.
+}
+TxSendAndResetF16
+                                { save F16 to hub }
+                                mov         _txAddr, txScratchAddr
+                                wrbyte      _txF16U, _txAddr
+                                add         _txAddr, #1
+                                mov         _txCount, #2
+                                wrbyte      _txF16L, _txAddr
+                            
+                                { send F16 }
+                                mov         _txAddr, txScratchAddr
+                                call        #TxSendBytes
+
+                                { reset F16 }
+                                mov         _txF16L, #0
+                                mov         _txF16U, #0
+
+TxSendAndResetF16_ret           ret
+
+
 
 
 { SendFinalHeader, SendIntermediateHeader (Partial Sending Routines)
-  The partial sending routines exist to allow sending payload bytes from multiple random
-    locations of hub RAM without buffering them first. If sending from a single contiguous block
-    of hub RAM then it is easier to use the Complete Sending Routines.
+    The partial sending routines exist to allow sending payload bytes from multiple random
+  locations of hub RAM without buffering them first. If sending from a single contiguous block
+  of hub RAM then it is easier to use the complete sending routines.
   Usage:    mov     payloadSize, <number of bytes total in payload>
             call    #SendFinalHeader
       <or>  call    #SendIntermediateHeader
@@ -1089,42 +1384,41 @@ txSendBytes_ret                 ret
       <finally>
             call    #FinishSending
 }
-SendFinalHeader
-                                movs        txApplyTemplate, #$90
-                                jmp         #txPerformChecks
+SendFinalHeader                 movs        _SendApplyTemplate, #$90                   'ReportCrowError assumes the RH0 template is at SendFinalHeader
+                                jmp         #_SendChecks
 SendIntermediateHeader
-                                movs        txApplyTemplate, #$80
+                                movs        _SendApplyTemplate, #$80
 
-                                { checks: ensure not muted, and ensure payload size is within buffer size }
-txPerformChecks                 test        outb, #cMuteFlag            wc      'outb is CH3
-                        if_c    jmp         SendHeader_ret
-                                max         payloadSize, kCrowPayloadLimit      'do not allow payloadSize to exceed spec limit
+                                { check that the device is allowed to send, and make sure payload length is in spec }
+_SendChecks                     test        runFlags, #cOpenTransaction     wc      'TxSendBytes also performs this check, but we need to check it here
+                        if_nc   jmp         SendHeader_ret                          '  to avoid retaining the line if not allowed.
+                                max         payloadSize, kCrowPayloadLimit          'do not allow payloadSize to exceed spec limit
                                 
                                 { compose header bytes RH0-RH2 }
-                                mov         cnt, payloadSize                    'sh-cnt used for scratch
-                                shr         cnt, #8                             '(assumes payloadSize does not exceed spec limit)
-txApplyTemplate                 or          cnt, #0-0
+                                mov         cnt, payloadSize                        'sh-cnt used for scratch
+                                shr         cnt, #8                                 '(assumes payloadSize does not exceed spec limit)
+_SendApplyTemplate              or          cnt, #0-0
                                 mov         _txAddr, txScratchAddr                      
-                                wrbyte      cnt, _txAddr                        'RH0
+                                wrbyte      cnt, _txAddr                            'RH0
                                 add         _txAddr, #1
-                                wrbyte      payloadSize, _txAddr                'RH1
+                                wrbyte      payloadSize, _txAddr                    'RH1
                                 add         _txAddr, #1
-                                wrbyte      par, _txAddr                        'RH2; sh-par is token
+                                wrbyte      par, _txAddr                            'RH2; sh-par is token
 
                                 { reset F16 }
                                 mov         _txF16L, #0
                                 mov         _txF16U, #0
 
                                 { retain line }
-txRetainLine                    or          dira, txMask
+                                or          dira, txMask
 
                                 { send RH0-RH2 }
                                 mov         _txAddr, txScratchAddr
                                 mov         _txCount, #3
-                                call        #txSendBytes
+                                call        #TxSendBytes
 
                                 { send RH3-RH4 (the header F16) }
-                                call        #txSendAndResetF16
+                                call        #TxSendAndResetF16
 
                                 { prep for first payload chunk; the flag to indicate whether the last checksums need to be sent
                                    when FinishSending is called uses bit 9 of outb; outb is set to CH3, and will have bit 9 = 0 by default,
@@ -1136,24 +1430,20 @@ SendIntermediateHeader_ret      ret
     
 
 { SendPayloadBytes (Partial Sending Routine)
-  This routine sends payload bytes for an response packet that has been started with a
-    call to SendFinalHeader or SendIntermediateHeader.
-  Note that the total number of bytes to send must still be known before sending the header.
-    The total sum of bytes sent using one or more SendPayloadBytes calls must exactly match the
-    payloadSize passed to the header sending routine -- if it does not, then the Crow host (i.e. PC)
-    will experience some sort of error (e.g. timeout, unexpected number of bytes, bad checksum).
-  Usage:
+    This routine sends payload bytes for an response packet that has been started with a
+  call to SendFinalHeader or SendIntermediateHeader.
+    Note that the total number of bytes to send must still be known before sending the header.
+  The total sum of bytes sent using one or more SendPayloadBytes calls must exactly match the
+  payload size passed to the header sending routine -- if it does not, then the Crow host (i.e. PC)
+  will experience some sort of error (e.g. timeout, unexpected number of bytes, bad checksum).
+    Usage:
             mov     payloadSize, <number of bytes to send with this call, may be zero>
             mov     payloadAddr, <base address of bytes to send>
             call    #SendPayloadBytes
-  After this call payloadSize will be zero and payloadAddr will point to the address after the last byte sent.
+    After this call payloadSize will be zero and payloadAddr will point to the address after the last byte sent.
 }
 SendPayloadBytes
 
-
-
-                                test        outb, #cMuteFlag           wc      'skip if responses muted; outb is CH3
-                        if_c    jmp         SendPayloadBytes_ret
 :loop
                                 mov         _txCount, payloadSize           wz
                         if_z    jmp         SendPayloadBytes_ret                    'exit: nothing to send
@@ -1185,15 +1475,14 @@ SendPayloadBytes_ret            ret
 
 
 { FinishSending (Partial Sending Routine)
-  This routine finishes the response packet.
-  This routine MUST be called after a call to SendFinalHeader or SendIntermediateHeader,
-    even if there are no payload bytes.
+    This routine finishes the response packet.
+    This routine MUST be called after a call to SendFinalHeader or SendIntermediateHeader,
+  even if there are no payload bytes.
 }
 FinishSending
-                                test        outb, #cMuteFlag          wc      'skip if responses muted
-                        if_c    jmp         FinishSending_ret
+                                { Two things required: send last payload F16 if necessary, and release the line. }
                                 test        outb, #cSendChecksums          wc      'send final payload checksum if necessary; flag in bit 9 of outb
-                        if_c    call        #txSendAndResetF16
+                        if_c    call        #TxSendAndResetF16
 txReleaseLine                   andn        dira, txMask                            'this instruction may be deleted in some circumstances (along
 FinishSending_ret               ret                                                 ' with txRetainLine) -- see "PropCrow User Guide.txt"
 
@@ -1211,45 +1500,23 @@ FinishSending_ret               ret                                             
 }
 SendFinalResponse               movs        Send_ret, #ReceiveCommand
 
-SendFinalAndReturn              mov         _x, payloadSize
-                                mov         _y, payloadAddr
+SendFinalAndReturn              mov         _txS0, payloadSize
+                                mov         _txS1, payloadAddr
                                 call        #SendFinalHeader
                                 jmp         #_SendPayload
 
-SendIntermediate                mov         _x, payloadSize
-                                mov         _y, payloadAddr
+SendIntermediate                mov         _txS0, payloadSize
+                                mov         _txS1, payloadAddr
                                 call        #SendIntermediateHeader
 
-_SendPayload                    mov         payloadSize, _x 
-                                mov         payloadAddr, _y 
+_SendPayload                    mov         payloadSize, _txS0
+                                mov         payloadAddr, _txS1 
                                 call        #SendPayloadBytes 
 
                                 call        #FinishSending
 Send_ret
 SendFinalAndReturn_ret
 SendIntermediate_ret            ret
-
-
-{ txSendAndResetF16
-  Helper routine to send the current F16 checksum (upper first, then lower). It 
-    also resets the checksum after sending. }
-txSendAndResetF16
-                                { save F16 to hub }
-                                mov         _txAddr, txScratchAddr
-                                wrbyte      _txF16U, _txAddr
-                                add         _txAddr, #1
-                                mov         _txCount, #2                        'sending prep
-                                wrbyte      _txF16L, _txAddr
-                            
-                                { send F16 }
-                                mov         _txAddr, txScratchAddr
-                                call        #txSendBytes
-
-                                { reset F16 }
-                                mov         _txF16L, #0
-                                mov         _txF16U, #0
-
-txSendAndResetF16_ret           ret
 
 
 
@@ -1290,9 +1557,9 @@ txSendAndResetF16_ret           ret
 excPayloadFlag          long    |< 15       'flag in _rxMixed, indicates command payload exceeds buffer capacity
 rxMixedTimoutReset                          'used to reset _rxMixed when an interbyte timeout has occurred
 writeByteFlag           long    |< 14       'flag in _rxMixed, used by parsing code to identify payload bytes to write to hub
-ibTimeoutFlag           long    |< 13       'flag in _rxMixed, used to signify that an interbyte timeout has occurred
+'ibTimeoutFlag           long    |< 13       'flag in _rxMixed, used to signify that an interbyte timeout has occurred
 rxMixedInitReset        long    $1fff       'used to reset _rxMixed for the first time through the receive loop
-kOneInUpperWord         long    $1_0000     'used to increment lowBitCount in _rxMixed
+kOneInUpperWord         long    $0001_0000  'used to increment lowBitCount in _rxMixed
 
 
 { ExecutePage
@@ -1324,60 +1591,37 @@ kOneInUpperWord         long    $1_0000     'used to increment lowBitCount in _r
       - Any errors in the loading process will cause an error handler to be called, aborting the expected thread of execution.
 }
 ExecutePage
-                                cmp         _page, #cNumPages           wc      'see if the page index is within bounds
 
-:checkCurr              if_c    cmp         _page, #cInvalidPage        wz      'curr page index stored in s-field (init'ed to cInvalidPage)
-                  if_c_and_z    jmp         #cPage                              'if page already loaded and is valid / in-bounds, then go
-
-                        if_nc   mov         _error, #cPageOOB                   'page index must be within table bounds
-                        if_nc   jmp         #CrowErrorHandler
+:currPage                       cmp         _page, #cInvalidPage            wz      'curr page index stored in s-field (initially set to cInvalidPage)
+                        if_z    jmp         #cPage                                  'if page already loaded then go
 
                                 movd        :load, #cPage
 
-                                mov         _pageEntryAddr, _page               '@(PageTable[index]) = @pageTableAddr + 4*index
+                                mov         _pageEntryAddr, _page                   '@(PageTable[index]) = @PageTable + 4*index
                                 shl         _pageEntryAddr, #2
                                 add         _pageEntryAddr, pageTableAddr 
-                                rdword      _pageAddr, _pageEntryAddr           '_pageAddr = base address of page in hub
+                                rdword      _pageAddr, _pageEntryAddr               '_pageAddr = base address of page in hub
                                 add         _pageEntryAddr, #3
-                                rdbyte      _pageSize, _pageEntryAddr   wz      '_pageSize in longs
-
-                        if_z    mov         _error, #cEmptyPage                 'page size can not be zero
-                        if_z    jmp         #CrowErrorHandler
-
-                                cmp         _pageSize, #cPageMaxSize    wc, wz  'page size must fit within space
-                if_nc_and_nz    mov         _error, #cExcPageSize
-                if_nc_and_nz    jmp         #CrowErrorHandler
-
-                                movs        :verify, #cPage
-                                add         :verify, _pageSize
-                                sub         :verify, #1
+                                rdbyte      _pageSize, _pageEntryAddr               '_pageSize in longs
  
 :load                           rdlong      0-0, _pageAddr
                                 add         :load, kOneInDField
                                 add         _pageAddr, #4
                                 djnz        _pageSize, #:load
 
-                                movs        :checkCurr, _page                   'the page has been changed
+                                movs        :currPage, _page                        'the page has been changed
 
-:verify                         cmp         PageSignature, 0-0          wz      'verify signature (last register is "jmp #16")
+                                jmp         #cPage
 
-                        if_z    jmp         #cPage                              'all good, so go
-
-                                { bad signature }
-
-                                movs        :checkCurr, #cInvalidPage           'must mark page as invalid
-
-                                mov         _error, #cBadPageSig
-
-                            { fall through to crow error handler }
 
 { CrowErrorHandler
     This routine simply tests whether crow errors should be reported, and then executes the relevant
-  code page if so. It expects that _error is set.
+  code page if so. _error should already be set.
 }
 CrowErrorHandler
-                                test        otherOptions, #cReportCrowErrors    wc
-                        if_nc   jmp         #RecoveryMode
+                                test        otherOptions, #cReportCrowErrors    wc  'c=0 report crow errors disabled
+                                test        runFlags, #cOpenTransaction         wz  'z=1 no open transaction
+                   if_nc_or_z   jmp         #RecoveryMode 
 
                                 mov         _page, #cReportCrowError
                                 jmp         #ExecutePage
@@ -1389,11 +1633,11 @@ txMask              long    1
 
 pin27 long |< 27
 
-pause long 8_000_000
+'pause long 8_000_000
+total long 0
 
 runFlags    long 0
 
-PageSignature                   jmp         #16                                 'for reference, never executed
 
 
 { This is the end of permanent code. Initialization code, paged code, and res'd variables follow. }
@@ -1411,6 +1655,8 @@ fit cPage 'On error: permanent code exceeds space allotted. Reduce code or incre
 FinishInit
                                 or          dira, pin27
                                 or          outa, pin27
+
+                    wrlong      par, #12
 
                                 add         _addr, #1                           'txPin
                                 rdbyte      _x, _addr      
@@ -1488,6 +1734,7 @@ _rxPrevByte
 _rcvyPrevPhsb
 _txAddr         res
 
+_utilCount
 _calcClk
 _pageEntryAddr
 _rxCountdown
@@ -1498,13 +1745,16 @@ _pageAddr
 _rxMixed  
 _txNextByte     res
 
+_utilFlags
 _calcIBTimeout
 _pageSize
 _txByte         res
 
+_utilY
 _calcBreak
 _txF16L         res
 
+_utilX
 _calcTwoBit
 _pageTmp
 _txF16U
@@ -1512,14 +1762,18 @@ _rxRemaining        res
 
 
 { Global Variables }
+{ todo: fix}
+_txS0
 rxLowBits res
+
+_txS1
 rxLowClocks res
 
 
 { Serial Timings }
 'rxBitPeriodA    res
 'rxBitPeriodB    res
-rxBitPeriod5    res
+'rxBitPeriod5    res
 
 'txBitPeriodA    res
 'txBitPeriodB    res
@@ -1551,8 +1805,14 @@ txScratchAddr           res
 serSettingsChangedAddr  res
 pageTableAddr           res
 
-fit 490 'On error: too many res variables. Reduce variables, cPage, or cPageMaxSize.
+fit 488 'On error: too many res variables. Reduce variables, cPage, or cPageMaxSize.
+org 488
 
+txBitPeriodA    res 'must be at even address
+txBitPeriodB    res 'must be at address immediately after txBitPeriodA
+
+
+fit 490
 { Dedicated Temporary Variables
     Some routines (Divide, Multiply, ReportCrowError) use these registers for arguments and results.
     Important: the receiving code uses these registers, so their values will be undefined
@@ -1562,8 +1822,8 @@ fit 490 'On error: too many res variables. Reduce variables, cPage, or cPageMaxS
 org 490
 
 _tmp0
-_x
 _error
+_x
 _rxOffset       res
 
 _tmp1
