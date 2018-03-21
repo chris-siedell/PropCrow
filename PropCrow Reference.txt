@@ -1,0 +1,407 @@
+===
+PropCrow Reference.txt
+March 2018
+draft
+===
+
+todo: reset settings
+
+
+PropCrow is a feature-rich device implementation of the Crow protocol (v2) for the Parallax Propeller microcontroller (P8X32A).
+
+There is another implementation for the Propeller called PropCR. See the PropCR Comparison section for details.
+
+
+Table of Contents
+=================
+
+Crow Protocol Summary
+PropCrow Summary
+Spin API
+    - Initial Setup and Launch
+    - Driver Settings
+    - General User Code Methods
+    - Command Information
+    - Buffer Constants
+    - Parsing the Command
+    - Composing Responses
+    - Sending Responses
+Admin Protocol
+Driver Interface
+Design Notes
+    - Device Lock
+    - Baud Detection Mode
+    - Clock Sources
+    - Reducing Memory
+PropCR Comparison
+
+
+Crow Protocol Summary
+=====================
+
+command response
+device, host
+addresses
+admin commands, user commands
+
+
+PropCrow Summary
+================
+
+There are three parts to PropCrow: the driver, user code objects, and the admin protocol.
+
+The driver is a PASM program that runs in one cog. The driver takes care of serial communication and packetization. It processes admin commands from the host. User commands are forwarded to user code objects.
+
+User code objects can change driver settings, open and close ports, process user commands, and send responses. They do these things by interfacing with the driver through hub memory. The Spin API below provides high-level access to this driver interface. The driver can support multiple user code objects in multiple cogs, but only one object can be processing a command at a time -- see the Device Lock sub-section for details.
+
+Any standard Crow host implementation can communicate with a Propeller running PropCrow. Host software can use the PropCrow Admin Protocol to obtain diagnostics and change settings of the PropCrow driver remotely. This protocol is described in the Admin Protocol section.
+
+
+
+Spin API
+========
+
+Initial Setup and Launch
+------------------------
+
+Some setup must be done before launch. Once the driver is launched it can not be relaunched -- as originally written, the driver repurposes some of its code space as a buffer.
+
+.setDeviceName(nameAddr)
+This method gives the device a descriptive name for diagnostic and debugging purposes. nameAddr should point to a static, NUL-terminated string with up to 32 characters (not including the NUL). The default is "PropCrow v1". Returns 0 on success, -1 if the device name was already set by this or another cog (before launch), or -2 if the driver has been launched.
+
+.setLockID(lockID)
+PropCrow requires a hardware lock to guarantee data integrity. By default, PropCrow will use the system's locknew command to check out a new lock. Use this method to override that behavior and explicitly set the lock to use. Returns 0 on success, -1 if the lockID has already been manually set by this or another cog (before launch), or -2 if the driver has been launched.
+
+.new
+Launches the driver into any available cog. Returns the new cogID on success, -1 if no cogs are available, or -2 if the driver is already launched.
+
+.init(cogID)
+Launches the driver into the specified cog. Returns 0 on success, or -2 if the driver is already launched.
+
+
+Driver Settings
+---------------
+
+These methods may be called before or after launch. If settings are changed after launch they might not be applied immediately -- the driver checks for changes only when errors occur, or just before waiting for a command (i.e. after a transaction has ended). There is no guaranteed safe way to have changes applied immediately if the driver is stuck waiting for a command. (Briefly making the rxPin a low output will induce a framing error, but this may also corrupt an ongoing communication.)
+
+.setBaudrate(bitsPerSecond)
+Accepts any value from 300 to 3_000_000 bps. Defaults to 115200 bps.
+
+.setUseTwoStopBits(bool)
+Use this option if the host needs two stop bits. PropCrow can always receive using one. Defaults to false.
+
+.setBreakThreshold(milliseconds)
+This setting is the minimum amount of time the rxPin must be low before a break condition is detected. Set to 0 to disable break detection. PropCrow treats a break condition as a remote command to reset its serial settings, but allowRemoteReset must also be true in this case. Defaults to 100 ms.
+
+.setInterbyteTimeout(milliseconds)
+PropCrow assumes all bytes of a command will arrive in a timely manner. If the interbyte timeout is exceeded the driver will discard any command packet that it was receiving. Setting to 0 will result in 4 bit periods being used as the timeout. Defaults to 100 ms.
+
+.setResponseDelay(microseconds)
+The response delay is the minimum amount of time the line must be idle before a response is sent. This applies to the time between a command and response, as well as between responses when intermediate responses are used. Long values accepted. Defaults to 0 µs.
+
+.setClockOptions(xtalOptions, xinOptions, rcfastOptions, rcslowOptions)
+PropCrow recognizes four different clock sources: xtal (any), xin, rcfast, and rcslow. Each source has three boolean settings associated with it: useSource, useBaudDetect, and useContRecal. These settings are stored in the options bitfield for each clock source. The bitmasks are:
+    useSource       = %001
+    useBaudDetect   = %010
+    useContRecal    = %100 
+useSource: if false, the PropCrow driver will be idle while the clock source is selected.
+useBaudDetect: if true, the driver will enter a baud detection mode when necessary. 
+useContRecal: (Continuous Recalibration) if true, the driver will continuously adjust its timings to match what it is receiving from the host.
+Defaults:
+            useSource   useBaudDetect   useContRecal   |  decimal value
+    xtal    Y           N               N              |  1
+    xin     Y           N               N              |  1
+    rcfast  Y           Y               Y              |  7
+    rcslow  Y           Y               Y              |  7
+Even if useSource is true the clock frequency must be sufficient to support the given baudrate.
+
+.setUserCodeTimeout(milliseconds)
+The amount of time the driver should wait before declaring the user code unresponsive. When this happens the driver will discard the command it received and return an error response to the host (ImplementationException).
+
+.setPins(rxPin, txPin)
+Sets the pin numbers used by the driver. Valid pin numbers are 0 to 31. The pins may be identical -- the driver makes txPin an output only during sending. Defaults to 31 for rxPin and 30 for txPin.
+
+.setAddress(crowAddress)
+Sets the address for the device. Valid addresses are 1 to 31. Defaults to 1.
+
+.maxNumPorts
+This is a compile-time constant specifying the maximum number of user ports that may be open simultaneously.
+
+.ignoreFeedback
+.setIgnoreFeedback(bool)
+This setting determines whether the driver will temporarily ignore rx line interruptions while it is sending. (The ignored interval actually extends past sending by responseDelay.) This should be true if the tx and rx lines use separate pins but are still tied together somehow (e.g. a single channel radio). It should be false in any other case, since it would mean ignoring potentially meaningful interruptions. If the tx and rx pins are the same the driver will automatically ignore feedback regardless of this setting. Defaults to false.
+
+.interruptThreshold
+.setInterruptThreshold(level)
+This setting determines how the driver should react if unexpected signals are detected on the rx pin while the device owns the communications channel. (Interruptions are automatically ignored during sending if the rx and tx pin are the same.) Unexpected signals may come from several sources:
+    - noise,
+    - a non-standard transmitter on the channel,
+    - feedback during sending, if ignoreFeedback is false, 
+    - another Crow device with the same address on the channel, or
+    - the host, if it has decided that the device's response has taken too long.
+The driver detects interruptions by monitoring the total amount of time the rx line has been low during the transaction. If everything is working correctly the total time should be zero -- no other device or host should be transmitting. At some interruption threshold the driver will terminate the transaction prematurely, before the final response is sent. That threshold is defined by one of five discrete levels:
+    0 - lowest  - 1 clock (any noise),
+    1 - low     - 0.75 bit period (any byte),
+    2 - medium  - 10 bit periods (more than any one byte, but any command or response packet),
+    3 - high    - 1/16th the break threshold, and
+    4 - off     - never, all interruptions are ignored.
+The default is 2.
+
+
+General User Code Methods
+-------------------------
+
+These are the methods a user code object uses to register ports and obtain commands.
+
+.openPort(num)
+Opens the port with the given number. Ports are owned by the object that opens them -- only that object can receive commands on that port. Port numbers are two byte values (0 to 65535). Returns the port number on success. Returns -1 if the port is already open. Returns -2 if the d
+
+.openPortFrom(num)
+Opens the first available port starting at the given number. Returns the port number on success, or -1 on failure.
+
+.closePort(num)
+Closes a port. The port must have been opened by the same object that is attempting to close it.
+
+.checkForCommand
+Checks to see if a command has arrived on any of the object's ports. Returns true if a command has arrived, false otherwise. This method will implicitly release the driver lock, if owned. If the object received a command it will reaquire the driver lock when this method returns.
+
+.waitForCommand
+Blocks until a command arrives on any of the object's opened ports. This method will implicitly release the driver lock, if owned. The object will reaquire the driver lock when this method returns.
+
+.releaseDriverLock
+Explicitly releases the driver lock, if the object owns it. It is safe to call this method even if the object doesn't own the lock.
+
+.hasDriverLock
+Returns whether the object has exclusive use of the driver. While locked:
+    - the object should be the only one using the command and response buffers,
+    - the object may send responses, as long as there's an open transaction, and
+    - the driver will not accept more commands (the host may receive DeviceUnavailable error responses). 
+The object owns the lock when it receives a command, and it retains the lock until it either explicitly or implicitly releases it with a method call.
+
+.allowedToSend
+The object is allowed to send if the object has the driver lock, and a transaction is open. (See the Transaction section above for more details.) If the sending methods are called when allowedToSend is false they will abort.
+
+.useLEByteOrder
+.setUseLEByteOrder(bool)
+Specifies the byte order of multibyte values within payloads (both command and response). This setting is used by the packing and unpacking methods. "LE" means little-endian, where the least significant byte is first (the native byte order on the Propeller). The byte order of payloads is something that needs to be agreed upon in advance by both the host and device. Defaults to true.
+
+.setObjectName(nameAddr)
+This method gives the object a descriptive name for diagnostic and debugging purposes. nameAddr should point to a static, NUL-terminated string with up to 32 characters (not including the NUL). The default is "Spin".
+
+
+Command Information
+-------------------
+
+These methods return details about the command received. These methods will abort if the calling object does not have the driver lock.
+
+.port
+Indicates the port that the command arrived on.
+
+.responseExpected
+Indicates whether the host expects a response to the command. If true, the device must send a response -- otherwise, the host will keep waiting until a timeout error occurs. If false, the device must not send a response (the sending methods will not allow this).
+
+.isBroadcast
+Indicates if the command was a broadcast command. Responses are never expected for broadcast commands.
+
+
+Buffer Constants
+----------------
+
+The driver has two buffers located in hub memory: one for storing the received command payload, and one for composing a response payload. The command buffer is required by the driver, but using the response buffer is optional.
+
+In the standard implementation these buffers are separate, but users can modify the code so that both buffers are at the same location. This would reduce memory usage, but it would also restrict how the buffers could be used (it would be challenging to parse a command and compose a response simultaneously).
+
+.cmdBuffAddr
+The base address of the command buffer (index 0). It is always long-aligned.
+
+.cmdMaxSize
+The space reserved at compile-time for the command buffer. This will not be greater than 2047 bytes (the protocol limit). (PropCrow will automatically discard commands that exceed cmdMaxSize -- the host will receive a PayloadExceedsCapacity error response.)
+
+.rspBuffAddr
+The base address of the response buffer (index 0). It is always long-aligned.
+
+.rspMaxSize
+The space reserved at compile-time for the response buffer.  This will not be greater than 2047 bytes (the protocol limit).
+ 
+
+Parsing the Command
+-------------------
+
+These methods can be used to parse the command's payload. The calling object must have the driver lock (see hasDriverLock). For the sake of speed and code size these methods do not verify if the caller has the lock. If called without the lock these methods will return or copy undefined data.
+
+Also for the sake of efficiency these methods will not check if they are reading past the command buffer.
+
+.cmdIndex
+.setCmdIndex(index)
+The current byte position in the command buffer. Resets to 0 after a command is received.
+
+.cmdIndexAddr
+The hub address corresponding to cmdIndex.
+
+.cmdSize
+The size of the command's payload, in bytes. This may be zero (empty payloads are allowed) up to and including cmdMaxSize (which the protocol limits to 2047).
+
+.unpackByte
+Returns the byte at cmdIndexAddr and increments cmdIndex by 1.
+
+.unpackWord
+Returns the two-byte value at cmdIndexAddr and increments cmdIndex by 2. The byte order is determined by useLEByteOrder. (The alignment of cmdIndexAddr doesn't matter.)
+
+.unpackTriple
+Returns the three-byte value at cmdIndexAddr and increments cmdIndex by 3. The byte order is determined by useLEByteOrder. (The alignment of cmdIndexAddr doesn't matter.)
+
+.unpackLong
+Returns the four-byte value at cmdIndexAddr and increments cmdIndex by 4. The byte order is determined by useLEByteOrder. (The alignment of cmdIndexAddr doesn't matter.)
+
+.unpackString(destAddr, maxSize, usesFixedWidth) *may abort*
+Copies the NUL-terminated string at cmdIndexAddr to destAddr, up to a given maximum size. maxSize does not include the terminating NUL, but the NUL is always written, so there must be maxSize+1 free bytes at destAddr. Let strSize be the size of the copied string (not including the terminating NUL). The value of cmdIndex afterwards depends on usesFixedWidth:
+    - if true, cmdIndex is incremented by maxSize+1, and
+    - if false, cmdIndex is incremented by strSize+1.
+If copying was stopped due to maxSize being reached (no NUL found) then the method will abort with strSize as the value. Otherwise, it will return strSize normally.
+
+.unpackBytes(destAddr, count, destStride)
+Copies count byte values starting at cmdIndexAddr to destAddr, using the provided destStride (use 1 for dense packing). cmdIndex is incremented by count.
+
+.unpackWords(destAddr, count, destStride)
+Copies count two-byte values starting at cmdIndexAddr to destAddr, using the provided destStride (use 2 for dense packing). cmdIndex is incremented by 2*count. The byte order is determined by useLEByteOrder. destAddr must be word-aligned, and destStride must be a multiple of two. (The alignment of cmdIndexAddr doesn't matter.)
+
+.unpackTriples(destAddr, count, destStride)
+Copies count three-byte values starting at cmdIndexAddr to destAddr, using the provided destStride (use 3 for dense packing, or 4 if stored in longs). cmdIndex is incremented by 3*count. The byte order is determined by useLEByteOrder. There are no restrictions on destAddr alignment or destStride value. (The alignment of cmdIndexAddr doesn't matter.)
+
+.unpackLongs(destAddr, count, destStride)
+Copies count four-byte values starting at cmdIndexAddr to destAddr, using the provided destStride (use 4 for dense packing). cmdIndex is incremented by 4*count. The byte order is determined by useLEByteOrder. destAddr must be long-aligned, and destStride must be a multiple of four. (The alignment of cmdIndexAddr doesn't matter.)
+
+
+Composing Responses
+-------------------
+
+These methods can be used to compose a response payload in the driver's response buffer. Using this buffer is not required -- response payloads can be sent from anywhere in hub ram. The calling object must have the driver lock to use these methods (see hasDriverLock).
+
+All of these methods will abort if:
+    - the object does not have the driver lock, or
+    - the call would cause a write past the end of the buffer (or might, in the case of packString).
+
+.rspIndex
+.setRspIndex(index)
+The current byte position in the response buffer. Setting the index past the current size will cause the size to increase accordingly (effectively, an implicit call to setRspSize). Resets to 0 after a command is received. Unchanged after an intermediate response is sent.
+
+.rspIndexAddr
+The address corresponding to rspIndex.
+ 
+.rspSize
+.setRspSize(size)
+The current size of the response, in bytes. The size automatically increases if necessary when the packing methods are called. Manually increasing the size will cause the newly included bytes to be set to zero. Manually decreasing the size will cause bytes to be lost. Resets to 0 after a command is received. It does not change after an intermediate response is sent.
+
+.clearRspBuffer
+This method resets the response's index and size to 0. It is implicitly called when a command is received.
+
+.packByte(x)
+Puts the byte value at rspAddr and increments rspIndex by 1, increasing rspSize if necessary.
+
+.packWord(x)
+Puts the two-byte value at rspAddr and increments rspIndex by 2, increasing rspSize if necessary. The byte order is determined by the useLEByteOrder setting.
+
+.packTriple(x)
+Puts the three-byte value at rspAddr and increments rspIndex by 3, increasing rspSize if necessary. The byte order is determined by the useLEByteOrder setting.
+
+.packLong(x)
+Puts the four-byte value at rspAddr and increments rspIndex by 4, increasing rspSize if necessary. The byte order is determined by the useLEByteOrder setting.
+
+.packString(srcAddr, maxSize)
+Copies a NUL-terminated string from a hub address to the response buffer, up to a given maximum size. maxSize does not include the terminating NUL, but the NUL is always written, so there must be maxSize+1 available bytes in the buffer (rspMaxSize - rspIndex >= maxSize + 1 must be true). rspIndex and rspSize are increased accordingly. Returns the size of the string (not including the NUL).
+
+.packBytes(srcAddr, count, srcStride)
+Copies count bytes from srcAddr to rspAddr, using the provided srcStride. rspIndex is incremented by count, and rspSize is increased if necessary.
+
+.packWords(srcAddr, count, srcStride)
+Copies count two-byte values from srcAddr to rspAddr, using the provided srcStride. rspIndex is incremented by 2*count, and rspSize is increased if necessary. The byte order is determined by useLEByteOrder. The alignment of rspAddr does not matter, but srcAddr must be word-aligned.
+
+.packTriples(srcAddr, count, srcStride)
+Copies count three-bytes values starting at srcAddr to rspAddr, using the provided srcStride. rspIndex is incremented by 3*count, and rspSize is increased if necessary. The byte order is determined by useLEByteOrder. Any alignment is allowed for srcAddr. The srcStride is the number of bytes from one source three-byte value to the next. For example, if the triples are originally stored in longs the srcStride would be 4. If the triples are densely packed (no skipped bytes) then srcStride would be 3. The packed triples are always densely packed.
+
+.packLongs(srcAddr, count, srcStride)
+Copies count four-byte values from srcAddr to rspAddr, using the provided srcStride. rspIndex is increased by 4*count, and rspSize is increased if necessary. The byte order is determined by useLEByteOrder.
+
+
+Sending Responses
+-----------------
+
+All of these methods will abort if the object does not have the driver lock, or if the transaction is closed. Having the driver lock is under the object's control -- the lock will not be released until the object calls a method that releases it. However, the transaction may close at any time without the object's knowledge. This will happen if the object is unresponsive (doesn't provide a complete response within a time limit), or if the driver detects an interruption on the rx line (due to unexpected data or a break condition). Therefore, calling code must use an abort trap.
+
+.sendIntermediate
+Sends an intermediate response from the driver's response buffer (rspSize bytes starting at rspBuffAddr). Any number of intermediate responses are allowed, but they must be followed by exactly one final response. The payload size (rspSize) may be zero.
+
+.sendIntermediateFrom(addr, size)
+Sends an intermediate response with a payload at the given address and size.
+
+.startIntermediate(payloadSize)
+Sends the packet header for an intermediate response. This method is useful if you want to send payload bytes from multiple locations in hub ram without buffering them first. This approach is complicated by the fact that you must know the exact payload size before sending the data. Once called the method may be followed by any number of sendPayloadBytes calls, however, the total sum of the count arguments must add to payloadSize. After all payload bytes have been sent there must be exactly one call to stopResponse.
+
+.sendFinal
+Sends a final response from the driver's response buffer (rspSize bytes starting at rspBuffAddr). After the final response is sent the transaction is closed and no more responses may be sent. The payload size (rspSize) may be zero.
+
+.sendFinalFrom(addr, size)
+Sends a final response with a payload at the given address and size.
+
+.startFinal(payloadSize)
+Sends the packet header for a final response. The rules for startIntermediate also apply to this method.
+
+.sendPayloadBytes(addr, count)
+Sends count response payload bytes starting at addr. The response packet must have already been started with startIntermediate or startFinal.
+
+.stopResponse
+This method closes a response packet started with startIntermediate or startFinal. It must be called if either of those methods is called.
+
+
+
+Admin Protocol
+==============
+
+
+Driver Interface
+================
+
+This section describes using the driver's memory interface. Keep in mind that the authoritative specification is simply what's in the PropCrow.spin file.
+
+
+Design Notes
+============
+
+
+Device Lock
+-----------
+
+
+
+Baud Detection Mode
+-------------------
+
+While in this mode the driver will be unable to receive commands. It will not leave this mode until the baudrate has been reliably detected, the serial settings change, the clock source changes, or a break induced reset occurs.
+
+
+Clock Sources
+-------------
+
+PropCrow requires at least 33 clocks per bit period. Specifically, this means
+    115200 bps is supported by any xtal frequency (4 MHz and up)
+    230400 bps is supported by any rcfast frequency (minimum 8 MHz)
+    2 Mbps is supported at 80 MHz
+    3 Mbps is supported at 100 MHz
+    300 bps is supported at any rcslow frequency (minimum 13 kHz)
+    600 bps is supported at 32.768 kHz
+PropCrow can use the internal oscillator clocks and other drifting clock sources. Usable clocks must be relatively jitter free, and stable over the typical time between command packets. Using continuous recalibration and sending frequent packets will help keep the timings accurate as the clock source drifts. The Crow protocol's admin command keepAlive can be used for this purpose.
+
+Reducing Memory
+---------------
+
+
+
+
+PropCR Comparison
+=================
+
+
+
+
+
+
