@@ -857,19 +857,22 @@ ReceiveCommand
                                 movs        rxMovD, #rxFirstParsingGroup+3
                                 mov         _rxResetOffset, #0
                                 mov         _rxWait0, startBitWait
-                                mov         _rxMixed, rxMixedInitReset
 
                                 test        rxMask, ina                     wz      'z=1 => rx pin already low -- missed falling edge
 
                         if_nz   waitpne     rxMask, rxMask                          'wait for start bit edge
                         if_nz   add         _rxWait0, cnt
-                        if_nz   waitcnt     _rxWait0, bitPeriod0                    'wait to sample start bit (for initial byte only)
+                        if_nz   waitcnt     _rxWait0, bitPeriod0                    'wait to sample start bit
                         if_nz   test        rxMask, ina                     wc      'c=1 framing error; c=0 continue, with parser reset
-                        if_z    jmp         #RecoveryMode                           '...exit for missed falling edge (need edge for cont-recal)
+                        if_z    jmp         #RecoveryMode                           '...exit for missed falling edge (need edge for accurate cont-recal)
                         if_c    jmp         #FramingError
 
                                 { the receive loop -- c=0 reset parser}
 
+'loop top - occurs within interval between startbit and bit0
+rxLoopTop
+                        if_nc   mov         _rxMixed, rxMixedReset                  'Mixed - reset (byteCount, lowBitCount, flags)
+                       
 'bit0 - 34 clocks
 rxBit0                          waitcnt     _rxWait0, bitPeriod1
                                 testn       rxMask, ina                     wz
@@ -952,15 +955,14 @@ rxStartWait                     long    0-0                                     
 
                         if_z    add         _rxWait0, cnt                           'Wait 1
 
-'start bit - 34 clocks
+'start bit - 34 clocks (last instr at rxLoopTop)
 rxStartBit              if_z    waitcnt     _rxWait0, bitPeriod0
                         if_z    test        rxMask, ina                     wz      'z=0 framing error
 rxAddUpperNibble        if_z    add         _rxMixed, 0-0                           'Cont-Recal 8 - finish adding low bit count for upper nibble of previous byte
                         if_z    mov         inb, _rxWait0                           'Timeout 1 - using sh-inb as scratch
                         if_z    sub         inb, _rxWait1                           'Timeout 2 - see page 98 for timeout notes
                         if_z    cmp         inb, ibTimeout                 wc       'Timeout 3 - c=0 reset, c=1 no reset
-                if_z_and_nc     mov         _rxMixed, rxMixedTimoutReset            'Mixed - reset due to timeout (takes djnz into account); see "_rxMixed Notes"
-                        if_z    djnz        _rxMixed, #rxBit0                       'Mixed - add to byteCount (negative); also finishes reset of _rxMixed on timeout
+                        if_z    djnz        _rxMixed, #rxLoopTop                    'Mixed - add to byteCount (negative)
                     
                         { fall through for framing errors }
 
@@ -1531,34 +1533,26 @@ SendIntermediate_ret            ret
 
 { _rxMixed Notes
     The _rxMixed register contains several pieces of information used by the receiving code:
-        lowBitCount (upper word) - the count of low data bits, used by the auto-recalibration code
-        E (bit 15) - flag used to detect when the command payload exceeds the buffer size, to prevent overruns
+        lowBitCount (upper word) - the count of low data bits, used by the continuous recalibration code
+        E (bit 15) - flag used to signify when the command payload exceeds the buffer size, to prevent overruns
         W (bit 14) - flag used to identify which packet bytes to write to the hub (i.e. payload bytes)
-        I (bit 13) - flag used to record that an interbyte timeout has occurred
-        byteCount (bits 0-12) - the number of packet bytes received, as a negative number (used by auto-recal code)
+        (bit 13 not presently used; could be used as flag for recording when interbyte timeout occurs -- see notes)
+        byteCount (bits 0-12) - the number of packet bytes received, as a negative number (used by cont-recal code)
     So this is the layout
-        |---lowBitCount--|EWI|--byteCount--|
-    Value after initial reset:
+        |---lowBitCount--|EW0|--byteCount--|
+    Value after reset:
         |0000000000000000|000|1111111111111|
-    Value after interbyte timeout reset:
-        |0000000000000000|001|1111111111111|
     Considerations:
         - The sizes of lowBitCount and byteCount were chosen so that this mechanism will work with payload sizes
             up to 4095 bytes (the expected maximum allowed in any future Crow revisions).
-        - The placement of the I flag allows the W flag mask to be used as the reset value for _rxMixed, which works
-            because of the djnz at the bottom of the loop.
-        - The byte count mask ($1fff), which is necessary to extract byteCount, also serves as the reset value
-            for the initial pass through the receive loop.
         - The byte count is made by the djnz at the bottom of the loop -- a jump is required anyway, so the byte
             count comes for free. _rxMixed never reaches zero since the initial value exceeds any possible
-            packet size (the parser enforces this limit, even if the host keeps sending bytes).
+            packet size (the shifted parsing code enforces this limit, even if the host keeps sending bytes).
     See page 114.
 }   
 excPayloadFlag          long    |< 15       'flag in _rxMixed, indicates command payload exceeds buffer capacity
-rxMixedTimoutReset                          'used to reset _rxMixed when an interbyte timeout has occurred
-writeByteFlag           long    |< 14       'flag in _rxMixed, used by parsing code to identify payload bytes to write to hub
-'ibTimeoutFlag           long    |< 13       'flag in _rxMixed, used to signify that an interbyte timeout has occurred
-rxMixedInitReset        long    $1fff       'used to reset _rxMixed for the first time through the receive loop
+writeByteFlag           long    |< 14       'flag in _rxMixed, used by parsing code to specify which bytes to write to buffer
+rxMixedReset            long    $1fff       'used to reset _rxMixed
 kOneInUpperWord         long    $0001_0000  'used to increment lowBitCount in _rxMixed
 
 
