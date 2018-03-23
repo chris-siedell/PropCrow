@@ -17,88 +17,131 @@ _xinfreq = 5_000_000
   These cMax* settings determine the sizes of the reserved buffers.
   By specification, Crow command payloads may not exceed 2047 bytes (MaxRxPayloadSize).
 }
+'cCmdBufferMaxSize   = 300 'Commands with payloads over this limit will receive OverCapacity error responses.
+'cRspBufferMaxSize   = 200 'This is the limit only for the dedicated response buffer. 
+cMaxUserPorts       = 10    'The maximum number of open user ports. May be any two byte value (as memory allows).
+
 cMaxRxPayloadSize   = 300   'may be 2-2047 (lower limit due to mechanism to avoid buffer overruns)
 cMaxTxPayloadSize   = 100   'may be 0-2047
-cMaxUserPorts       = 10    'any two byte value (as memory allows)
 
-cMaxNumPages        = 10
+
+
+
+
 
 cRxBufferLongs   = (cMaxRxPayloadSize/4) + 1
 cTxBufferLongs   = (cMaxTxPayloadSize/4) + 1
 cUserPortsLongs  = ((cMaxUserPorts*6) / 4) + 1
 
-{ flags and masks }
-CommandTypeFlag     = %0001_0000    'for CH0
-cAddressMask         = %0001_1111    'for CH3
-cMuteFlag            = %0100_0000    'for CH3
+{ other }
+cPropCrowID         = $abcd 'must be two byte value
 
-{ masks used for the serialOptions bitfields }
+
+
+
+{ Flags and Masks }
+
+{ ...for flagsAndBadF16 - see flagsAndBadF16 Notes below }
+cCommandTypeFlag    = %0_0001_0000
+cSendF16Flag        = %1_0000_0000
+
+{ ...for cmdDetails }
+cAddressMask        = %0001_1111
+cMuteFlag           = %0100_0000
+
+{ ...for serialOptions }
 cUseSource          = %0000_0001
 cUseBaudDetect      = %0000_0010
 cUseContRecal       = %0000_0100
 cUseTwoStopBits     = %1000_0000
 
-{ otherOptions bitfield }
+{ ...for otherOptions }
 cEnableReset        = %0000_0001
 cAllowRemoteChanges = %0000_0010
-cReportCrowErrors   = %0000_0100
+cSendErrorResponses = %0000_0100
 
-{ other }
-cPropCrowID         = $abcd 'must be two byte value
+{ Paging Constants 
+    These control the register layout in the cog. If you're reading this you're probably
+  are getting FIT errors from the compiler.
+}
+cPage           = 400   'Starting address of paged code. Permanent code is below this address.
+cPageMaxSize    = 52    'Maximum size of pages.
+cPageLimit      = cPage + cPageMaxSize  'Res'd variables start at cPageLimit.
 
-
-{ paging constants }
-cPage           = 400
-cPageMaxSize    = 52
-cPageLimit      = cPage + cPageMaxSize
-
-
-{ Crow error codes; values from v2 specification }
+{ Crow Error Codes
+    The Crow v2 specification introduced error responses. Error responses contain a 
+  5-bit error code identifying the error. These are the error codes defined by the
+  standard.
+}
 cDeviceUnavailable      = 0
-cOverCapacity           = 1
+cPayloadTooBig          = 1
 cBadChecksum            = 2
 cPortNotOpen            = 3
 cImplementationFault    = 4
 cUserCodeFault          = 5
 
-cExcPayloadSize         = 0     'The command payload exceeds device's capacity.
-cAdminPortNotOpen            = 1     'The port is not open.
-cUserPortNotOpen = 2
-cImplementationError    = 3     'An implementation specific error has occurred.
-
-{ implementation error codes; must not conflict with Crow error codes (128+ is safe) }
-cBufferLocked   = 128
-
-{   The cSendChecksums flag indicates whether the F16 checksums for the last payload chunk still need to be sent. It is used
-  in FinishSending. Bit 9 is used because the flag is stored in outb, i.e. header byte CH3, which means bit 9 will be cleared
-  by default, saving an instruction.
+{ Custom Error Codes
+    These end up being reported as ImplementationFault or UserCodeFault errors. The 
+  numbers assigned must be 9-bit (used as immediate values) and they must be 32+ (so
+  as not to overlap with Crow error codes).
 }
-cSendChecksums  = %1_0000_0000
+cDriverLocked           = 128
+
+
+
+
 
 { page indices }
 cCalculateTimings   = 0
 cGetDeviceInfo      = 1
 cUserCommand        = 2
 cPropCrowAdmin      = 3
-cReportCrowError    = 4
+cPgSendErrorResponse    = 4
 cBlinky             = 5
 cOtherStandardAdmin = 6
 cCalc2              = 7
 cNumPages           = 8
 cInvalidPage        = 511   'signifies no valid page loaded
 
-{ runFlags options }
 
-cOpenTransaction    = %1
+{ Special Purpose Register Usage
+    Out of necessity PropCrow makes use of some special purpose registers for variables. 
+    Variables aliased to shadow SPRs have a "_SH" suffix as a warning to use them only in the
+  destination field.
+    The counter A and video generator registers are never used by PropCrow -- they have been left
+  available for custom code.
+}
 
-{ special purpose register aliases }
+{ SPR Global Variables }
+flagsAndBadF16  = $1F7      'dirb       see flagsAndBadF16 Notes
+port_SH         = $1F2      'sh-ina
+token_SH        = $1F0      'sh-par
+cmdDetails      = $1F5      'outb       cmdDetails is CH3
 
-cCH0_badF16_shina  = $1F2 'sha-ina
-cPort_dirb   = $1F7    'dirb
-cCH3_outb    = $1F5      'outb
-'cCommandFlags   = $1F5 'outb
-cToken_shpar = $1F0 'sha-par
-cRxF16U_shcnt = $1F1 'sha-cnt
+{ flagsAndBadF16 Notes
+    Like _rxMixed, this register contains several pieces of information:
+        commandType - bit 4 - 0 = admin command, 1 = user command. From CH0. Use #cCommandTypeFlag to test.
+        sendF16 - bit 9 - Flag used by sending code to signify if the last payload F16 bytes need to
+                          be sent. Use #cSendF16Flag flag to test. Cleared when a command arrives.
+        isOpen - bit 13 - Flag indicates if a transaction is open. It is cleared when a command arrives, so
+                          the code must set it later if required. Use isOpenFlag to test.
+        badF16Count - upper word - A count of the number of payload chunks that have failed checksums.
+                                   Resets to zero when a command arrives. 
+    flagsAndBadF16 is set to CH0 in the shifted parsing code (instruction A of RxH0), which then
+  modifies it to test the reserved bits. Because of this source, bits 0-3 and bits 5-7 should be
+  considered undefined. The upper bytes will be all zeroes since this is always true of rxByte.
+}
+
+{ SPR Local and Scratch Variables }
+
+_txTmp_SH       = $1F3      'sh-inb
+_rxTmp_SH       = $1F3      'sh-inb
+
+_txWait_SH      = $1F1      'sh-cnt
+_rxF16U_SH      = $1F1      'sh-cnt
+
+'sh-cnt
+
 
 
 obj
@@ -128,7 +171,7 @@ pub new | pause
     word[@PageTable][2] := @GetDeviceInfo
     word[@PageTable][4] := @UserCommand
     word[@PageTable][6] := @PropCrowAdmin
-    word[@PageTable][8] := @ReportCrowError
+    word[@PageTable][8] := @PgSendErrorResponse
     word[@PageTable][10] := @Blinky
     word[@PageTable][12] := @OtherStandardAdmin
     word[@PageTable][14] := @Calc2
@@ -196,10 +239,10 @@ word    0
 byte    0
 byte    PropCrowAdmin_end - PropCrowAdmin + 1
 
-'4: ReportCrowError
+'4: SendErrorResponse
 word    0
 byte    0
-byte    ReportCrowError_end - ReportCrowError + 1
+byte    PgSendErrorResponse_end - PgSendErrorResponse + 1
 
 '5: Blinky
 word    0
@@ -295,7 +338,7 @@ ControlBlock
                     word    100                 'resetBreakThreshold, in milliseconds
                     long    $0707_0101          'resetSerialOptions
                     byte    0                   'activeSerialSettingsChanged
-                    byte    cReportCrowErrors | cAllowRemoteChanges | cEnableReset                   'otherOptions
+                    byte    cSendErrorResponses | cAllowRemoteChanges | cEnableReset                   'otherOptions
 __numUserPorts      word    0                   'numUserPorts
                     word    cMaxUserPorts       'maxUserPorts
 __userPortsAddr     word    0-0                 'userPortsAddr
@@ -399,27 +442,27 @@ Blinky_end
 blinkyPause     long 4_000_000
 
 
-
+{ PgSendErrorResponse
+    This code send a Crow-level error response (not an upper-level protocol error response). Crow-level error
+  responses indicate some problem that prevents an otherwise valid command from being responded to normally.
+  Error responses are sent only for 'reportable' errors -- some errors have to be silently ignored (e.g. bad
+  reserved bits in the command header, or errors for any command with muted responses). See the Crow v2
+  specification for more details.
+    To report an error: set _x to the error code, then call ReportCrowError. That routine will determine whether
+  the error is reportable, in which case it will execute this page.
+}
 org cPage
-ReportCrowError
-                                { ReportCrowError assumes _error has been set to Crow (<3) or implementation error number (>=3). }
+PgSendErrorResponse
+                                { It is assumed that _x has been set to a Crow error code (< 32) or a custom error code (>= 32). }
 
                                 { An error response has bit 5 of the first header byte (RH0) set. Rather than creating a special option
                                     for sending error responses, we directly modify the header template, and then revert it (clear) when
                                     we're done. This saves a bit of permanent code. }
  
-                                'or          SendFinalHeader, #%0010_0000            'set bit 5 of RH0 (for Crow error)
+'todo: restore                                or          SendFinalHeader, #%0010_0000            'set bit 5 of RH0 (for Crow error)
 
-                                { Crow error codes:
-                                    0 - excessive command payload
-                                    1 - admin port not open
-                                    2 - user port not open
-                                    3 - implementation error 
 
-                                  This implementation sets _error > 3 to report implementation errors. That number will be returned
-                                    within the error message. The Crow level error code is always 3 for implementation errors. }
-
-                                cmp         _error, #3                      wc
+                                cmp         _x, #3                      wc
                         if_nc   jmp         #:implementation
 
                                 { Errors 0-2 always have three payload bytes, starting with the error code. }
@@ -429,22 +472,22 @@ ReportCrowError
 
                                 mov         payloadSize, #1                         'send error code
                                 mov         payloadAddr, txBufferAddr
-                                wrbyte      _error, txBufferAddr
+                                wrbyte      _x, txBufferAddr
                                 call        #SendPayloadBytes
 
                                 mov         payloadSize, #2                         'next parameter is two bytes
 
-                                cmp         _error, #0                      wz      'value of next parameter depends on error type
+                                cmp         _x, #0                      wz      'value of next parameter depends on error type
                         if_z    jmp         #:excPayloadSize
                                 
                                 { error is admin/user port closed, parameter is attempted port number }
 
                                 mov         payloadAddr, txBufferAddr               'copy port to buffer, in big-endian order
                                 add         payloadAddr, #1
-                                wrbyte      cPort_dirb, payloadAddr
+                                wrbyte      port_SH, payloadAddr
                                 sub         payloadAddr, #1
-                                shr         cPort_dirb, #8                          'safe to modify port -- not needed afterwards
-                                wrbyte      cPort_dirb, payloadAddr
+                                shr         port_SH, #8                             'safe to modify port -- not needed afterwards
+                                wrbyte      port_SH, payloadAddr
 
                                 call        #SendPayloadBytes                       'send port
                                 
@@ -468,8 +511,8 @@ ReportCrowError
                                   The implementation error number is not part of the Crow standard, it is just part of the message
                                     string sent to the host to help with debugging. }
                                 
-                            wrlong  _error, #8
-                                { Write the implementation error number as a string to the tx buffer. _error aliases _x, so
+                            wrlong  _x, #8
+                                { Write the implementation error number as a string to the tx buffer. _x aliases _x, so
                                     we don't need to set that up. } 
                                 mov         _addr, txBufferAddr
                                 'call        #Uint32ToStr
@@ -515,7 +558,7 @@ ReportCrowError
 
                                 mov         payloadAddr, txBufferAddr
                                 mov         payloadSize, _count 
-                                call        #SendPayloadBytes                       'send Uint32ToStr(_error)
+                                call        #SendPayloadBytes                       'send Uint32ToStr(_x)
 
                                 mov         _x, #$2e
                                 wrbyte      _x, payloadAddr                         'write "." after number string (where crow error code was)
@@ -524,9 +567,9 @@ ReportCrowError
 
 :finish                         call        #FinishSending                          'requires all error responses used partial sending routines
 
-                                'andn        SendFinalHeader, #%0010_0000            'revert RH0 template (clear bit 5 for normal responses)
+'todo: restore                                'andn        SendFinalHeader, #%0010_0000            'revert RH0 template (clear bit 5 for normal responses)
                                 
-ReportCrowError_end             jmp         #RecoveryMode
+PgSendErrorResponse_end         jmp         #RecoveryMode
 
 fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
 
@@ -538,8 +581,8 @@ UserCommand
                                 'jmp         #SendFinalResponse
 
 
-                                rdlong      _error, rxBufferAddr
-                                jmp         #CrowErrorHandler
+                                rdlong      _x, rxBufferAddr
+                                jmp         #ErrorHandler
 
 {
                                 'echo the port
@@ -771,8 +814,7 @@ fit 16
 org 16
 
 { Multiply
-    Algorithm from the Spin interpreter, with sign code removed. It is placed here for the benefit of
-  code pages (its position shouldn't change).
+    Algorithm from the Spin interpreter, with sign code removed.
     Before: _x = multiplier
             _y = multiplicand
     After: _x = lower half of product
@@ -789,8 +831,7 @@ Multiply
 Multiply_ret                    ret
 
 { Divide 
-    Algorithm from the Spin interpreter, with sign code removed. It is placed here for the benefit of
-  code pages (its position shouldn't change).
+    Algorithm from the Spin interpreter, with sign code removed.
     Before: _x = dividend
             _y = divisor
     After: _x = remainder
@@ -808,28 +849,6 @@ Divide
                                 djnz        inb, #:mdiv2
 Divide_ret                      ret
 
-
-{ Special/Shadow Register Usage
-
-    PropCrow sets up ctrb as a continuously running NEG counter on rx pin with frqb=1. This should not be changed.
-
-    PropCrow does not touch the counter A registers (frqa, ctra, phsa) or the video registers (vcfg, vscl).
-
-    par points to the control block.
-
-    PropCrow does use shadow and reserved registers. Specifically:
-
-    Locally to ReceiveCommand, shifted parsing code, and FinishReceiveCommand:
-      sh-ina = CH0, to save T flag
-      sh-inb = local scratch
-      sh-cnt = rxF16U
-
-    Globally:
-      sh-par = token    'must remain unchanged until final header has been sent
-      dirb   = port     'must remain unchanged until code has finished with port number
-      outb   = CH3      'must remain unchanged until all bytes have been sent, bit 9 used for cSendChecksums flag
-
-}
 
 
                                 
@@ -862,7 +881,7 @@ ReceiveCommand
 
 'loop top - occurs within interval between startbit and bit0
 rxLoopTop
-                        if_nc   mov         _rxMixed, rxMixedReset                  'Mixed - reset (byteCount, lowBitCount, writeVetoes)
+                        if_nc   mov         _rxMixed, rxMixedReset                  'Mixed - reset byteCount, lowBitCount, writeVetoes (nonPayloadFlag is set)
                        
 'bit0 - 34 clocks
 rxBit0                          waitcnt     _rxWait0, bitPeriod1
@@ -878,11 +897,11 @@ rxBit0                          waitcnt     _rxWait0, bitPeriod1
 rxBit1                          waitcnt     _rxWait1, bitPeriod0
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0000_0010
-                        if_nc   mov         cnt, #0                                 'F16 2 - sh-cnt is rxF16U
+                        if_nc   mov         _rxF16U_SH, #0                          'F16 2
                         if_c    add         _rxF16L, _rxPrevByte                    'F16 3 - this if_c is not optional
                         if_c    cmpsub      _rxF16L, #255                           'F16 4 - the if_c's are optional from this point on for F16
-                        if_c    add         cnt, _rxF16L                            'F16 5
-                        if_c    cmpsub      cnt, #255                               'F16 6
+                        if_c    add         _rxF16U_SH, _rxF16L                     'F16 5
+                        if_c    cmpsub      _rxF16U_SH, #255                        'F16 6
 
 'bit 2 - 34 clocks
 rxBit2                          waitcnt     _rxWait1, bitPeriod1
@@ -917,7 +936,7 @@ rxMovD                          mov         rxShiftedD, 0-0                     
 'bit 5 - 33 clocks
 rxBit5                          waitcnt     _rxWait1, bitPeriod0
                                 test        rxMask, ina                     wc
-rxHubop                         long    0-0                                         'Hubop - Write 3 (rxWriteByte -- uses z flag), or rxReadBufferLock)
+rxHubop                         long    0-0                                         'Hubop - Write 3 (rxWriteByte -- uses z flag), or rxReadDriverLock)
 
 'bit 6 - 34 clocks
 rxBit6                          waitcnt     _rxWait1, bitPeriod1
@@ -950,9 +969,9 @@ rxStartWait                     long    0-0                                     
 rxStartBit              if_z    waitcnt     _rxWait0, bitPeriod0
                         if_z    test        rxMask, ina                     wz      'z=0 framing error
 rxAddUpperNibble        if_z    add         _rxMixed, 0-0                           'Cont-Recal 8 - finish adding low bit count for upper nibble of previous byte
-                        if_z    mov         inb, _rxWait0                           'Timeout 1 - using sh-inb as scratch
-                        if_z    sub         inb, _rxWait1                           'Timeout 2 - see page 98 for timeout notes
-                        if_z    cmp         inb, ibTimeout                  wc      'Timeout 3 - c=0 reset, c=1 no reset
+                        if_z    mov         _rxTmp_SH, _rxWait0                     'Timeout 1
+                        if_z    sub         _rxTmp_SH, _rxWait1                     'Timeout 2 - see page 98 for timeout notes
+                        if_z    cmp         _rxTmp_SH, ibTimeout            wc      'Timeout 3 - c=0 reset, c=1 no reset
                         if_z    djnz        _rxMixed, #rxLoopTop                    'Mixed - add to byteCount (negative)
                     
                         { fall through for framing errors }
@@ -974,7 +993,6 @@ ParsingError
 }
 'todo (3/17): does the removal of the ctrb off code change any timings?
 RecoveryMode
-                                andn        runFlags, #cOpenTransaction             'close any open transaction
                                 mov         cnt, recoveryTime
                                 add         cnt, cnt
                                 mov         _rcvyPrevPhsb, phsb                     'first interval always recoveryTime+1 counts, so at least one loop for break 
@@ -1010,17 +1028,16 @@ BreakHandler
     These instructions are shifted into the receive loop at the rxHubop location. The shifts must be performed
   by the shifted parsing code -- they are not done automatically.
     It does not matter which instruction is loaded on parser reset. Consider each case:
-      rxWriteByte - On parser reset the nonPayloadFlag in writeVetoes (in _rxMixed) is set, so writes will not occur.
-      rxReadDriverLock - Reading the driver lock state is OK -- it is intended during header arrival.
-      rxGetBufferAddr 
-  is cleared, so if the rxWriteByte instruction is loaded it will not execute until parsing code explicitly sets
-  that flag. If the rxReadDriverLock instruction is loaded that is also OK -- reading the driver lock state is meant
-  to occur while the header is being received. Therefore the pre-loop initialization code does not need to set
-  rxHubop to any value (it is a nop the first time through the loop after cog launch).
+      RxWriteByte - On parser reset the nonPayloadFlag in writeVetoes (in _rxMixed) is set, so writes will not occur.
+      RxReadDriverLock - Reading the driver lock state is OK -- it is intended behavior during header arrival.
+    Also, rxHubop is a nop on cog launch, so the pre-loop initialization code does not ever need to set its value.
+    For consideration: there's the potential for supporting a pool of buffers using the RX Hubop mechanism.
+  This may be useful if the host is receiving DeviceUnavailable errors due to user code not releasing the driver
+  lock fast enough. In this case there would be three hubops: loading the next buffer set to use, checking
+  if it is locked/owned, and then setting the buffer write instruction.
 }
-'rxGetBuffer                 rdword      _rxAddr, rxBufferAddrMinusOneAddr       'Write 1 - get the buffer address to use (minus one, due to pre-increment) 
-rxWriteByte             if_z    wrbyte      _rxPrevByte, _rxAddr                    'Write 4 - write byte to command payload buffer (if writeVetoes are clear) 
-rxReadBufferLock                rdword      _rxLockingUser, driverLockAddr          'check if user code has buffer lock (will be zero if not locked)
+RxReadDriverLock                rdword      _rxLockingUser, driverLockAddr          'check if user code has driver lock (will be zero if unlocked)
+RxWriteByte             if_z    wrbyte      _rxPrevByte, _rxAddr                    'Write 4 - write byte to command payload buffer (if writeVetoes are clear) 
 
 
 
@@ -1084,9 +1101,9 @@ rxReadBufferLock                rdword      _rxLockingUser, driverLockAddr      
   The parsing groups are labelled by the byte being received when they execute.
 }
 rxFirstParsingGroup
-rxH0                            mov         cCH0_badF16_shina, rxByte               'A - save CH0 (to bit 6) in sh-ina for T flag and testing; also reset badF16 in top word
-                                xor         cCH0_badF16_shina, #%0100_0000          ' B - flip bit 6 for reserved bits testing
-                                test        cCH0_badF16_shina, #%0110_1000  wz      ' C - test reserved bits 3 (0), 5 (0), and 6 (originally 1); z=1 OK
+rxH0                            mov         flagsAndBadF16, rxByte                  'A - save T flag, reset other flags, and reset badF16Count; also prep for testing CH0
+                                xor         flagsAndBadF16, #%0100_0000             ' B - flip bit 6 for reserved bits testing
+                                test        flagsAndBadF16, #%0110_1000     wz      ' C - test reserved bits 3 (0), 5 (0), and 6 (originally 1); z=1 OK
                     if_nz_or_c  mov         rxStartWait, rxParsingErrorExit         ' D - ...exit for bad reserved bits (also require c = bit 7 = 0) 
 
 rxH1                            mov         payloadSize, _rxPrevByte                'A - extract payload size
@@ -1095,51 +1112,47 @@ rxH1                            mov         payloadSize, _rxPrevByte            
                                 or          payloadSize, rxByte                     ' D
 
 rxH2                            mov         _rxRemaining, payloadSize               'A - _rxRemaining keeps track of how many payload bytes are left to receive
-                                mov         _rxAddr, rxBufferAddrMinusOne           ' B - reset address for writing to hub; todo: change mechanism
-                                mov         cPort_dirb, #0                          ' C - set implicit port 0; dirb is port
-                                mov         cToken_shpar, rxByte                    ' D - sh-par is token
-
+                                mov         _rxAddr, cmdBufferResetAddr             ' B - reset address for writing command payload to hub
+                                mov         port_SH, #0                             ' C - set implicit port 0
+                                mov         token_SH, rxByte                        ' D - save token for responses
 rxH3
-                                mov         rxHubop, rxReadBufferLock               'A - read the buffer's lock state
-                                nop                                                   ' B
-                                mov         cCH3_outb, rxByte                       ' C - save CH3 for later processing (address, mute flag, reserved bit)
-                        if_nc   mov         _rxOffset, #12                          ' D - c (bit7) is 1 for explicit port; skip H4 and H5 if using implicit port
+                                mov         rxHubop, RxReadDriverLock               'A - read the driver's lock state
+isOpenFlag
+nonPayloadFlag                  long    |< 13                                       ' B - (spacer nop) part of writeVetoes in _rxMixed; also used for flagsAndBadF16
+                                mov         cmdDetails, rxByte                      ' C - save CH3 for later processing (address, mute flag, reserved bit 5)
+                        if_nc   mov         _rxOffset, #12                          ' D - c = bit7 = 1 for explicit port; skip H4 and H5 if using implicit port
 rxH4_Optional
-kCrowPayloadLimit               long    2047                                        'A - spacer nop; payload size limit (11 bits in v1 and v2)
-rxByte                          long    0-0                                         ' B - spacer nop; rxByte must have upper bytes zero for F16 and cont-recal
-                                mov         cPort_dirb, rxByte                      ' C - start storing explicit port; dirb is port
-                                shl         cPort_dirb, #8                          ' D
-
+kCrowPayloadLimit               long    2047                                        'A - (spacer nop) payload size limit is 11 bits in v1 and v2
+rxByte                          long    0-0                                         ' B - (spacer nop) rxByte must have upper bytes zero for F16 and cont-recal
+                                mov         port_SH, rxByte                         ' C - start saving explicit port
+                                shl         port_SH, #8                             ' D
 rxH5_Optional
-                            nop                                                     'A - spacer nop
-kOneInDField                    long    |< 9                                        ' B - spacer nop
-propCrowAdminPort               long    cPropCrowID                                 ' C - spacer nop; cPropCrowID required to be two byte value
-                                or          cPort_dirb, rxByte                      ' D - finished receiving explicit port; dirb is port
-
+kOneInUpperWord                 long    $0001_0000                                  'A - (spacer nop) used to increment upper word counts lowBitCount and badF16Count
+kOneInDField                    long    |< 9                                        ' B - (spacer nop) 
+propCrowAdminPort               long    cPropCrowID                                 ' C - (spacer nop) cPropCrowID required to be two byte value
+                                or          port_SH, rxByte                         ' D - finished saving explicit port
 
 rxH6_F16C0                      mov         _rxCountdown, _rxRemaining              'A - _rxCountdown used to keep track of payload bytes left in chunk 
                                 max         _rxCountdown, #128                      ' B - chunks are limited to 128 data bytes
                                 sub         _rxRemaining, _rxCountdown              ' C - _rxRemaining is number of payload bytes after the coming chunk
                                 add         _rxCountdown, #1                        ' D - pre-undo automatic decrement for F16C1
-
 rxH7_F16C1
                         if_z    mov         rxStartWait, rxExit                     'A - ...exit receive loop if no bytes in first chunk (empty payload)
-                                mov         rxHubop, rxWriteByte                    ' B - setup to write payload byte to buffer
-                                cmp         _rxLockingUser, #0              wz      ' C - test if the driver is locked; z=0 locked by _rxLockingUser
-                                muxnz       _rxMixed, bufferLockedFlag              ' D - veto all payload buffer writes if buffer is locked
+                                mov         rxHubop, RxWriteByte                    ' B - setup to write payload byte to buffer
+                                cmp         _rxLockingUser, #0              wz      ' C - test if the driver is locked; z=0 driver locked by _rxLockingUser
+                                muxnz       _rxMixed, driverLockedFlag              ' D - veto all buffer writes if driver is locked
 
 { rxP_0 - first payload byte of first chunk }
-rxP_0
-                        if_z    mov         _rxOffset, #8                           'A - go to rxP_F16C0 if all of chunk's bytes have been received
+rxP_0                   if_z    mov         _rxOffset, #8                           'A - go to rxP_F16C0 if all of chunk's bytes have been received
                                 andn        _rxMixed, nonPayloadFlag                ' B - clear the non-payload byte write veto (want to write payload byte to buffer)
-                                or          cRxF16U_shcnt, _rxF16L          wz      ' C - check header's F16; z=1 OK (need F16U == F16L == 0)
+                                or          _rxF16U_SH, _rxF16L             wz      ' C - check header's F16; z=1 OK (need F16U == F16L == 0)
                         if_nz   mov         rxStartWait, rxParsingErrorExit         ' D - ...exit for bad header checksums
 
 { rxP_Repeating - any payload byte after the first in a chunk }
-rxP_Repeating           if_nz   mov         _rxOffset, #0                           'A - if there are still payload bytes in the chunk keep repeating this group
-                            nop                                                     ' B
+rxP_Repeating           if_nz   mov         _rxOffset, #0                           'A - keep repeating if payload bytes in chunk (automatically go to RxP_F16C0 otherwise)
+writeVetoesMask                 long    $e000                                       ' B - (spacer nop) used for _rxMixed
                                 cmp         payloadSize, maxRxPayloadSize   wz, wc  ' C - check if command payload size exceeds buffer capacity
-                if_nc_and_nz    or          _rxMixed, overCapacityFlag              ' D - veto all remaining payload buffer writes if payload exceeds capacity
+                if_nc_and_nz    or          _rxMixed, tooBigFlag                    ' D - veto all remaining payload buffer writes if payload exceeds capacity
 
 { rxP_F16C0 - F16 C0 for a payload chunk }
 rxP_F16C0                       or          _rxMixed, nonPayloadFlag                'A - turn off writing to payload buffer (don't write F16 bytes)
@@ -1148,48 +1161,17 @@ rxP_F16C0                       or          _rxMixed, nonPayloadFlag            
                                 sub         _rxRemaining, _rxCountdown              ' D - _rxRemaining is number of payload bytes after the coming chunk
 
 { rxP_F16C1 - F16 C1 for a payload chunk }
-rxP_F16C1
-                                add         _rxCountdown, #1                wz      'A - undo automatic decrement; check if _rxCountdown==0 (next chunk empty)
+rxP_F16C1                       add         _rxCountdown, #1                wz      'A - undo automatic decrement; check if _rxCountdown==0 (next chunk empty)
                         if_z    mov         rxStartWait, rxExit                     ' B - ...exit receive loop if no bytes in next chunk (all bytes received)
-                            nop                                                     ' C
-                            nop                                                     ' D
+driverLockedFlag                long    |< 14                                       ' C - (spacer nop) part of writeVetoes in _rxMixed
+tooBigFlag                      long    |< 15                                       ' D - (spacer nop) part of writeVetoes in _rxMixed
 
-{ rxP_CheckF16 - first payload byte in chunk, excluding the first chunk }
-rxP_CheckF16            if_z    subs        _rxOffset, #12                          'A - go to rxP_F16C0 if all chunk bytes have been received
+{ rxP_CheckF16 - first payload byte in chunk, after the first chunk }
+rxP_CheckF16            if_z    subs        _rxOffset, #12                          'A - go to rxP_F16C0 if all chunk payload bytes have been received
                         if_nz   subs        _rxOffset, #16                          ' B - otherwise, go to rxP_Repeating 
-                                or          cRxF16U_shcnt, _rxF16L          wz      ' C - check chunk's F16; z=1 OK (need F16U == F16L == 0)
-                        if_nz   add         cCH0_badF16_shina, kOneInUpperWord      ' D - add to the badF16 sum if chunk failed test
+                                or          _rxF16U_SH, _rxF16L             wz      ' C - check chunk's F16; z=1 OK (need F16U == F16L == 0)
+                        if_nz   add         flagsAndBadF16, kOneInUpperWord         ' D - increment badF16Count if chunk failed test
 
-
-{
-rxP_mod128            
-
-
-                                cmp         payloadSize, maxRxPayloadSize   wz, wc  ' C - check if command payload size exceeds buffer capacity
-                if_nc_and_nz    or          _rxMixed, excPayloadFlag                ' D - ...if so, set flag (used in rxP_Repeat)
-
-
-
-rxF16C0                         andn        _rxMixed, writeByteFlag                 'A - turn off writing to hub (don't write F16 bytes)
-                                mov         _rxCountdown, _rxRemaining              ' B - _rxCountdown used to keep track of payload bytes left in chunk 
-                                max         _rxCountdown, #128                      ' C - chunks are limited to 128 data bytes
-                                sub         _rxRemaining, _rxCountdown              ' D - _rxRemaining is number of payload bytes after the coming chunk
-
-rxF16C1                         add         _rxCountdown, #1                wz      'A - undo automatic decrement; check if _rxCountdown==0 (next chunk empty)
-                        if_z    mov         rxStartWait, rxExit                     ' B - ...exit receive loop if no bytes in next chunk (all bytes received)
-                                cmp         payloadSize, maxRxPayloadSize   wz, wc  ' C - check if command payload size exceeds buffer capacity
-                if_nc_and_nz    or          _rxMixed, excPayloadFlag                ' D - ...if so, set flag (used in rxP_Repeat)
-
-rxP_VerifyF16                   or          _rxMixed, writeByteFlag                 'A - turn on writing to hub
-                        if_z    subs        _rxOffset, #12                          ' B - if _rxCountdown==0 then chunk's payload bytes done, go to rxF16C0
-                                or          cnt, _rxF16L                    wz      ' C - should have F16U == F16L == 0; sh-cnt is rxF16U
-                        if_nz   mov         rxStartWait, rxParsingErrorExit         ' D - ...exit for bad checksums
-
-rxP_Repeat              if_z    subs        _rxOffset, #16                          'A - go to rxF16C0 if all of chunk's payload bytes are received
-                        if_nz   subs        _rxOffset, #4                           ' B - ...otherwise, repeat this group
-                                test        _rxMixed, excPayloadFlag        wc      ' C - check if payload size exceeds capacity (from rxF16C1)
-                        if_c    mov         _rxAddr, rxBufferAddrMinusOne           ' D - ...if so, keep resetting address to prevent overrun (command discarded anyway)
-}
 
 
 { Receive Loop Continue / Exit Instructions
@@ -1197,7 +1179,7 @@ rxP_Repeat              if_z    subs        _rxOffset, #16                      
   or exit the loop. }
 rxContinue              if_z    waitpne     rxMask, rxMask
 rxExit                  if_z    jmp         #ReceiveCommandFinish
-rxParsingErrorExit      if_z    jmp         #ParsingError                           'don't exit immediately -- framing error on stop bit takes precedence
+rxParsingErrorExit      if_z    jmp         #ParsingError                           'don't exit at error point -- framing error on stop bit takes precedence
 
 { ReceiveCommandFinish
     This code runs after all packet bytes have been received.
@@ -1209,37 +1191,40 @@ ReceiveCommandFinish
                                 { save the number of low clock counts; used by cont-recal and admin commands }
                                 mov         rxLowClocks, phsb
 
-                                { verify final checksums }
+                                { check final checksums }
                                 add         _rxF16L, _rxPrevByte                    'compute F16L for last byte
                                 cmpsub      _rxF16L, #255                           '(computing F16U unnecessary since it should be zero)
-                                or          cRxF16U_shcnt, _rxF16L          wz      'z=1 OK (need F16U == F16L == 0)
+                                or          _rxF16U_SH, _rxF16L             wz      'z=1 OK (need F16U == F16L == 0)
 
-                                { what to do for a bad final checksum depends on whether it is for header or payload chunk }
+                                { what to do for a bad final checksum (z=0) depends on whether it is for header or payload chunk }
                         if_nz   cmp         payloadSize, #1                 wc      'c=1 empty payload => F16 is header's
-                if_nz_and_c     jmp         #ParsingError                           'bad header F16 is a parsing error
-                        if_nz   add         cCH0_badF16_shina, kOneInUpperWord      'if last payload chunk is bad, increment badF16 count
-
-                                { bad payload checksums are a reportable error -- handled later }
+                if_nz_and_c     jmp         #ParsingError                           '...exit: bad header F16 is a parsing error
+                        if_nz   add         flagsAndBadF16, kOneInUpperWord         'if last payload chunk is bad, increment badF16Count; deal with it later
 
                                 { Verify reserved bit 5 of CH3 is zero. In future Crow versions this may be used for a CRC option. }
-                                test        cCH3_outb, #%0010_0000          wc      'c=1 out of spec
+                                test        cmdDetails, #%0010_0000         wc      'c=1 out of spec
                         if_c    jmp         #ParsingError
 
                                 { extract the address }
-                                mov         inb, cCH3_outb                          'sh-inb used for address (scratch); outb is CH3
-                                and         inb, #cAddressMask              wz      'z=1 broadcast address (0)
-                                test        cCH3_outb, #cMuteFlag           wc      'c=1 mute response
-                    if_z_and_nc jmp         #ParsingError                           '...broadcast must mute (invalid packet)
+                                mov         _rxTmp_SH, cmdDetails                   'get address in _rxTmp
+                                and         _rxTmp_SH, #cAddressMask        wz      'z=1 broadcast address (address 0)
+                                test        cmdDetails, #cMuteFlag          wc      'c=1 mute response
+                    if_z_and_nc jmp         #ParsingError                           '...exit: broadcast must mute (invalid packet)
 
-                                { At this point the packet has passed all parsing tests involving non-reportable errors.
-                                    However, it may be addressed to different device. }
-                                { z=1 broadcast address, sh-inb is address }
+                                { At this point the packet has passed all parsing tests involving non-reportable errors. }
+                                { z=1 broadcast address, _rxTmp is address }
 
-rxVerifyAddress         if_nz   cmp         inb, #0-0                       wz      'verify non-broadcast address; s-field set by LoadSettings
-                        if_nz   jmp         #ReceiveCommand                         '...wrong non-broadcast address
+rxVerifyAddress         if_nz   cmp         _rxTmp_SH, #0-0                 wz      'verify non-broadcast address; s-field set by LoadSettings
+                        if_nz   jmp         #ReceiveCommand                         '...exit: packet intended for different device
 
-                                { a crow transaction is open if responses aren't muted (until final response sent, or error) }
-                                muxnc       runFlags, #cOpenTransaction
+                                { Now determine if a Crow transaction is open -- it is if responses aren't muted (c=0). The
+                                    transaction closes when a final response is sent, or an interruption occurs.
+                                  We need to set the isOpen flag of flagsAndBadF16. Also, if a transaction is open
+                                    we need to retain the line (make tx pin an output).
+                                  Since this is the only place a transaction can be opened we handle the details here. A transaction
+                                    can close in multiple places, so that is handled with a routine (CloseTransaction). }
+                                muxnc       flagsAndBadF16, isOpenFlag              'set isOpen flag (c=0 open transaction)
+                        if_nc   or          dira, txMask                            'if open, retain the line (make tx pin an output) 
 
 '                                { calculate the number of low bits }
 '
@@ -1265,39 +1250,42 @@ rxVerifyAddress         if_nz   cmp         inb, #0-0                       wz  
 
                                 { now check some reportable error conditions }
 rxErrorChecks 
-                                { error check: the rx buffer is/was locked by user code }
-                                test        _rxMixed, bufferLockedFlag      wc
-                        if_c    mov         _error, #cBufferLocked
-                        if_c    jmp         #CrowErrorHandler
+                                { error check: the driver is/was locked by user code }
+                                test        _rxMixed, driverLockedFlag      wc
+                        if_c    mov         _x, #cDriverLocked
+                        if_c    jmp         #ErrorHandler
 
                                 { error check: payload size exceeded capacity }
-                                test        _rxMixed, overCapacityFlag      wc
-                        if_c    mov         _error, #cOverCapacity
-                        if_c    jmp         #CrowErrorHandler
+                                test        _rxMixed, tooBigFlag            wc
+                        if_c    mov         _x, #cPayloadTooBig
+                        if_c    jmp         #ErrorHandler
 
-                                { extract the T flag from CH0 and save it in c }
-                                test        cCH0_badF16_shina, #CommandTypeFlag     wc  'c=1 user command; sh-ina is H0 from rxH0
+                                { error check: bad payload checksums (count in upper word of typeAndBadF16) }
+                                test        flagsAndBadF16, kUpperWordMask  wz
+                        if_nz   mov         _x, #cBadChecksum
+                        if_nz   jmp         #ErrorHandler
 
-                                { error check: bad payload checksums (count in upper word of cCH0_badF16_shina) }
-                                shr         cCH0_badF16_shina, #16          wz
-                        if_nz   mov         _error, #cBadChecksum
-                        if_nz   jmp         #CrowErrorHandler
+                                { check command type }
+                                test        flagsAndBadF16, #cCommandTypeFlag   wc  'c=1 user command
 
-                                { if user command do port lookup elsewhere;
-                                    c = T flag from earlier; c=1 user command  }
+                                { if user command do port lookup elsewhere }
                         if_c    jmp         #UserPortLookup
 
-                                { check admin port - port is in dirb/cPort }
+                                { admin command }
 
-                                cmp         cPort_dirb, #0                  wz     'Crow standard admin commands (universal and extended)
+
+    {todo: reduce permanent code by making everything except ping and stayAwake handled by paged code }
+
+                                cmp         port_SH, #0                     wz      'standard admin commands from Crow specification
                         if_z    jmp         #StandardAdmin
     
-                                cmp         cPort_dirb, propCrowAdminPort   wz     'PropCrow admin
+                                cmp         port_SH, propCrowAdminPort      wz      'PropCrow admin commands
                         if_z    mov         _page, #cPropCrowAdmin
                         if_z    jmp         #ExecutePage
 
-                                mov         _error, #cAdminPortNotOpen              'the port not being open is a reportable error
-                                jmp         #CrowErrorHandler 
+                                { admin port is closed }
+                                mov         _x, #cPortNotOpen
+                                jmp         #ErrorHandler 
 
 
 { UserPortLookup
@@ -1306,6 +1294,9 @@ rxErrorChecks
 UserPortLookup
                                 mov         _page, #cUserCommand
                                 jmp         #ExecutePage
+
+kUpperWordMask long $ffff_0000
+
 
 
 { UniversalAdmin
@@ -1340,27 +1331,28 @@ StandardAdmin
                                 rdbyte      _x, rxBufferAddr                wz
 
                                 { getDeviceInfo(), code = 0x00 } 
-                        if_nz   jmp         #:echo
+                        if_nz   jmp         #:checkIfEcho
                                 cmp         payloadSize, #1                 wz      'z=0 payload size incorrect (require exactly one byte)
-                                test        runFlags, #cOpenTransaction     wc      'c=0 no open transaction (command was muted)
+                                test        flagsAndBadF16, isOpenFlag      wc      'c=0 no open transaction
                     if_nc_or_nz jmp         #ReceiveCommand
                                 mov         _page, #cGetDeviceInfo
                                 jmp         #ExecutePage
 
-                                { echo(numIntermediates=0, bytes=[]), code = 0x01 }
-:echo
-                                cmp         _x, #1                          wz
+:checkIfEcho                    cmp         _x, #1                          wz
                         if_nz   mov         _page, #cOtherStandardAdmin             'all other standard admin commands taken care of with paged code
                         if_nz   jmp         #ExecutePage
+                                
+                                { echo(numIntermediates=0, bytes=[]), code = 0x01 }
 
                                 cmp         payloadSize, #2                 wc      'c=1 payload size too small (require 2+ bytes)
-                                test        runFlags, #cOpenTransaction     wz      'z=1 no open transaction (command was muted)
+                                test        flagsAndBadF16, isOpenFlag      wz      'z=1 no open transaction (command was muted)
                     if_c_or_z   jmp         #ReceiveCommand
+
+                                { todo: consider revising echo -- limit on num intermediates; also exact echo (incl. init 2 bytes) }
 
                                 mov         _y, rxBufferAddr
                                 add         _y, #1
                                 rdbyte      _x, _y                          wz      '_x = number of intermediate responses is second byte
-                            { todo: limit on num intermediates? }
                                 add         _y, #1                                  '_y = address of bytes to echo (starting at third byte, if provided)
                                 mov         _z, payloadSize
                                 sub         _z, #2                                  '_z = number of bytes to echo
@@ -1394,7 +1386,7 @@ StandardAdmin
 
 
 { TxSendBytes
-    Helper routine used to send bytes. It also updates the running F16 checksum. It assumes
+    Internal routine used to send bytes. It also updates the running F16 checksum. It assumes
   the tx pin is already an output. Bytes are sent from the hub.
     This routine should not be called by user code -- use the complete or partial sending routines.
     The lowest bitPeriod supported by this routine is 32 or 33 clocks (32 clocks requires that
@@ -1402,54 +1394,57 @@ StandardAdmin
   Usage:    mov     _txAddr, <hub address of bytes>
             mov     _txCount, <number to send != 0>
             call    #TxSendBytes
-  After retuning _txCount will be zero and _txAddr will point to the address immediately
-    after the last byte sent.
+  After: _txCount = 0
+         _txAddr = address immediately after last byte sent
 }
 TxSendBytes
-                                test        runFlags, #cOpenTransaction     wc      'do not send if no open transaction
+                                { First, check if there is no open transaction and abort if that is the case. Although the
+                                    line should be released in that case (the tx pin not an output) this check is still an
+                                    important safety measure. It also shortens the amount of time before waiting for a command. }
+                                test        flagsAndBadF16, isOpenFlag      wc      'c=0 transaction not open
                         if_nc   jmp         TxSendBytes_ret
 
                                 rdbyte      _txByte, _txAddr
                                 
-                                mov         cnt, cnt
-                                add         cnt, #9
+                                mov         _txWait_SH, cnt
+                                add         _txWait_SH, #9
 
-:byteLoop                       waitcnt     cnt, txBitPeriodA                       'start bit
+:byteLoop                       waitcnt     _txWait_SH, txBitPeriodA                'start bit
                                 andn        outa, txMask
 
-                                add         _txF16L, _txByte                        'F16 calculation
+                                add         _txF16L, _txByte                        'do F16 calculation
                                 cmpsub      _txF16L, #255
                                 add         _txF16U, _txF16L
                                 cmpsub      _txF16U, #255
 
                                 shr         _txByte, #1                     wc
-                                waitcnt     cnt, txBitPeriodB                       'bit0
+                                waitcnt     _txWait_SH, txBitPeriodB                'bit0
                                 muxc        outa, txMask
 
-                                mov         inb, #6
+                                mov         _txTmp_SH, #6
                                 add         _txAddr, #1
 
 :bitLoop                        shr         _txByte, #1                     wc
-:twiddle                        waitcnt     cnt, txBitPeriodA                       'bits1-6
+:twiddle                        waitcnt     _txWait_SH, txBitPeriodA                'bits1-6
                                 muxc        outa, txMask
                                 xor         :twiddle, #1
-                                djnz        inb, #:bitLoop
+                                djnz        _txTmp_SH, #:bitLoop
             
                                 shr         _txByte, #1                     wc
                                 
-                                waitcnt     cnt, txBitPeriodA                       'bit7
+                                waitcnt     _txWait_SH, txBitPeriodA                'bit7
                                 muxc        outa, txMask
 
                                 rdbyte      _txNextByte, _txAddr
 
-                                waitcnt     cnt, stopBitDuration                    'stop bit
+                                waitcnt     _txWait_SH, stopBitDuration             'stop bit
                                 or          outa, txMask
 
                                 mov         _txByte, _txNextByte
 
                                 djnz        _txCount, #:byteLoop
 
-                                waitcnt     cnt, #0                                 'ensure line is high for a full stop bit duration
+                                waitcnt     _txWait_SH, #0                          'ensure line is high for a full stop bit duration
 
 TxSendBytes_ret                 ret 
 
@@ -1483,6 +1478,8 @@ TxSendAndResetF16_ret           ret
     The partial sending routines exist to allow sending payload bytes from multiple random
   locations of hub RAM without buffering them first. If sending from a single contiguous block
   of hub RAM then it is easier to use the complete sending routines.
+    Arguments/Results: payloadSize = total size of payload (not changed by routine, unless it exceeds the limit)
+
   Usage:    mov     payloadSize, <number of bytes total in payload>
             call    #SendFinalHeader
       <or>  call    #SendIntermediateHeader
@@ -1494,32 +1491,25 @@ TxSendAndResetF16_ret           ret
             call    #FinishSending
 }
 SendFinalHeader                 movs        _SendApplyTemplate, #$90                'Note: ReportCrowError assumes s-field of SendFinalHeader is RH0 template
-                                jmp         #_SendChecks
-SendIntermediateHeader
-                                movs        _SendApplyTemplate, #$80
+                                jmp         #_SendEnforceSizeLimit
+SendIntermediateHeader          movs        _SendApplyTemplate, #$80
 
-                                { check that the device is allowed to send, and make sure payload length is in spec }
-_SendChecks                     test        runFlags, #cOpenTransaction     wc      'TxSendBytes also performs this check, but we need to check it here
-                        if_nc   jmp         SendHeader_ret                          '  to avoid retaining the line if not allowed.
-                                max         payloadSize, kCrowPayloadLimit          'do not allow payloadSize to exceed spec limit
+_SendEnforceSizeLimit           max         payloadSize, kCrowPayloadLimit
                                 
                                 { compose header bytes RH0-RH2 }
-                                mov         cnt, payloadSize                        'sh-cnt used for scratch
-                                shr         cnt, #8                                 '(assumes payloadSize does not exceed spec limit)
-_SendApplyTemplate              or          cnt, #0-0
+                                mov         _txTmp_SH, payloadSize                  '_txTmp will be RH0
+                                shr         _txTmp_SH, #8                           'this requires payloadSize does not exceed limit
+_SendApplyTemplate              or          _txTmp_SH, #0-0
                                 mov         _txAddr, txScratchAddr                      
-                                wrbyte      cnt, _txAddr                            'RH0
+                                wrbyte      _txTmp_SH, _txAddr                      'RH0
                                 add         _txAddr, #1
                                 wrbyte      payloadSize, _txAddr                    'RH1
                                 add         _txAddr, #1
-                                wrbyte      cToken_shpar, _txAddr                   'RH2; sh-par is token
+                                wrbyte      token_SH, _txAddr                       'RH2
 
                                 { reset F16 }
                                 mov         _txF16L, #0
                                 mov         _txF16U, #0
-
-                                { retain line }
-                                or          dira, txMask
 
                                 { send RH0-RH2 }
                                 mov         _txAddr, txScratchAddr
@@ -1529,9 +1519,7 @@ _SendApplyTemplate              or          cnt, #0-0
                                 { send RH3-RH4 (the header F16) }
                                 call        #TxSendAndResetF16
 
-                                { prep for first payload chunk; the flag to indicate whether the last checksums need to be sent
-                                   when FinishSending is called uses bit 9 of outb; outb is set to CH3, and will have bit 9 = 0 by default,
-                                   so we don't need to clear it here (it will be set when payload bytes are sent) }
+                                { prep for first payload chunk; the sendF16 flag is already cleared by default }
                                 mov         _txMaxChunkRemaining, #128          'the maximum number of bytes for a full chunk (the last may be partial)
 SendHeader_ret
 SendFinalHeader_ret
@@ -1564,7 +1552,7 @@ SendPayloadBytes
                                 mov         _txAddr, payloadAddr
 
                                 call        #txSendBytes
-                                or          outb, #cSendChecksums                   'if any payload bytes have been sent then a checksum must follow eventually
+                                or          flagsAndBadF16, #cSendF16Flag           'if any payload bytes have been sent then a checksum must follow eventually
 
                                 mov         payloadAddr, _txAddr
 
@@ -1575,7 +1563,7 @@ SendPayloadBytes
                                 call        #txSendAndResetF16
 
                                 { prep for next chunk }
-                                andn        outb, #cSendChecksums                   'checksums just sent, so clear flag (bit 9 of outb)
+                                andn        flagsAndBadF16, #cSendF16Flag           'checksums just sent, so clear flag
                                 mov         _txMaxChunkRemaining, #128
  
                                 jmp         #:loop 
@@ -1584,52 +1572,42 @@ SendPayloadBytes_ret            ret
 
 
 { FinishSending (Partial Sending Routine)
-    This routine finishes the response packet.
-    This routine MUST be called after a call to SendFinalHeader or SendIntermediateHeader,
-  even if there are no payload bytes.
+    This routine finishes the response packet by sending final F16 payload checksums, if necessary.
 }
 FinishSending
-                                { Two things required: send last payload F16 if necessary, and release the line. }
-                                test        outb, #cSendChecksums          wc      'send final payload checksum if necessary; flag in bit 9 of outb
+                                { send the last payload F16, if necessary }
+                                test        flagsAndBadF16, #cSendF16Flag   wc
                         if_c    call        #TxSendAndResetF16
-txReleaseLine                   andn        dira, txMask                            'this instruction may be deleted in some circumstances (along
-FinishSending_ret               ret                                                 ' with txRetainLine) -- see "PropCrow User Guide.txt"
+FinishSending_ret               ret
 
 
 
 
-{ Complete Sending Routines 
-  These routines require that the entire payload be in a contiguous block of hub ram.
-  Usage:    mov         payloadSize, <num bytes of payload>
-            mov         payloadAddr, <hub address of payload>
-            call        #SendFinalAndReturn
-       <or> call        #SendIntermediate
-       <or> jmp         #SendFinalResponse
-  Both payloadSize and payloadAddr are modified by these routines. 
+
+{ SendIntermediateResponse (Complete Sending Routine)
+    This is a convenience routine for sending an intermediate response.
+    Usage: set payloadSize and payloadAddr
+            call    #SendIntermediate
 }
-SendFinalResponse               movs        Send_ret, #ReceiveCommand
-
-SendFinalAndReturn              mov         _txS0, payloadSize
-                                mov         _txS1, payloadAddr
-                                call        #SendFinalHeader
-                                jmp         #_SendPayload
-
-SendIntermediate                mov         _txS0, payloadSize
-                                mov         _txS1, payloadAddr
-                                call        #SendIntermediateHeader
-
-_SendPayload                    mov         payloadSize, _txS0
-                                mov         payloadAddr, _txS1 
-                                call        #SendPayloadBytes 
-
+SendIntermediate                call        #SendIntermediateHeader
+                                call        #SendPayloadBytes
                                 call        #FinishSending
-Send_ret
-SendFinalAndReturn_ret
 SendIntermediate_ret            ret
 
-
-
-
+{ SendFinalResponse, SendFinalAndReturn (Complete Sending Routines)
+    These are convenience routines for sending a final response. They differ in what happens
+  afterwards: either returning to the calling code, or immediately jumping to ReceiveCommand.
+    Usage: set payloadSize and payloadAddr
+            call    #SendFinalAndReturn
+            -or-
+            jmp     #SendFinalResponse
+}
+SendFinalResponse               movs        SendFinalAndReturn_ret, #ReceiveCommand
+SendFinalAndReturn              call        #SendFinalHeader
+                                call        #SendPayloadBytes
+                                call        #FinishSending
+                                call        #CloseTransaction
+SendFinalAndReturn_ret          ret
 
 
 
@@ -1646,11 +1624,11 @@ SendIntermediate_ret            ret
           reset these flags must be set/cleared by shifted parsing code, so the code is making a decision about the
           current byte being written during the next receive loop. The flags:
             N: nonPayload   - bit 13 - set if the byte is a non-payload byte, cleared otherwise; set on reset
-            L: bufferLocked - bit 14 - set if the buffer is locked; cleared on reset
-            O: overCapacity - bit 15 - set if payload exceeds capacity; cleared on reset
+            L: driverLocked - bit 14 - set if the driver is locked; cleared on reset
+            B: tooBig - bit 15 - set if command payload exceeds buffer capacity; cleared on reset
         lowBitCount (upper word) - the count of low data bits, used by the continuous recalibration code
     So this is the layout
-        |---lowBitCount--|OLN|--byteCount--|
+        |---lowBitCount--|BLN|--byteCount--|
     Value after reset:
         |0000000000000000|001|1111111111111|
     Considerations:
@@ -1662,11 +1640,8 @@ SendIntermediate_ret            ret
     See page 114.
 }   
 rxMixedReset            long    $3fff       'byteCount = -1, nonPayloadFlag = 1, all else clear/zero
-nonPayloadFlag          long    |< 13       'part of writeVetoes in _rxMixed
-bufferLockedFlag        long    |< 14       'part of writeVetoes in _rxMixed
-overCapacityFlag        long    |< 15       'part of writeVetoes in _rxMixed
-writeVetoesMask         long    $e000       'bits 13, 14, and 15 set; for _rxMixed
-kOneInUpperWord         long    $0001_0000  'used to increment lowBitCount in _rxMixed
+'nonPayloadFlag, driverLockedFlag, tooBigFlag, and writeVetoesMask are located in shifted parsing code as spacer nops
+
 
 lowCounterMode                  long    $3000_0000
 
@@ -1724,16 +1699,31 @@ ExecutePage
                                 jmp         #cPage
 
 
-{ CrowErrorHandler
-    This routine simply tests whether crow errors should be reported, and then executes the relevant
-  code page if so. _error should already be set.
+{ CloseTransaction
+    Used to close the transaction, preventing any further more transmissions until the next command.
+  It is safe to call even when the transaction is already closed.
+    Arguments/Results: none
+    Usage:  call    #CloseTransaction
 }
-CrowErrorHandler
-                                test        otherOptions, #cReportCrowErrors    wc  'c=0 report crow errors disabled
-                                test        runFlags, #cOpenTransaction         wz  'z=1 no open transaction
+CloseTransaction                andn        flagsAndBadF16, isOpenFlag              'clear isOpen flag
+                                andn        dira, txMask                            'release the line (make tx pin high-z)
+CloseTransaction_ret            ret
+
+
+{ ErrorHandler
+    Use this routine to process low-level errors -- errors that will be reported to the host using a 
+  Crow error response. This routine determines whether the error should be reported, and then calls the
+  sending code if necessary.
+    Arguments/Results: _x = error code
+    Usage:  mov     _x, #<error code>
+            jmp     #ErrorHandler
+}
+ErrorHandler
+                                test        otherOptions, #cSendErrorResponses  wc  'c=0 error responses disabled
+                                test        flagsAndBadF16, isOpenFlag          wz  'z=1 no open transaction
                    if_nc_or_z   jmp         #RecoveryMode 
 
-                                mov         _page, #cReportCrowError
+                                mov         _page, #cPgSendErrorResponse
                                 jmp         #ExecutePage
 
 
@@ -1746,7 +1736,6 @@ pin27 long |< 27
 'pause long 8_000_000
 total long 0
 
-runFlags    long 0
 
 
 
@@ -1773,10 +1762,10 @@ FinishInit
                                 shl         txMask, _x
                                 or          outa, txMask
                                
-                                add         _addr, #1                           'rxBufferAddr, rxBufferAddrMinusOne
+                                add         _addr, #1                           'rxBufferAddr, cmdBufferResetAddr
                                 rdword      rxBufferAddr, _addr 
-                                mov         rxBufferAddrMinusOne, rxBufferAddr
-                                sub         rxBufferAddrMinusOne, #1
+                                mov         cmdBufferResetAddr, rxBufferAddr    'cmdBufferResetAddr = cmdBufferAddr - 1 due to pre-increment for writes
+                                sub         cmdBufferResetAddr, #1
 
                                 add         _addr, #2                           'txBufferAddr
                                 rdword      txBufferAddr, _addr
@@ -1899,9 +1888,6 @@ rxLowClocks res
 'rxBitPeriodB    res
 'rxBitPeriod5    res
 
-'txBitPeriodA    res
-'txBitPeriodB    res
-
 
 bitPeriod0      res
 bitPeriod1      res
@@ -1918,7 +1904,7 @@ otherOptions    res
 deviceInfoAddr          res
 accessLockID            res
 rxBufferAddr            res
-rxBufferAddrMinusOne    res
+cmdBufferResetAddr      res
 txBufferAddr            res
 numUserPortsAddr        res
 maxUserPorts            res
@@ -1931,23 +1917,16 @@ serSettingsChangedAddr  res
 pageTableAddr           res
 
 
-{ Dedicated Temporary Variables
-    Some routines (Divide, Multiply, ReportCrowError) use these registers for arguments and results.
-    Important: the receiving code uses these registers, so their values will be undefined
-  after each command is received.
-    Aliases: _tmp0 through _tmp5, or _x, _y, _z, _addr, _retAddr, and _count.
-}
 
-{ Special Temporaries
-    To increase flexibility for paged code the following temporaries are never used by the sending or
-  utility routines except as calling arguments or return results, in which case the use is clearly stated.
-  These temporaries are used by the receiving code (_rx), which means they will be undefined every time
-  a command is received. 
+{ Argument/Result Temporaries
+    The following registers are never used by the sending or utility routines except as calling arguments
+  or return results, in which case that use is clearly stated.
+    These registers are used by the receiving code (_rx), which means they will be undefined immediately
+  after a command is received, but their values will be stable and predictable after that.
 }
 fit 488 'On error: too many res variables. Reduce variables, cPage, or cPageMaxSize.
 org 488
 
-_error
 _x
 _rxOffset       res
 
@@ -1955,16 +1934,16 @@ _y
 _rxResetOffset  res
 
 _z
-_rxWait0    res
+_rxWait0        res
 
 _addr
-_rxWait1    res
+_rxWait1        res
 
 _retAddr
-_rxAddr     res
+_rxAddr         res
 
 _count 
-_rxF16L     res
+_rxF16L         res
 
 
 { Fixed Location Globals
@@ -1973,6 +1952,7 @@ _rxF16L     res
 }
 fit 494
 org 494
+
 txBitPeriodA    res 'must be at even address
 txBitPeriodB    res 'must be at address immediately after txBitPeriodA
 
