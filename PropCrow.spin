@@ -112,7 +112,9 @@ cUnknownErrStr      = 3
 cSpinStr            = 4
 cDefaultUserName    = 5
 
-{ page indices }
+{ Page Indices
+    The "_A" or "_B" suffix clarifies what kind of page it is -- refer to Paging Constants.
+}
 cCalculateTimings   = 0
 cGetDeviceInfo      = 1
 cUserCommand        = 2
@@ -126,7 +128,9 @@ cSendCustomError    = 9
 cSendErrorFinish    = 10
 cStandardAdminCont  = 11
 cReceiveExtra_B     = 12
-cNumPages           = 13
+cFramingError_A     = 13
+cBaudDetect_A       = 14
+cNumPages           = 15
 cInvalidPage        = 511   'signifies no valid page loaded
 
 
@@ -207,6 +211,8 @@ pub new | __pause
     word[@PageTable][20] := @SendErrorFinishPg
     word[@PageTable][22] := @StandardAdminCont
     word[@PageTable][24] := @ReceiveExtra_B
+    word[@PageTable][26] := @FramingError_A
+    word[@PageTable][28] := @BaudDetect_A
 
     word[@StringTable][0] := @PropCrowStr
     word[@StringTable][1] := @WaitingForStr
@@ -322,6 +328,17 @@ byte    StandardAdminCont_end - StandardAdminCont + 1
 word    @ReceiveExtra_B
 byte    0
 byte    ReceiveExtra_B_end - ReceiveExtra_B + 1
+
+'13: FramingError_A
+word    @FramingError_A
+byte    0
+byte    FramingError_A_end - FramingError_A + 1
+
+'14: BaudDetect_A
+word    @BaudDetect_A
+byte    0
+byte    BaudDetect_A_end - BaudDetect_A + 1
+
 
   
 { ControlBlock
@@ -512,6 +529,26 @@ DefaultUserName     byte "User Object", 0
 'WasUnresponsiveStr  byte "> was unresponsive.", 0
 
 
+{ FramingError_A
+    Handles framing errors.
+}
+org cPageA
+FramingError_A
+                            {todo: increment consecutive framing errors count
+                                    if count reaches limit and baud detect enabled, go to baud detect
+                                    otherwise, force reload the settings }
+FramingError_A_end
+                                jmp         #ReceiveCommand
+fit cPageALimit 'On error: page too big.
+
+{ BaudDetect_A
+    Enters baud detection mode.
+}
+org cPageA
+BaudDetect_A
+BaudDetect_A_end                jmp         #ReceiveCommand
+fit cPageALimit 'On error: page too big.
+
 { ReceiveExtra_B
     This page starts with a 16 register nibble table. This table contains the number of zero bits for the
   numbers 0 to 15. It is used by the continuous recalibration code -- the values are in the upper word since
@@ -537,14 +574,8 @@ long    $0001_0000
 long    $0001_0000
 long    $0000_0000
 
-FramingError
-                                { todo: add logic }
-                                jmp         #RecoveryMode
 
-                            {todo: increment consecutive framing errors count
-                                    if count reaches limit and baud detect enabled, go to baud detect
-                                    otherwise, force reload the settings }
-ParsingError
+ParsingErrorHandler_B
                        
                             {todo: check if settings have changed, if so then reload
                                     otherwise, go to recovery mode }
@@ -944,7 +975,7 @@ GetDeviceInfo
                                 'call        #UnlockSharedAccess
                                 
 GetDeviceInfo_end               jmp         #ReceiveCommand
-fit cPageALimit 'Page is too big. Reduce code or increase cPageSize.
+fit cPageALimit 'On error: page is too big.
 
 org cPageA
 
@@ -996,7 +1027,8 @@ CalculateTimings
 CalculateTimings_end
                                 jmp         #ExecutePageA
 
-fit cPageALimit 'Page is too big. Reduce code or increase cPageSize.
+fit cPageALimit 'On error: page is too big.
+
 
 
 
@@ -1048,7 +1080,8 @@ Calc2
 Calc2_end
 k1000                           long    1000
 
-fit cPageALimit 'On error: page is too big. Reduce code or increase cPageSize.
+fit cPageALimit 'On error: page is too big.
+
 
 
 
@@ -1080,6 +1113,7 @@ Calc3
                                 call        #LoadPageB
 
 Calc3_end                       jmp         #RecoveryMode
+fit cPageALimit 'On error: page is too big.
             
 org 0
 
@@ -1174,23 +1208,27 @@ Divide_ret                      ret
 
                                 
 { ReceiveCommand
-  This routine contains the receive loop used to receive and process bytes. Processing is done using
-    shifted parsing instructions, which are explained in more detail in the "Parsing Instructions" 
-    section below.
+    This routine contains the receive loop used to receive and process bytes. Processing is done using shifted
+  parsing instructions, which are explained in more detail in the "RX Shifted Parsing Instructions" notes.
+    If all bytes of a packet have been received normally then execution goes to ReceiveCommandFinish for final
+  parsing and validity checks. Otherwise, this routine may exit to HandleFramingError or ParsingErrorHandler_B.
 }
 ReceiveCommand
                                 call        #Trace
                                 xor         outa, pin27
 
+                                { todo: check if settings have changed }
+
+                                { Page B required for nibble table and ParsingErrorHandler_B. }
                                 mov         _page, #cReceiveExtra_B
                                 call        #LoadPageB
 
                                 { pre-loop initialization }
-                                mov         rxStartWait, rxContinue
-                                movs        rxMovA, #rxFirstParsingGroup
-                                movs        rxMovB, #rxFirstParsingGroup+1
-                                movs        rxMovC, #rxFirstParsingGroup+2
-                                movs        rxMovD, #rxFirstParsingGroup+3
+                                mov         _RxStartWait, rxContinue
+                                movs        _RxMovA, #rxFirstParsingGroup
+                                movs        _RxMovB, #rxFirstParsingGroup+1
+                                movs        _RxMovC, #rxFirstParsingGroup+2
+                                movs        _RxMovD, #rxFirstParsingGroup+3
                                 mov         _rxResetOffset, #0
                                 mov         _rxWait0, startBitWait
 
@@ -1201,16 +1239,15 @@ ReceiveCommand
                         if_nz   waitcnt     _rxWait0, bitPeriod0                    'wait to sample start bit
                         if_nz   test        rxMask, ina                     wc      'c=1 framing error; c=0 continue, with parser reset
                         if_z    jmp         #RecoveryMode                           '...exit for missed falling edge (need edge for accurate cont-recal)
-                        if_c    jmp         #FramingError
+                        if_c    jmp         #FramingErrorHandler
 
                                 { the receive loop -- c=0 reset parser}
 
 'loop top - occurs within interval between startbit and bit0
-rxLoopTop
-                        if_nc   mov         _rxMixed, rxMixedReset                  'Mixed - reset byteCount, lowBitCount, writeVetoes (nonPayloadFlag is set)
+_RxLoopTop              if_nc   mov         _rxMixed, rxMixedReset                  'Mixed - reset byteCount, lowBitCount, writeVetoes (nonPayloadFlag is set)
                        
 'bit0 - 34 clocks
-rxBit0                          waitcnt     _rxWait0, bitPeriod1
+:bit0                           waitcnt     _rxWait0, bitPeriod1
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0000_0001
                         if_nc   mov         phsb, rxPhsbReset                       'Cont-Recal 1 - reset low clocks count on reset; MUST change rxPhsbReset calculation if moved
@@ -1220,7 +1257,7 @@ rxBit0                          waitcnt     _rxWait0, bitPeriod1
                         if_nc   mov         _rxF16L, #0                             'F16 1 - zero checksums on reset; see page 90
 
 'bit1 - 34 clocks
-rxBit1                          waitcnt     _rxWait1, bitPeriod0
+:bit1                           waitcnt     _rxWait1, bitPeriod0
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0000_0010
                         if_nc   mov         _rxF16U_SH, #0                          'F16 2
@@ -1230,96 +1267,109 @@ rxBit1                          waitcnt     _rxWait1, bitPeriod0
                         if_c    cmpsub      _rxF16U_SH, #255                        'F16 6 -  to work, which is not necc. true the first pass through, but is after.)
 
 'bit 2 - 34 clocks
-rxBit2                          waitcnt     _rxWait1, bitPeriod1
+:bit2                           waitcnt     _rxWait1, bitPeriod1
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0000_0100
                         if_nc   mov         _rxOffset, _rxResetOffset               'Shift 1 - go back to first parsing group on reset (see page 93)
                                 subs        _rxResetOffset, _rxOffset               'Shift 2 - adjust reset offset
-                                adds        rxMovA, _rxOffset                       'Shift 3 - (next four) offset addresses for next parsing group
-                                adds        rxMovB, _rxOffset                       'Shift 4
-                                adds        rxMovC, _rxOffset                       'Shift 5
+                                adds        _RxMovA, _rxOffset                      'Shift 3 - (next four) offset addresses for next parsing group
+                                adds        _RxMovB, _rxOffset                      'Shift 4
+                                adds        _RxMovC, _rxOffset                      'Shift 5
 
 'bit 3 - 34 clocks
-rxBit3                          waitcnt     _rxWait1, bitPeriod0
+:bit3                           waitcnt     _rxWait1, bitPeriod0
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0000_1000
-                                adds        rxMovD, _rxOffset                       'Shift 6
+                                adds        _RxMovD, _rxOffset                      'Shift 6
                                 mov         _rxOffset, #4                           'Shift 7 - restore default offset (must be done before shifted instructions)
-rxMovA                          mov         rxShiftedA, 0-0                         'Shift 8 - (next four) shift parsing instructions into place
-rxMovB                          mov         rxShiftedB, 0-0                         'Shift 9
-rxMovC                          mov         rxShiftedC, 0-0                         'Shift 10
+_RxMovA                         mov         _RxShiftedA, 0-0                        'Shift 8 - (next four) shift parsing instructions into place
+_RxMovB                         mov         _RxShiftedB, 0-0                        'Shift 9
+_RxMovC                         mov         _RxShiftedC, 0-0                        'Shift 10
 
 'bit 4 - 34 clocks
-rxBit4                          waitcnt     _rxWait1, bitPeriod1
+:bit4                           waitcnt     _rxWait1, bitPeriod1
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0001_0000
-rxMovD                          mov         rxShiftedD, 0-0                         'Shift 11
-                                movs        rxAddLowerNibble, rxByte                'Cont-Recal 3 - determine low bit count of lower nibble; must follow mux of bit 3
-                                andn        rxAddLowerNibble, #%1_1111_0000         'Cont-Recal 4 - (spacer required)
+_RxMovD                         mov         _RxShiftedD, 0-0                        'Shift 11
+                                movs        _RxAddLowerNibble, rxByte               'Cont-Recal 3 - determine low bit count of lower nibble; must follow mux of bit 3
+                                andn        _RxAddLowerNibble, #%1_1111_0000        'Cont-Recal 4 - (spacer required)
                                 test        _rxMixed, writeVetoesMask       wz      'Write 1 - z=1 write byte to hub if all writeVetoes are clear
                         if_z    add         _rxAddr, #1                             'Write 2 - increment address (pre-increment saves re-testing the flag)
 
 'bit 5 - 33 clocks
-rxBit5                          waitcnt     _rxWait1, bitPeriod0
+:bit5                           waitcnt     _rxWait1, bitPeriod0
                                 test        rxMask, ina                     wc
-rxHubop                         long    0-0                                         'Hubop - Write 3 (rxWriteByte -- uses z flag), or rxReadDriverLock)
+_RxHubop                        long    0-0                                         'see RX Hubop; may be rxWriteByte (uses z flag), rxReadDriverLock, or nop
 
 'bit 6 - 34 clocks
-rxBit6                          waitcnt     _rxWait1, bitPeriod1
+:bit6                           waitcnt     _rxWait1, bitPeriod1
                                 testn       rxMask, ina                     wz
                                 muxc        rxByte, #%0010_0000
                                 muxz        rxByte, #%0100_0000
-rxAddLowerNibble                add         _rxMixed, 0-0                           'Cont-Recal 5 - add count of low data bits of current byte's lower nibble
+_RxAddLowerNibble               add         _rxMixed, 0-0                           'Cont-Recal 5 - add count of low data bits of current byte's lower nibble
                                 sub         _rxCountdown, #1                wz      'Countdown - used by parsing code to determine when F16 follows payload bytes
-rxShiftedA                      long    0-0                                         'Shift 12 - (next four) execute shifted instructions
-rxShiftedB                      long    0-0                                         'Shift 13
+_RxShiftedA                     long    0-0                                         'Shift 12 - (next four) execute shifted instructions
+_RxShiftedB                     long    0-0                                         'Shift 13
 
 'bit 7 - 34 clocks
-rxBit7                          waitcnt     _rxWait1, bitPeriod0
+:bit7                           waitcnt     _rxWait1, bitPeriod0
                                 test        rxMask, ina                     wc
                                 muxc        rxByte, #%1000_0000
-rxShiftedC                      long    0-0                                         'Shift 14
-rxShiftedD                      long    0-0                                         'Shift 15
+_RxShiftedC                     long    0-0                                         'Shift 14
+_RxShiftedD                     long    0-0                                         'Shift 15
                                 mov         _rxPrevByte, rxByte                     'Handoff
                                 shr         rxByte, #4                              'Cont-Recal 6 - start getting low bits count for upper nibble
-                                movs        rxAddUpperNibble, rxByte                'Cont-Recal 7 - (spacer required)
-
-rxStopBit                       waitcnt     _rxWait1, bitPeriod0                    'see page 98
+                                movs        _RxAddUpperNibble, rxByte               'Cont-Recal 7 - (spacer required before Cont-Recal 8)
+'stop bit
+:stopBit                        waitcnt     _rxWait1, bitPeriod0                    'see page 98
                                 testn       rxMask, ina                     wz      'z=0 framing error
 
-rxStartWait                     long    0-0                                         'wait for start bit, or exit loop (either all bytes received, or parsing error)
+_RxStartWait                    long    0-0                                         'see RX StartWait; may be rxContinue, rxExit, or rxParsingErrorExit (all only if_z)
 
                         if_z    add         _rxWait0, cnt                           'Wait 1
 
-'start bit - 34 clocks (last instr at rxLoopTop)
-rxStartBit              if_z    waitcnt     _rxWait0, bitPeriod0
+'start bit - 34 clocks (last instr at _RxLoopTop)
+:startBit               if_z    waitcnt     _rxWait0, bitPeriod0
                         if_z    test        rxMask, ina                     wz      'z=0 framing error
-rxAddUpperNibble        if_z    add         _rxMixed, 0-0                           'Cont-Recal 8 - finish adding low bit count for upper nibble of previous byte
+_RxAddUpperNibble       if_z    add         _rxMixed, 0-0                           'Cont-Recal 8 - finish adding low bit count for upper nibble of previous byte
                         if_z    mov         _rxTmp_SH, _rxWait0                     'Timeout 1
                         if_z    sub         _rxTmp_SH, _rxWait1                     'Timeout 2 - see page 98 for timeout notes
                         if_z    cmp         _rxTmp_SH, ibTimeout            wc      'Timeout 3 - c=0 reset, c=1 no reset
-                        if_z    djnz        _rxMixed, #rxLoopTop                    'Mixed - add to byteCount (negative)
-                                jmp         #FramingError                           'note: the djnz never reaches zero 
+                        if_z    djnz        _rxMixed, #_RxLoopTop                   'Mixed - add to byteCount (negative)
 
+                    { Fall through to FramingErrorHandler (djnz never gets to zero in normal operation). }
 
+{ FramingErrorHandler (jmp)
+    Invokes the framing error code page.
+}
+FramingErrorHandler
+                                mov         _page, #cFramingError_A
+                                jmp         #ExecutePageA
 
 
 { RX Hubop, used by ReceiveCommand
-    These instructions are shifted into the receive loop at the rxHubop location. The shifts must be performed
+    These instructions are shifted into the receive loop at the _RxHubop location. The shifts must be performed
   by the shifted parsing code -- they are not done automatically.
     It does not matter which instruction is loaded on parser reset. Consider each case:
-      RxWriteByte - On parser reset the nonPayloadFlag in writeVetoes (in _rxMixed) is set, so writes will not occur.
-      RxReadDriverLock - Reading the driver lock state is OK -- it is intended behavior during header arrival.
-    Also, rxHubop is a nop on cog launch, so the pre-loop initialization code does not ever need to set its value.
-    For consideration: there's the potential for supporting a pool of buffers using the RX Hubop mechanism.
-  This may be useful if the host is receiving DeviceUnavailable errors due to user code not releasing the driver
+      rxWriteByte - On parser reset the nonPayloadFlag in writeVetoes (in _rxMixed) is set, so writes will not occur.
+      rxReadDriverLock - Reading the driver lock state is OK -- it is intended behavior during header arrival.
+    Also, _RxHubop is a nop on cog launch, so the pre-loop initialization code does not ever need to set its value.
+    For future consideration: there's the potential for supporting a pool of buffers using the RX Hubop mechanism.
+  This may be useful if the host is receiving errors due to user code not releasing the driver
   lock fast enough. In this case there would be three hubops: loading the next buffer set to use, checking
   if it is locked/owned, and then setting the buffer write instruction.
 }
-RxReadDriverLock                rdword      _rxLockingUser, driverLockAddr          'check if user code has driver lock (will be zero if unlocked)
-RxWriteByte             if_z    wrbyte      _rxPrevByte, _rxAddr                    'Write 4 - write byte to command payload buffer (if writeVetoes are clear) 
+rxReadDriverLock                rdword      _rxLockingUser, driverLockAddr          'check if user code has driver lock (will be zero if unlocked)
+rxWriteByte             if_z    wrbyte      _rxPrevByte, _rxAddr                    'Write 4 - write byte to command payload buffer (if writeVetoes are clear) 
 
 
+{ RX StartWait, used by ReceiveCommand
+    These instructions are shifted to _RxStartWait in the receive loop to either receive more bytes or exit the loop.
+  The 'if_z' causes the instruction to be skipped if a framing error was detected on the stop bit.
+}
+rxContinue              if_z    waitpne     rxMask, rxMask                          'wait for initial edge of next start bit
+rxExit                  if_z    jmp         #ReceiveCommandFinish                   'finish parsing fully received packet
+rxParsingErrorExit      if_z    jmp         #ParsingErrorHandler_B                  'don't exit at parsing error detection -- framing error on stop bit takes precedence
 
 
 { RX Shifted Parsing Instructions, used by ReceiveCommand
@@ -1384,7 +1434,7 @@ rxFirstParsingGroup
 rxH0                            mov         flagsAndBadF16, rxByte                  'A - save T flag, reset other flags, and reset badF16Count; also prep for testing CH0
                                 xor         flagsAndBadF16, #%0100_0000             ' B - flip bit 6 for reserved bits testing
                                 test        flagsAndBadF16, #%0110_1000     wz      ' C - test reserved bits 3 (0), 5 (0), and 6 (originally 1); z=1 OK
-                    if_nz_or_c  mov         rxStartWait, rxParsingErrorExit         ' D - ...exit for bad reserved bits (also require c = bit 7 = 0) 
+                    if_nz_or_c  mov         _RxStartWait, rxParsingErrorExit        ' D - ...exit for bad reserved bits (also require c = bit 7 = 0) 
 
 rxH1                            mov         payloadSize, _rxPrevByte                'A - extract payload size
                                 and         payloadSize, #$7                        ' B
@@ -1396,7 +1446,7 @@ rxH2                            mov         _rxRemaining, payloadSize           
                                 mov         port_SH, #0                             ' C - set implicit port 0
                                 mov         token_SH, rxByte                        ' D - save token for responses
 rxH3
-                                mov         rxHubop, RxReadDriverLock               'A - read the driver's lock state
+                                mov         _RxHubop, rxReadDriverLock              'A - read the driver's lock state
 isOpenFlag
 nonPayloadFlag                  long    |< 13                                       ' B - (spacer nop) part of writeVetoes in _rxMixed; also used for flagsAndBadF16
                                 mov         cmdDetails, rxByte                      ' C - save CH3 for later processing (address, mute flag, reserved bit 5)
@@ -1417,8 +1467,8 @@ rxH6_F16C0                      mov         _rxCountdown, _rxRemaining          
                                 sub         _rxRemaining, _rxCountdown              ' C - _rxRemaining is number of payload bytes after the coming chunk
                                 add         _rxCountdown, #1                        ' D - pre-undo automatic decrement for F16C1
 rxH7_F16C1
-                        if_z    mov         rxStartWait, rxExit                     'A - ...exit receive loop if no bytes in first chunk (empty payload)
-                                mov         rxHubop, RxWriteByte                    ' B - setup to write payload byte to buffer
+                        if_z    mov         _RxStartWait, rxExit                    'A - ...exit receive loop if no bytes in first chunk (empty payload)
+                                mov         _RxHubop, rxWriteByte                   ' B - setup to write payload byte to buffer
                                 cmp         _rxLockingUser, #0              wz      ' C - test if the driver is locked; z=0 driver locked by _rxLockingUser
                                 muxnz       _rxMixed, driverLockedFlag              ' D - veto all buffer writes if driver is locked
 
@@ -1426,7 +1476,7 @@ rxH7_F16C1
 rxP_0                   if_z    mov         _rxOffset, #8                           'A - go to rxP_F16C0 if all of chunk's bytes have been received
                                 andn        _rxMixed, nonPayloadFlag                ' B - clear the non-payload byte write veto (want to write payload byte to buffer)
                                 or          _rxF16U_SH, _rxF16L             wz      ' C - check header's F16; z=1 OK (need F16U == F16L == 0)
-                        if_nz   mov         rxStartWait, rxParsingErrorExit         ' D - ...exit for bad header checksums
+                        if_nz   mov         _RxStartWait, rxParsingErrorExit        ' D - ...exit for bad header checksums
 
 { rxP_Repeating - any payload byte after the first in a chunk }
 rxP_Repeating           if_nz   mov         _rxOffset, #0                           'A - keep repeating if payload bytes in chunk (automatically go to RxP_F16C0 otherwise)
@@ -1442,7 +1492,7 @@ rxP_F16C0                       or          _rxMixed, nonPayloadFlag            
 
 { rxP_F16C1 - F16 C1 for a payload chunk }
 rxP_F16C1                       add         _rxCountdown, #1                wz      'A - undo automatic decrement; check if _rxCountdown==0 (next chunk empty)
-                        if_z    mov         rxStartWait, rxExit                     ' B - ...exit receive loop if no bytes in next chunk (all bytes received)
+                        if_z    mov         _RxStartWait, rxExit                    ' B - ...exit receive loop if no bytes in next chunk (all bytes received)
 driverLockedFlag                long    |< 14                                       ' C - (spacer nop) part of writeVetoes in _rxMixed
 tooBigFlag                      long    |< 15                                       ' D - (spacer nop) part of writeVetoes in _rxMixed
 
@@ -1453,48 +1503,46 @@ rxP_CheckF16            if_z    subs        _rxOffset, #12                      
                         if_nz   add         flagsAndBadF16, kOneInUpperWord         ' D - increment badF16Count if chunk failed test
 
 
-{ Receive Loop Continue / Exit Instructions
-    These instructions are shifted to rxStartWait in the receive loop to either receive more bytes
-  or exit the loop. }
-rxContinue              if_z    waitpne     rxMask, rxMask
-rxExit                  if_z    jmp         #ReceiveCommandFinish
-rxParsingErrorExit      if_z    jmp         #ParsingError                           'don't exit at parsing error detection -- framing error on stop bit takes precedence
-
-
 { ReceiveCommandFinish
-    This code runs after all packet bytes have been received.
+    This code runs after all packet bytes have been received (jumped to from _RxStartWait).
 }
 ReceiveCommandFinish
-
-                            xor outa, pin27
-
-                                { save the number of low clock counts; used by cont-recal and admin commands }
+                                { Save the number of zero clock counts during the packet (the clock count for when the rx line was transmitting
+                                    a zero bit). This count is used by the continuous recalibration code and some PropCrow admin commands. It is
+                                    also used a reference point for detecting transaction interruptions. }
 '                                mov         cmdLowClocks, phsb
+
+                                { todo: Save the time of packet arrival to enforce any required delays. }
+
+                                { todo: figure out at what point to do continuous recalibration }
 
                                 { check final checksums }
                                 add         _rxF16L, _rxPrevByte                    'compute F16L for last byte
                                 cmpsub      _rxF16L, #255                           '(computing F16U unnecessary since it should be zero)
                                 or          _rxF16U_SH, _rxF16L             wz      'z=1 OK (need F16U == F16L == 0)
 
+                                { In the following ParsingErrorHandler_B may be called. The ReceiveExtra_B page should still be loaded
+                                    from ReceiveCommand. }
+
                                 { what to do for a bad final checksum (z=0) depends on whether it is for header or payload chunk }
                         if_nz   cmp         payloadSize, #1                 wc      'c=1 empty payload => F16 is header's
-                    if_nz_and_c jmp         #ParsingError                           '...exit: bad header F16 is a parsing error
-                        if_nz   add         flagsAndBadF16, kOneInUpperWord         'if last payload chunk is bad, increment badF16Count; deal with it later
+                    if_nz_and_c jmp         #ParsingErrorHandler_B                  '...exit: bad header F16 is a parsing error
+                        if_nz   add         flagsAndBadF16, kOneInUpperWord         'if last payload chunk is bad, increment badF16Count and deal with it later
 
-                                { Verify reserved bit 5 of CH3 is zero. In future Crow versions this may be used for a CRC option. }
+                                { Verify reserved bit 5 of CH3 is zero. }
                                 test        cmdDetails, #%0010_0000         wc      'c=1 out of spec
-                        if_c    jmp         #ParsingError
+                        if_c    jmp         #ParsingErrorHandler_B
 
                                 { extract the address }
                                 mov         _rxTmp_SH, cmdDetails                   'get address in _rxTmp
                                 and         _rxTmp_SH, #cAddressMask        wz      'z=1 broadcast address (address 0)
                                 test        cmdDetails, #cMuteFlag          wc      'c=1 mute response
-                    if_z_and_nc jmp         #ParsingError                           '...exit: broadcast must mute (invalid packet)
+                    if_z_and_nc jmp         #ParsingErrorHandler_B                  '...exit: broadcast must mute (invalid packet)
 
                                 { At this point the packet has passed all parsing tests involving non-reportable errors. }
-                                { z=1 broadcast address, _rxTmp is address }
+                                { z=1 broadcast address, c=0 open transaction (not muted), _rxTmp is address }
 
-rxVerifyAddress         if_nz   cmp         _rxTmp_SH, #0-0                 wz      'verify non-broadcast address; s-field set by LoadSettings
+_RxVerifyAddress        if_nz   cmp         _rxTmp_SH, #0-0                 wz      'verify non-broadcast address; s-field set by LoadSettings
                         if_nz   jmp         #ReceiveCommand                         '...exit: packet intended for different device
 
 
@@ -1503,7 +1551,9 @@ rxVerifyAddress         if_nz   cmp         _rxTmp_SH, #0-0                 wz  
                                   We need to set the isOpen flag of flagsAndBadF16. Also, if a transaction is open
                                     we need to retain the line (make tx pin an output).
                                   Since this is the only place a transaction can be opened we handle the details here. A transaction
-                                    can close in multiple places, so that is handled with a routine (CloseTransaction). }
+                                    can close in multiple places, so that is handled with a routine (CloseTransaction). 
+                                  Declaring the transaction open has to be done before checking for reportable Crow-level
+                                    errors so error responses can be sent. }
                                 muxnc       flagsAndBadF16, isOpenFlag              'set isOpen flag (c=0 open transaction)
                         if_nc   or          dira, txMask                            'if open, retain the line (make tx pin an output) 
 
@@ -1531,9 +1581,9 @@ rxVerifyAddress         if_nz   cmp         _rxTmp_SH, #0-0                 wz  
                     
                                 { todo }
 
-                                { now check some reportable error conditions }
+                                { Now check some reportable Crow-level error conditions. }
                                 
-                                { error check: the driver is/was locked by user code }
+                                { error check: the driver is/was locked by user code (reported as IsBusy) }
                                 test        _rxMixed, driverLockedFlag      wc
                         if_c    mov         _x, #cDriverLocked
                         if_c    mov         _y, _rxLockingUser
@@ -1567,7 +1617,7 @@ ProcessCommand
 
                                 cmp         port_SH, #0                     wz      'z=1 standard admin from Crow specification
                         if_nz   mov         _x, #cPortNotOpen
-                        if_nz   jmp         #ErrorHandler                           '...exit for admin port not open
+                        if_nz   jmp         #ErrorHandler                           '...exit for admin port not open (a reportable Crow error)
 
                         { The command is on admin port 0, fall through to StandardAdminStart. }
  
@@ -2085,8 +2135,10 @@ FinishInit
                                 add         _addr, #1   'skip numPages
 
                                 rdbyte      _x, _addr                           'crowAddress
-                                movs        rxVerifyAddress, _x
+                                movs        _RxVerifyAddress, _x
                                 add         _addr, #1                           'accessLockID
+
+                                {todo: move address to load settings }
 
                                 rdbyte      accessLockID, _addr
 
