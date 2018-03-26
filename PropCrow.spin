@@ -17,19 +17,14 @@ _xinfreq = 5_000_000
   These cMax* settings determine the sizes of the reserved buffers.
   By specification, Crow command payloads may not exceed 2047 bytes (MaxRxPayloadSize).
 }
-'cCmdBufferMaxSize   = 300 'Commands with payloads over this limit will receive OverCapacity error responses.
+cCmdBufferMaxSize   = 300 'Commands with payloads over this limit will receive OverCapacity error responses.
 'cRspBufferMaxSize   = 200 'This is the limit only for the dedicated response buffer. 
 cMaxUserPorts       = 10    'The maximum number of open user ports. May be any two byte value (as memory allows).
 
-cMaxRxPayloadSize   = 300   'may be 2-2047 (lower limit due to mechanism to avoid buffer overruns)
+'cMaxRxPayloadSize   = 300   'may be 2-2047 (lower limit due to mechanism to avoid buffer overruns)
 cMaxTxPayloadSize   = 100   'may be 0-2047
 
-
-
-
-
-
-cRxBufferLongs   = (cMaxRxPayloadSize/4) + 1
+cRxBufferLongs   = (cCmdBufferMaxSize/4) + 1
 cTxBufferLongs   = (cMaxTxPayloadSize/4) + 1
 cUserPortsLongs  = ((cMaxUserPorts*6) / 4) + 1
 
@@ -69,9 +64,7 @@ cPageMaxSize    = 52    'Maximum size of pages.
 cPageLimit      = cPage + cPageMaxSize  'Res'd registers start at cPageLimit.
 
 { Crow Error Codes
-    The Crow v2 specification introduced error responses. Error responses contain a 
-  5-bit error code identifying the error. These are the error codes assigned by the
-  standard.
+    These are the error codes assigned by the Crow standard.
 }
 cDeviceUnavailable      = 0
 cPayloadTooBig          = 1
@@ -83,7 +76,7 @@ cImplementationFault    = 6
 cUserCodeFault          = 7
 
 { Custom Error Codes
-    These must be 32-63.
+    Translated to standard error codes in SendCustomError. These must be 32-63.
 }
 cDriverLocked           = 32
 
@@ -93,7 +86,7 @@ cPropCrowStr        = 0
 cWaitingForStr      = 1
 cToFinishStr        = 2
 cUnknownErrStr      = 3
-
+cSpinStr            = 4
 
 { page indices }
 cCalculateTimings   = 0
@@ -102,15 +95,13 @@ cUserCommand        = 2
 cPropCrowAdmin      = 3
 cSendError          = 4
 cBlinky             = 5
-cOtherStandardAdmin = 6
+cSendEcho           = 6
 cCalc2              = 7
 cCalc3              = 8
 cSendCustomError    = 9
 cSendErrorFinish    = 10
-cNumPages           = 11
-
-
-
+cStandardAdminCont  = 11
+cNumPages           = 12
 cInvalidPage        = 511   'signifies no valid page loaded
 
 
@@ -124,9 +115,9 @@ cInvalidPage        = 511   'signifies no valid page loaded
 { SPR Global Variables }
 
 flagsAndBadF16  = $1F7      'dirb       see flagsAndBadF16 Notes
-port_SH         = $1F0      'sh-par
+port_SH         = $1F0      'sh-par     not needed by implementation after invoking user code
 cmdDetails      = $1F5      'outb       cmdDetails is CH3
-token_SH        = $1F2      'sh-ina
+token_SH        = $1F2      'sh-ina     must remain unchanged for sending responses
 
 { SPR Local Variables }
 
@@ -166,7 +157,7 @@ var
     long    __txBuffer[cTxBufferLongs]
 
 
-pub new | pause
+pub new | __pause
 
     dira[26] := 1
     outa[26] := 1
@@ -184,25 +175,18 @@ pub new | pause
     word[@PageTable][6] := @PropCrowAdmin
     word[@PageTable][8] := @SendErrorPg
     word[@PageTable][10] := @Blinky
-    word[@PageTable][12] := @OtherStandardAdmin
+    word[@PageTable][12] := @SendEcho
     word[@PageTable][14] := @Calc2
     word[@PageTable][16] := @Calc3
     word[@PageTable][18] := @SendCustomErrorPg
     word[@PageTable][20] := @SendErrorFinishPg
+    word[@PageTable][22] := @StandardAdminCont
 
     word[@StringTable][0] := @PropCrowStr
-    word[@StringTable][2] := strsize(@PropCrowStr)
-    word[@StringTable][4] := @WaitingForStr
-    word[@StringTable][6] := strsize(@WaitingForStr)
-    word[@StringTable][8] := @ToFinishStr
-    word[@StringTable][10] := strsize(@ToFinishStr)
-    word[@StringTable][12] := @UnknownErrStr
-    word[@StringTable][14] := strsize(@UnknownErrStr)
-
-
-
-    __string0Addr := @ImplErrorStart
-    __string0Size := strsize(@ImplErrorStart)
+    word[@StringTable][1] := @WaitingForStr
+    word[@StringTable][2] := @ToFinishStr
+    word[@StringTable][3] := @UnknownErrStr
+    word[@StringTable][4] := @SpinStr
 
 
     __numUserPorts      := 3
@@ -220,16 +204,19 @@ pub new | pause
 
     cognew(@Entry, @ControlBlock)
 
-    pause := 160_000_000
+    __pause := 160_000_000
     result := cnt
+
+
+    word[15000] := @SpinStr
 
     repeat
         __lockingUser := 0
         outa[26] := 1
-        waitcnt(result += pause)
-        __lockingUser := 1040
+        waitcnt(result += __pause)
+        __lockingUser := 15000
         outa[26] := 0
-        waitcnt(result += pause)
+        waitcnt(result += __pause)
 
 dat
 
@@ -274,11 +261,10 @@ word    0
 byte    0
 byte    Blinky_end - Blinky + 1
 
-
-'6: OtherStandardAdmin
+'6: SendEcho
 word    0
 byte    0
-byte    OtherStandardAdmin_end - OtherStandardAdmin + 1
+byte    SendEcho_end - SendEcho + 1
 
 '7: Calc2
 word    0
@@ -300,6 +286,10 @@ word    0
 byte    0
 byte    SendErrorFinishPg_end - SendErrorFinishPg + 1
 
+'11: StandardAdminCont
+word    0
+byte    0
+byte    StandardAdminCont_end - StandardAdminCont + 1
   
 { ControlBlock
 
@@ -384,7 +374,7 @@ __rxPin             byte    31                  'rxPin
 __txPin             byte    30                  'txPin
 __rxBufferAddr      word    0-0                 'rxBufferAddr
 __txBufferAddr      word    0-0                 'txBufferAddr
-                    word    cMaxRxPayloadSize   'maxRxPayloadSize
+                    word    cCmdBufferMaxSize   'cCmdBufferMaxSize
                     word    cMaxTxPayloadSize   'maxTxPayloadSize
 __datConstantsAddr  word    0-0                 'datConstantsAddr
 __pageTableAddr     word    0-0                 'pageTableAddr
@@ -394,7 +384,7 @@ __pageTableAddr     word    0-0                 'pageTableAddr
                     byte    0-0                 'cogID
 __objBaseAddr       word    0-0                 'objBaseAddr
                     long    0                   'txScratch
-__lockingUser       word    0
+__lockingUser       word    0                   'lockingUser
                     word    0
 
 
@@ -422,83 +412,152 @@ __lockingUser       word    0
       - numUserPorts in [0, maxNumUserPorts)
 }
 
-
-
+{ DatConstants
+    A block of hub RAM containing constant data used by driver.
+}
 DatConstants
 
-{ This data is the same for all instances of PropCrow. It is kept separate from the
-  control block to make it easier to modify PropCrow to allow multiple instances. }
-
-{ DeviceInfoTemplate (@DatConstants + 0)
-  A template for sending getDeviceInfo responses. The mutable parts (for user ports) are
-  sent separately.
-}
-long    $0000_0200 | ((cPropCrowID & $ff) << 24) | ((cPropCrowID & $ff00) << 8)             'Crow v2, implementationID = cPropCrowID
-long    $0002_0000 | ((cMaxRxPayloadSize & $ff) << 8) | ((cMaxRxPayloadSize & $700) >> 8)   'max commmand payload size, 2 admin ports (upper byte not sent from here) 
-long    $0000_0000 | ((cPropCrowID & $ff) << 24) | ((cPropCrowID & $ff00) << 8)             'admin ports 0 and PropCrowID
-
-{ NibbleTable (@DatConstants + 12)
-  A table of low bit counts for integers 0 to 15. Used for continuous recalibration.
-}
-byte 4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0
-
-{ StringTable (@DatConstants + 28)
+{ StringTable, MUST be first part of DatConstants
+    Placing the string table first saves an instruction of permanent code in the
+  string copying routines.
+    Each entry in the table is a word containing the address of a NUL-terminated string.
 }
 StringTable
 
-'0 - PropCrowSpaceStr
-word    0
-word    0
-
+'0 - PropCrowStr
 '1 - WaitingForStr
 long 0
 
 '2 - ToFinishStr
-long 0
-
 '3 - UnknownErrStr
 long 0
 
+'4 - SpinStr
+'5 - DidNotRespondStr
+long 0
 
-{ ErrorResponseTemplate 
+'6 - WasUnresponsiveStr
+'7 -
+long 0
+
+{ DeviceInfoTemplate, part of DatConstants 
+    A template for sending getDeviceInfo responses. The mutable parts (for user ports) are
+  sent separately.
+}
+DeviceInfoTemplate
+
+
+long    $0000_0200 | ((cPropCrowID & $ff) << 24) | ((cPropCrowID & $ff00) << 8)             'Crow v2, implementationID = cPropCrowID
+long    $0002_0000 | ((cCmdBufferMaxSize & $ff) << 8) | ((cCmdBufferMaxSize & $700) >> 8)   'max commmand payload size, 2 admin ports (top byte not sent from here) 
+long    $0000_0000 | ((cPropCrowID & $ff) << 24) | ((cPropCrowID & $ff00) << 8)             'admin ports 0 and PropCrowID
+
+{ NibbleTable, part of DatConstants
+  A table of low bit counts for integers 0 to 15. Used for continuous recalibration.
+}
+NibbleTable
+byte 4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0
+
+{ ErrorResponseTemplate, part of DatConstants
     This template sets up an error response with no standard details, and one implementation provided
   ascii error message. After writing this template to the response buffer, all that remains is to set
-  the first byte (type OR'd with 0x40), set byte 8 to message length (assuming it is less than 256),
+  the first byte (type OR'd with 0x80), set byte 8 to message length (assuming it is less than 256),
   and write the message at byte 9 (terminating NUL not required).
 } 
 ErrorResponseTemplate
 long    $0003_00FF      'bottom byte written later
 long    $0009_0001      'top byte of message length is zero (assume all messages are less than 256 characters)
 
-{ Strings }
-PropCrowStr     byte "PropCrow", 0
-WaitingForStr   byte "Waiting for ", 0
-ToFinishStr     byte " to finish.", 0
-UnknownErrStr   byte "Unknown error.", 0
-dat
 
+{ Strings }
+PropCrowStr         byte "PropCrow", 0
+WaitingForStr       byte "Waiting for <", 0
+ToFinishStr         byte "> to finish.", 0
+UnknownErrStr       byte "Unknown error.", 0
+SpinStr             byte "Spin Object", 0
+'DidNotRespondStr    byte "> never responded.", 0
+'WasUnresponsiveStr  byte "> was unresponsive.", 0
+
+
+
+
+{ SendEcho (page)
+    This page is invoked by AdminCommandStart for sending an echo response.
+    It is assumed that the command was valid and that a response is expected.
+}
 org cPage
-OtherStandardAdmin
-                                { todo }
-OtherStandardAdmin_end          
-                                jmp         #RecoveryMode
+SendEcho
+                                { The command is echo(numIntermediates=0, filler=[]).
+                                  There is a mandatory second byte in echo commands for the number of intermediate responses
+                                    to send. Only the bottom 3 bits are used, the rest are ignored (so a limit of 7 intermediates).
+                                  Any additional bytes past the second byte are optional filler. They have no meaning to the device
+                                    and their values are ignored. For echo commands they are sent back verbatim to the host. }
+
+                                { Get number of intermediate responses in _y. }
+                                mov         _addr, rxBufferAddr
+                                add         _addr, #1
+                                rdbyte      _y, _addr
+                                and         _y, #%111                       wz
+
+                                { Echo responses sent directly from the command payload buffer. }
+
+                        if_z    jmp         #:finalEcho
+
+:intermediateEcho               mov         _addr, rxBufferAddr
+                                mov         _count, payloadSize
+                                call        #SendIntermediate
+                                djnz        _x, #:intermediateEcho
+
+:finalEcho                      mov         _addr, rxBufferAddr
+                                mov         _count, payloadSize
+SendEcho_end                    jmp        #SendFinalResponse
 fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
 
+
+{ Blinky
+mov     _page, #cBlinky
+jmp     #ExecutePage
+}
 org cPage
-Blinky
+Blinky  
+'                                call        #Trace
+'
+'                                mov         cnt, cnt
+'                                add         cnt, pause
+'                                xor         outa, pin27
+'                                waitcnt     cnt, pause
+'                                jmp         #$-2
 
                                 mov         inb, #12
- 
                                 mov         cnt, cnt
-                                add         cnt, blinkyPause
-
+                                add         cnt, Blinky_end
 :loop                           xor         outa, pin27
-                                waitcnt     cnt, blinkyPause
-                                djnz        inb, #:loop
+                                waitcnt     cnt, Blinky_end
+'                                djnz        inb, #:loop
+                                jmp         #:loop
+'                                jmp         #RecoveryMode
+Blinky_end                      long 4_000_000
+fit cPageLimit
 
-                                jmp         #RecoveryMode
-Blinky_end 
-blinkyPause     long 4_000_000
+
+{ StandardAdminCont
+    Invoked by StandardAdminStart, this page continues the work of processing a standard admin command.
+  At this point we know the command is not ping, echo, or hostPresence.
+    Assumes:    _x = command type (first command payload byte)
+}
+org cPage
+StandardAdminCont
+                                cmp         _x, #0                          wz
+                        if_nz   jmp         #:checkNext
+                                
+                                { getDeviceInfo(), type = 0x00 } 
+                                cmp         payloadSize, #1                 wz      'z=0 payload size incorrect (require exactly one byte)
+                                test        flagsAndBadF16, isOpenFlag      wc      'c=0 no open transaction
+                    if_nc_or_nz jmp         #ReceiveCommand
+                                mov         _page, #cGetDeviceInfo
+                                jmp         #ExecutePage
+:checkNext
+StandardAdminCont_end           jmp         #ReceiveCommand
+fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
 
 
 { PgSendErrorResponse
@@ -509,8 +568,7 @@ blinkyPause     long 4_000_000
   specification for more details.
     To report an error: set _x to the error number, then jump to ErrorHandler. That routine will determine whether
   the error response should be sent, in which case it will execute this page.
-    Some errors require _y to be set as well. A list:
-        cDriverLocked: _y = lockingUser (user code block address)
+    Some errors require _y to be set as well. See SendCustomError.
 }
 org cPage
 SendErrorPg
@@ -521,7 +579,8 @@ SendErrorPg
                                     be translated to a standard error number.
                                   Custom errors may require _y be set to some value. }
 
-                                { The entire payload will be composed in the response buffer and sent on the SendErrorFinish page. }
+                                { The entire payload will be composed in the response buffer and sent on the SendErrorFinish page.
+                                    When executed, that page expects _x is E0, and _count is the size of the response payload. }
 
                                 { Is the error number a standard error number? Custom errors on separate page. }
                                 cmp         _x, #31                     wc
@@ -529,24 +588,25 @@ SendErrorPg
                         if_nc   jmp         #ExecutePage
 
                                 { If a standard error number was passed (_x < 32) we will not include any implementation
-                                    specific details. This means E1 and E2 are undefined and can be skipped. }
-                                mov         _copyDestAddr, #3
+                                    specific details. This means E1 and E2 are undefined and can have any values. }
+                                mov         _copyDestAddr, txBufferAddr
+                                add         _copyDestAddr, #3                   '_copyDestAddr points to start of any standard details 
 
                                 { If no standard details are included we will send a minimal response payload. }
                                 mov         _count, #1
 
                                 { PayloadTooBig sends the supported max size (two bytes) as a standard detail. }
                                 cmp         _x, #cPayloadTooBig         wz
-                        if_z    and         _x, #%0100_0000                     'standard details are included
+                        if_z    or          _x, #%0100_0000                     'standard details are included
                         if_z    add         _count, #4                          '+2 for E1-E2, +2 for details
-                        if_z    mov         _copySrcAddr, deviceInfoAddr
-                        if_z    add         _copySrcAddr, #4
-                        if_z    mov         _copyCount, #2                      'copy from device info template
+                        if_z    mov         _copySrcAddr, datConstantsAddr      'copy max size from device info template
+                        if_z    add         _copySrcAddr, #4*(DeviceInfoTemplate - DatConstants + 1)
+                        if_z    mov         _copyCount, #2
                         if_z    call        #CopyBytes
 
                                 { PortNotOpen sends type (one byte: 0x00=admin, 0x01=user) and port number (2 bytes). }
                                 cmp         _x, #cPortNotOpen                   wz
-                        if_z    and         _x, #%0100_0000                         'standard details are included
+                        if_z    or          _x, #%0100_0000                         'standard details are included
                         if_z    add         _count, #5                              '+2 for E1-E2, +3 for details
                         if_z    test        flagsAndBadF16, #cCommandTypeFlag   wc
                     if_z_and_c  wrbyte      :one, _copyDestAddr                     ':one has one in bottom byte 
@@ -557,15 +617,17 @@ SendErrorPg
                         if_z    add         _copyDestAddr, #1
                         if_z    rol         port_SH, #8
                         if_z    wrbyte      port_SH, _copyDestAddr                  'port LSB
-                        if_z    add         _copyDestAddr, #1
 
                                 mov         _page, #cSendErrorFinish
 SendErrorPg_end                 jmp         #ExecutePage
 fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
 
+
 { SendCustomErrorPg
     Executed if _x is not a standard error number (< 32). Such numbers are used to indicate that an ascii 
   error message should be included, and the custom error number translated to a standard error number.
+    Additional parameters expected:
+            Driver Locked:      _y = user block address for user object with lock
 }
 org cPage
 SendCustomErrorPg
@@ -579,13 +641,15 @@ SendCustomErrorPg
                                 
                                 { Start by copying the template to the response buffer. }
                                 mov         _copyDestAddr, txBufferAddr
-                                mov         _copySrcAddr, deviceInfoAddr
-                                add         _copySrcAddr, #(ErrorResponseTemplate - DatConstants)
+                                mov         _copySrcAddr, datConstantsAddr
+                                add         _copySrcAddr, #4*(ErrorResponseTemplate - DatConstants)
                                 mov         _copyCount, #8
                                 call        #CopyBytes
 
-                                { At this point _copyDestAddr points to byte 9 of buffer. At first _count will hold the message
-                                    length, at :finish it will become the payload size. }
+                                { At this point _copyDestAddr points to byte 8 of buffer. Byte 8 will be written later, so advance
+                                    _copyDestAddr to byte 9.
+                                  At first _count will hold the message length, at :finish it will become the payload size. }
+                                add         _copyDestAddr, #1
 
                                 { _copyMaxSize applies to the CopyString* routines. It should be larger than any expected string
                                     fragment, but small enough that the message length can be guaranteed to be less than 256. }
@@ -599,17 +663,19 @@ SendCustomErrorPg
                                 { Report as IsBusy. }
                                 mov         _x, #cIsBusy 
 
-                                { Message = "Waiting for <object name> to finish." }
+                                { Message = "Waiting for <" + objectName + "> to finish." }
 
-                                { "Waiting for " }
+                                { "Waiting for <" }
                                 mov         _copyIndex, #cWaitingForStr
                                 call        #CopyStringFromTable
                                 mov         _count, _copySize
-                                sub         _copyDestAddr, #1
 
-                                { <object name> }
+                                { objectName, address is first word of userObject block }
+                                rdword      _copySrcAddr, _y
+                                call        #CopyString
+                                add         _count, _copySize
 
-                                { " to finish." }
+                                { "> to finish." }
                                 mov         _copyIndex, #cToFinishStr
                                 call        #CopyStringFromTable
                                 add         _count, _copySize
@@ -623,7 +689,7 @@ SendCustomErrorPg
 
 :finish
                                 { Write the message length to byte 8. }
-                                mov         _addr, rxBufferAddr
+                                mov         _addr, txBufferAddr
                                 add         _addr, #8
                                 wrbyte      _count, _addr
             
@@ -640,6 +706,7 @@ fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
 
 { SendErrorFinishPg
     Executed at the very end of preparing an error response, when it is almost ready to be sent.
+  Assumes _x = E0 and _count = response payload size.
 }
 org cPage
 SendErrorFinishPg
@@ -710,10 +777,11 @@ GetDeviceInfo
 
                                 mov         _count, _x                         'response payload size is 12 + 2*<num user ports> (assumes 2 admin protocols)
                                 shl         _count, #1
-                                add         _count, #12
+                                add         _count, #4*(DeviceInfoTemplate - DatConstants)
                                 call        #SendFinalHeader
 
-                                mov         _addr, deviceInfoAddr
+                                mov         _addr, datConstantsAddr
+                                add         _addr, #12
                                 mov         _count, #7
                                 call        #SendPayloadBytes                       'send up to num reported user ports
 
@@ -722,8 +790,8 @@ GetDeviceInfo
                                 mov         _count, #1
                                 call        #SendPayloadBytes                       'send number of reported user ports
 
-                                mov         _addr, deviceInfoAddr
-                                add         _addr, #8
+                                mov         _addr, datConstantsAddr
+                                add         _addr, #4*(DeviceInfoTemplate - DatConstants + 2)
                                 mov         _count, #4
                                 call        #SendPayloadBytes                       'send open admin ports from template
 
@@ -749,8 +817,6 @@ GetDeviceInfo
 GetDeviceInfo_end               jmp         #ReceiveCommand
 fit cPageLimit 'Page is too big. Reduce code or increase cPageSize.
 
-
-
 org cPage
 
 { CalculateTimings
@@ -760,32 +826,32 @@ CalculateTimings
                                 'call        #LockSharedAccess
 
                                 mov         _addr, par
-                                rdlong      _calcBaud, _addr
+                                rdlong      _loadBaud, _addr
                                 add         _addr, #4
-                                rdword      _calcIBTimeout, _addr
+                                rdword      _loadIBTimeoutMS, _addr                 'in milliseconds
                                 add         _addr, #2
-                                rdword      _calcBreak, _addr
+                                rdword      _loadBreakMS, _addr                     'in milliseconds
                                 add         _addr, #2
-                                rdlong      _calcOptions, _addr
-                                rdlong      _calcClk, #0
+                                rdlong      _loadOptions, _addr
+                                rdlong      _loadClkFreq, #0
+                                rdbyte      _loadClkMode, #4
 
                                 'call        #UnlockSharedAccess
-
                             
-                                mov         _x, _calcClk                    
+                                mov         _x, _loadClkFreq                    
                                 shl         _x, #1
-                                mov         _y, _calcBaud
+                                mov         _y, _loadBaud
                                 call        #Divide
-                                mov         _calcTwoBit, _y
+                                mov         _loadTwoBit, _y
 
-                                mov         bitPeriod0, _calcTwoBit
+                                mov         bitPeriod0, _loadTwoBit
                                 shr         bitPeriod0, #1
                                 min         bitPeriod0, #34                         'bitPeriod0 ready
                            
                                 mov         txBitPeriodA, bitPeriod0
  
                                 mov         bitPeriod1, bitPeriod0
-                                test        _calcTwoBit, #1                     wc
+                                test        _loadTwoBit, #1                     wc
                         if_c    add         bitPeriod1, #1                          'bitPeriod1 ready
 
                                 mov         txBitPeriodB, bitPeriod1
@@ -798,7 +864,6 @@ CalculateTimings
                                 sub         startBitWait, #10                       'startBitWait ready; must not be < 5 (won't if bitPeriod0 >= 34)
             
                                 mov         _page, #cCalc2
-
 CalculateTimings_end
                                 jmp         #ExecutePage
 
@@ -808,10 +873,10 @@ fit cPageLimit 'Page is too big. Reduce code or increase cPageSize.
 
 org cPage
 Calc2
-                                mov         _x, _calcClk
+                                mov         _x, _loadClkFreq
                                 mov         _y, #10
                                 call        #Multiply
-                                mov         _y, _calcBaud
+                                mov         _y, _loadBaud
                                 call        #Divide
                                 mov         stopBitDuration, _y
                                 mov         _x, bitPeriod0
@@ -821,23 +886,23 @@ Calc2
                                 mov         _x, bitPeriod1
                                 shl         _x, #2
                                 sub         stopBitDuration, _x
-                                test        _calcOptions, #cUseTwoStopBits      wc
+                                test        _loadOptions, #cUseTwoStopBits      wc
                         if_c    add         stopBitDuration, bitPeriod1             'stopBitDuration ready                                
 
-                                mov         _x, _calcClk
+                                mov         _x, _loadClkFreq
                                 mov         _y, k1000
                                 call        #Divide
-                                mov         _calcClk, _y                                '_clk is now clocks per millisecond
+                                mov         _loadClkPerMS, _y                              'clocks per millisecond
 
-                                mov         _x, _calcIBTimeout
+                                mov         _x, _loadIBTimeoutMS
                                 call        #Multiply
                                 mov         ibTimeout, _x                           'ibTimeout ready
 
-                                mov         recoveryTime, _calcTwoBit
+                                mov         recoveryTime, _loadTwoBit
                                 shl         recoveryTime, #3                        'recoveryTime ready
 
-                                mov         _x, _calcClk
-                                mov         _y, _calcBreak
+                                mov         _x, _loadClkPerMS
+                                mov         _y, _loadBreakMS
                                 call        #Multiply
                                 mov         _y, recoveryTime
                                 call        #Divide
@@ -857,6 +922,8 @@ k1000                           long    1000
 fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
 
 
+
+
 org cPage
 Calc3 
 
@@ -864,13 +931,13 @@ Calc3
                                     after rxPin. }
 
                                 mov         _addr, par                          'rxPin
-                                add         _addr, #(__rxPin - __controlBlock)
+                                add         _addr, #32
                                 rdbyte      _x, _addr
                                 mov         rxMask, #1
                                 shl         rxMask, _x
                                 movs        ctrb, _x
-                                'movs        lowCounterMode, _x
-                                'mov         ctrb, lowCounterMode
+                                'movs        lowCounterMode, lowCounterMode
+'                                mov         ctrb, lowCounterMode
 
                                 add         _addr, #1                           'txPin (immediately after rxPin)
                                 rdbyte      _x, _addr
@@ -878,14 +945,9 @@ Calc3
                                 shl         txMask, _x 
                                 or          outa, txMask
 
-                                add         _addr, #1                           'txPin
-                                rdbyte      _x, _addr      
-                                mov         txMask, #1
-                                shl         txMask, _x
-                                or          outa, txMask
-                               
+                                call        #Trace
+
 Calc3_end                       jmp         #RecoveryMode
-dat 
             
 org 0
 
@@ -894,30 +956,8 @@ Entry
 { The first 16 cog registers will contain a lookup table after initialization. At launch, it
   contains initialization code. par = address of control block. }
                                 
-                                mov         _addr, par
-
-                                add         _addr, #24                          'serSettingsChangedAddr
-                                mov         serSettingsChangedAddr, _addr
-                
-                                add         _addr, #2                           'numUserPortsAddr
-                                mov         numUserPortsAddr, _addr
-
-                                add         _addr, #2                           'maxUserPorts
-                                rdword      maxUserPorts, _addr
-                                
-                                add         _addr, #2                           'userPortsAddr
-                                rdword      userPortsAddr, _addr
-
-                                add         _addr, #2                           'rxPin, ctrb setup
-                                'rdbyte      _x, _addr
-                                'shl         rxMask, _x
-                                'movs        lowCounterMode, _x
-                                '_xmov         ctrb, lowCounterMode
-
-                                { Setup rx low counter. }
-                                mov         frqb, #1              
-                                mov         ctrb, lowCounterMode            'pin number written in LoadSettings
-
+                                or          dira, pin27
+                                or          outa, pin27
                                 jmp         #FinishInit
 
 
@@ -970,6 +1010,8 @@ Divide_ret                      ret
     section below.
 }
 ReceiveCommand
+                                call        #Trace
+                                xor         outa, pin27
 
                                 { pre-loop initialization }
                                 mov         rxStartWait, rxContinue
@@ -1117,6 +1159,7 @@ rcvyLoop                        waitcnt     cnt, recoveryTime
                                 add         par, recoveryTime
                                 cmp         par, _rcvyCurrPhsb              wz      'z=0 line high at some point
                         if_nz   mov         inb, breakMultiple                      'reset break detection countdown
+                        call    #Trace
                                 mov         _rcvyPrevPhsb, _rcvyCurrPhsb
                                 djnz        inb, #rcvyLoop
 
@@ -1128,7 +1171,10 @@ rcvyLoop                        waitcnt     cnt, recoveryTime
 }
 DetectBaud
 
-BreakHandler
+BreakHandler    
+                                mov         _page, #cBlinky
+                                jmp         #ExecutePage
+
                                 waitpeq     rxMask, rxMask                          'wait for break to end
                                 { todo }
                                 jmp         #ReceiveCommand
@@ -1285,13 +1331,13 @@ rxP_CheckF16            if_z    subs        _rxOffset, #12                      
                         if_nz   add         flagsAndBadF16, kOneInUpperWord         ' D - increment badF16Count if chunk failed test
 
 
-
 { Receive Loop Continue / Exit Instructions
     These instructions are shifted to rxStartWait in the receive loop to either receive more bytes
   or exit the loop. }
 rxContinue              if_z    waitpne     rxMask, rxMask
 rxExit                  if_z    jmp         #ReceiveCommandFinish
-rxParsingErrorExit      if_z    jmp         #ParsingError                           'don't exit at error point -- framing error on stop bit takes precedence
+rxParsingErrorExit      if_z    jmp         #ParsingError                           'don't exit at parsing error detection -- framing error on stop bit takes precedence
+
 
 { ReceiveCommandFinish
     This code runs after all packet bytes have been received.
@@ -1329,6 +1375,7 @@ ReceiveCommandFinish
 rxVerifyAddress         if_nz   cmp         _rxTmp_SH, #0-0                 wz      'verify non-broadcast address; s-field set by LoadSettings
                         if_nz   jmp         #ReceiveCommand                         '...exit: packet intended for different device
 
+
                                 { Now determine if a Crow transaction is open -- it is if responses aren't muted (c=0). The
                                     transaction closes when a final response is sent, or an interruption occurs.
                                   We need to set the isOpen flag of flagsAndBadF16. Also, if a transaction is open
@@ -1363,10 +1410,11 @@ rxVerifyAddress         if_nz   cmp         _rxTmp_SH, #0-0                 wz  
                                 { todo }
 
                                 { now check some reportable error conditions }
-rxErrorChecks 
+                                
                                 { error check: the driver is/was locked by user code }
                                 test        _rxMixed, driverLockedFlag      wc
-                        if_c    mov         _x, #cIsBusy
+                        if_c    mov         _x, #cDriverLocked
+                        if_c    mov         _y, _rxLockingUser
                         if_c    jmp         #ErrorHandler
 
                                 { error check: payload size exceeded capacity }
@@ -1374,113 +1422,71 @@ rxErrorChecks
                         if_c    mov         _x, #cPayloadTooBig
                         if_c    jmp         #ErrorHandler
 
-                                { error check: bad payload checksums (count in upper word of typeAndBadF16) }
+                                { error check: bad payload checksums (count in upper word of typeAndBadF16);
+                                    future: could report count of bad chunks in custom error message }
                                 test        flagsAndBadF16, kUpperWordMask  wz
                         if_nz   mov         _x, #cBadPayloadChecksum
                         if_nz   jmp         #ErrorHandler
 
+                        { A valid command packet has been received addressed to this device (or broadcast). Fall through
+                            to ProcessCommand. (This transition is purely semantic -- ProcessCommand is never called explicitly.) }
+ProcessCommand
                                 { check command type }
                                 test        flagsAndBadF16, #cCommandTypeFlag   wc  'c=1 user command
 
                                 { if user command do port lookup elsewhere }
                         if_c    jmp         #UserPortLookup
 
-                                { admin command }
+                                { admin command -- two admin ports open: 0 and propCrowAdminPort }
 
-
-    {todo: reduce permanent code by making everything except ping and stayAwake handled by paged code }
-
-                                cmp         port_SH, #0                     wz      'standard admin commands from Crow specification
-                        if_z    jmp         #StandardAdmin
-    
-                                cmp         port_SH, propCrowAdminPort      wz      'PropCrow admin commands
+                                cmp         port_SH, propCrowAdminPort      wz      'z=1 PropCrow admin command
                         if_z    mov         _page, #cPropCrowAdmin
                         if_z    jmp         #ExecutePage
 
-                                { admin port is closed }
-                                mov         _x, #cPortNotOpen
-                                jmp         #ErrorHandler 
+                                cmp         port_SH, #0                     wz      'z=1 standard admin from Crow specification
+                        if_nz   mov         _x, #cPortNotOpen
+                        if_nz   jmp         #ErrorHandler                           '...exit for admin port not open
+
+                        { The command is on admin port 0, fall through to StandardAdminStart. }
+ 
+{ StandardAdminStart
+    This is the first level handler for admin commands defined by the Crow standards. The commands ping
+  and hostPresence use permanent code, all other commands use paged code.
+}
+StandardAdminStart
+                                { ping has no command payload and no response payload }
+                                mov         _count, payloadSize             wz      'simultaneously test for and set up ping response (harmless if not ping)
+                        if_z    jmp         #SendFinalResponse                      'safe if muted -- sending routines won't send in that case
+                        
+                                { for all other commands, first byte is command type }
+                                rdbyte      _x, rxBufferAddr
+
+                                { if type not 1 (echo/hostPresence) then continue on paged code }
+                                cmp         _x, #1                          wz
+                        if_nz   mov         _page, #cStandardAdminCont
+                        if_nz   jmp         #ExecutePage
+
+                                { echo/hostPresence require minimum of two bytes of payload }
+                                cmp         payloadSize, #2                 wc      'c=1 payload size too small (require 2+ bytes)
+                        if_c    jmp         #ReceiveCommand
+
+                                { the difference between echo/hostPresence is that echo expects a response }
+                                test        flagsAndBadF16, isOpenFlag      wc      'c=1 open transaction => response expected
+                        if_c    mov         _page, #cSendEcho
+                        if_c    jmp         #ExecutePage                            'echo handled with paged code
+
+                                { The command is hostPresence, for which nothing needs to be done. It is supported as a way for the host
+                                    to send inert data for continuous recalibration. }
+                                
+                                jmp         #ReceiveCommand
 
 
-{ UserPortLookup
-    Called when a user command has arrived. The 
+{ UserPortLookup (jmp)
+    This routine is called by ReceiveCommandFinish to invoke the user code registered to the port.
 }
 UserPortLookup
                                 mov         _page, #cUserCommand
                                 jmp         #ExecutePage
-
-kUpperWordMask long $ffff_0000
-
-
-
-{ UniversalAdmin
-    The universal admin commands (admin port 0) are defined in "Crow Specification v1.txt". There are
-  two commands: ping and getDeviceInfo. ping will be taken care of in permanent code, while getDeviceInfo
-  is done with paged code.
-}
-'UniversalAdmin
-'                                { universal admin command with no payload is ping }
-'                                cmp         payloadSize, #0                 wz      'z=1 ping command
-'                        if_nz   jmp         #:getDeviceInfo
-'                                jmp         #SendFinalResponse                      'send ping response (payloadSize==0), then go to ReceiveCommand
-'
-'                                { only other universal admin command, getDeviceInfo, has 0x00 as payload }
-':getDeviceInfo                  cmp         payloadSize, #1                 wz      'z=1 correct payload size
-'                        if_z    rdbyte      cnt, rxBufferAddr               wz      'z=1 correct payload byte
-'                        if_nz   jmp         #ReceiveCommand                         '...command not getDeviceInfo or ping
-'                                mov         _page, #cGetDeviceInfo                  'perform getDeviceInfo
-'                                jmp         #ExecutePage
-
-
-{ StandardAdmin
-    This is the first level handler for admin commands defined by the Crow standards. The commands ping
-  and echo use permanent code, the other commands use paged code.
-}
-StandardAdmin
-                                { ping() }
-                                cmp         payloadSize, #0                 wz
-                        if_z    jmp         #SendFinalResponse
-                        
-                                { for all other commands, first byte is command code }
-                                rdbyte      _x, rxBufferAddr                wz
-
-                                { getDeviceInfo(), code = 0x00 } 
-                        if_nz   jmp         #:checkIfEcho
-                                cmp         payloadSize, #1                 wz      'z=0 payload size incorrect (require exactly one byte)
-                                test        flagsAndBadF16, isOpenFlag      wc      'c=0 no open transaction
-                    if_nc_or_nz jmp         #ReceiveCommand
-                                mov         _page, #cGetDeviceInfo
-                                jmp         #ExecutePage
-
-:checkIfEcho                    cmp         _x, #1                          wz
-                        if_nz   mov         _page, #cOtherStandardAdmin             'all other standard admin commands taken care of with paged code
-                        if_nz   jmp         #ExecutePage
-                                
-                                { echo(numIntermediates=0, bytes=[]), code = 0x01 }
-
-                                cmp         payloadSize, #2                 wc      'c=1 payload size too small (require 2+ bytes)
-                                test        flagsAndBadF16, isOpenFlag      wz      'z=1 no open transaction (command was muted)
-                    if_c_or_z   jmp         #ReceiveCommand
-
-                                { todo: consider revising echo -- limit on num intermediates; also exact echo (incl. init 2 bytes) }
-
-                                mov         _y, rxBufferAddr
-                                add         _y, #1
-                                rdbyte      _x, _y                          wz      '_x = number of intermediate responses is second byte
-                                add         _y, #1                                  '_y = address of bytes to echo (starting at third byte, if provided)
-                                mov         _z, payloadSize
-                                sub         _z, #2                                  '_z = number of bytes to echo
-
-                        if_z    jmp         #:finalEcho
-
-:intermediateEcho               mov         _addr, _y
-                                mov         _count, _z
-                                call        #SendIntermediate
-                                djnz        _x, #:intermediateEcho
-
-:finalEcho                      mov         _addr, _y
-                                mov         _count, _z
-                                jmp        #SendFinalResponse
 
 
 
@@ -1498,8 +1504,7 @@ StandardAdmin
 'UnlockSharedAccess_ret          ret
 
 
-
-{ TxSendBytes
+{ TxSendBytes (call)
     Internal routine used to send bytes. It also updates the running F16 checksum. It assumes
   the tx pin is already an output. Bytes are sent from the hub.
     This routine should not be called by user code -- use the complete or partial sending routines.
@@ -1509,7 +1514,7 @@ StandardAdmin
             _txCount = number of bytes to send; IMPORTANT: must not be zero
     After:  _txAddr = address immediately after last byte sent
             _txCount = 0
-    Guarantee: z flag not modified
+    Guarantee: z-flag not modified
 }
 TxSendBytes
                                 { First, check if there is no open transaction and abort if that is the case. Although the
@@ -1565,12 +1570,12 @@ TxSendBytes
 TxSendBytes_ret                 ret 
 
 
-{ TxSendAndResetF16
-    Helper routine to send the current F16 checksum (upper first, then lower). It 
+{ TxSendAndResetF16 (call)
+    Internal routine to send the current F16 checksum (upper first, then lower). It 
   also resets the checksum after sending.
 }
 TxSendAndResetF16
-                                { save F16 to hub }
+                                { write F16 to hub }
                                 mov         _txAddr, txScratchAddr
                                 wrbyte      _txF16U, _txAddr
                                 add         _txAddr, #1
@@ -1588,26 +1593,24 @@ TxSendAndResetF16
 TxSendAndResetF16_ret           ret
 
 
-
-
-{ SendFinalHeader, SendIntermediateHeader (Partial Sending Routines)
+{ SendFinalHeader, SendIntermediateHeader (both call) -- Partial Sending Routines
     The partial sending routines exist to allow sending payload bytes from multiple random
-  locations of hub RAM without buffering them first. If sending from a single contiguous block
-  of hub RAM then it is easier to use the complete sending routines.
+  locations of hub RAM without buffering them first. If sending an empty payload, or a payload
+  from a single contiguous block of hub RAM, then it is easier to use the complete sending routines.
     Argument/Results:
         Before: _count = total payload size
-        After:  _count is unchanged (unless it exceeds packet max of 2047)
+        After:  _count is unchanged (unless it exceeds specification max of 2047)
     Usage:  mov     _count, <number of bytes total in payload>
             call    #SendFinalHeader
       <or>  call    #SendIntermediateHeader
       <then, if there is a payload -- repeat until all bytes sent>
-            mov     _count, <number of bytes in payload fragment>
+            mov     _count, <number of bytes in payload fragment>       'sum of fragment sizes must equal total payload size
             mov     _addr, <address of payload fragment>
             call    #SendPayloadBytes
       <finally>
             call    #FinishSending
 }
-SendFinalHeader                 movs        _SendApplyTemplate, #$90                'Note: ReportCrowError assumes s-field of SendFinalHeader is RH0 template
+SendFinalHeader                 movs        _SendApplyTemplate, #$90                'Note: SendError assumes s-field of SendFinalHeader is RH0 template
                                 jmp         #_SendEnforceSizeLimit
 
 SendIntermediateHeader          movs        _SendApplyTemplate, #$80
@@ -1618,7 +1621,7 @@ _SendEnforceSizeLimit           max         _count, kCrowPayloadLimit
                                     transaction and so it could be set once in ReceiveCommandFinish, but doing it here 
                                     saves one or two registers of permanent code. }
                                 mov         _txTmp_SH, _count                       '_txTmp will be RH0
-                                shr         _txTmp_SH, #8                           'this requires _count does not exceed limit
+                                shr         _txTmp_SH, #8                           'this assumes _count does not exceed Crow limit
 _SendApplyTemplate              or          _txTmp_SH, #0-0
                                 mov         _txAddr, txScratchAddr                      
                                 wrbyte      _txTmp_SH, _txAddr                      'RH0
@@ -1627,13 +1630,12 @@ _SendApplyTemplate              or          _txTmp_SH, #0-0
                                 add         _txAddr, #1
                                 wrbyte      token_SH, _txAddr                       'RH2
 
-
                                 { reset F16 }
                                 mov         _txF16L, #0
                                 mov         _txF16U, #0
 
                                 { send RH0-RH2 }
-                                mov         _txAddr, txHeaderAddr
+                                mov         _txAddr, txScratchAddr
                                 mov         _txCount, #3
                                 call        #TxSendBytes
 
@@ -1646,10 +1648,10 @@ _SendApplyTemplate              or          _txTmp_SH, #0-0
                                         rspChunkRemaining - This is reset to 128 at the start of each new chunk. It is decremented
                                                              as payload bytes are sent. When it reaches zero the F16 bytes are sent
                                                              and the process starts over with a new chunk.
-                                        sendF16 flag in flagsAndBadF16 - This flag is set when payload bytes have been sent and
+                                        sendF16 flag in flagsAndBadF16 - This flag is set immediately after payload bytes have been sent and
                                                              is cleared immediately after F16 bytes have been sent. If it is set when
                                                              FinishSending is called it means the F16 bytes for the last chunk still
-                                                             need to be sent (i.e. it was a partial chunk).
+                                                             need to be sent (i.e. it was a remainder chunk).
                                   So, we need to set rspChunkRemaining to 128. The sendF16 is automatically cleared for the first
                                     response, but we still need to clear it for later responses when intermediates are used.   
                                 }
@@ -1660,7 +1662,7 @@ SendFinalHeader_ret
 SendIntermediateHeader_ret      ret
     
 
-{ SendPayloadBytes (Partial Sending Routine)
+{ SendPayloadBytes (call) -- Partial Sending Routine
     This routine sends payload bytes for a response packet that has been started with a
   call to SendFinalHeader or SendIntermediateHeader. It automatically inserts F16 checksums
   into the byte stream at the end of every full chunk. (The F16 for a partial last chunk is
@@ -1671,12 +1673,9 @@ SendIntermediateHeader_ret      ret
   will experience some sort of error (e.g. timeout, unexpected number of bytes, bad checksum).
     Arguments/Results
         Before: _addr = starting address of payload bytes to send
-                _count = number of bytes to send
+                _count = number of bytes to send, may be zero
         After:  _addr = address immediately after last byte sent
                 _count = 0
-    Usage:  mov     _count, <number of bytes to send with this call, may be zero>
-            mov     _addr, <base address of bytes to send>
-            call    #SendPayloadBytes
 }
 SendPayloadBytes
                                 mov         _txCount, _count                wz
@@ -1707,8 +1706,9 @@ SendPayloadBytes
 SendPayloadBytes_ret            ret
 
 
-{ FinishSending (Partial Sending Routine)
-    This routine finishes the response packet by sending final F16 payload checksums, if necessary.
+{ FinishSending (call) -- Partial Sending Routine
+    This routine finishes the response packet by sending the final F16 payload checksums, if necessary.
+    Arguments/Results: none
 }
 FinishSending
                                 test        flagsAndBadF16, #cSendF16Flag   wc
@@ -1716,8 +1716,9 @@ FinishSending
 FinishSending_ret               ret
 
 
-{ SendIntermediateResponse (Complete Sending Routine)
-    This is a convenience routine for sending an intermediate response.
+{ SendIntermediate (call) -- Complete Sending Routine
+    This is a convenience routine for sending an intermediate response with an empty payload,
+  or a payload which is at a single location.
     Arguments/Results:
         Before: _addr = starting payload address
                 _count = payload size                
@@ -1730,13 +1731,15 @@ SendIntermediate                call        #SendIntermediateHeader
 SendIntermediate_ret            ret
 
 
-{ SendFinalResponse, SendFinalAndReturn (Complete Sending Routines)
-    These are convenience routines for sending a final response. They differ in what happens
-  afterwards: either returning to the calling code, or immediately jumping to ReceiveCommand.
-    Usage: set payloadSize and payloadAddr
-            call    #SendFinalAndReturn
-            -or-
-            jmp     #SendFinalResponse
+{ SendFinalResponse (jmp), SendFinalAndReturn (call) -- Complete Sending Routines
+    These are convenience routines for sending a final response with an empty payload, or a payload
+  which is at a single location. These routines differ in what happens after the packet is sent:
+  SendFinalResponse goes to ReceiveCommand after sending, SendFinalAndReturn returns to the calling code.
+    Arguments/Results:
+        Before: _addr = starting payload address
+                _count = payload size                
+        After:  _addr = address immediately after last byte sent
+                _count = 0
 }
 SendFinalResponse               movs        SendFinalAndReturn_ret, #ReceiveCommand
 SendFinalAndReturn              call        #SendFinalHeader
@@ -1744,7 +1747,6 @@ SendFinalAndReturn              call        #SendFinalHeader
                                 call        #FinishSending
                                 call        #CloseTransaction
 SendFinalAndReturn_ret          ret
-
 
 
 { RX Mixed Notes
@@ -1774,17 +1776,13 @@ rxMixedReset            long    $3fff       'byteCount = -1, nonPayloadFlag = 1,
 'nonPayloadFlag, driverLockedFlag, tooBigFlag, and writeVetoesMask are located in shifted parsing code as spacer nops
 
 
-lowCounterMode          long    $3000_0000
-
-cmdBufferMaxSize      long cCmdBufferMaxSize
-
-{ ExecutePage
+{ ExecutePage (jmp)
     The code for PropCrow exceeds the cog's space, so a paging mechanism must be used. This paging mechanism
   also makes it easier to expand the base PropCrow implementation.
     Rules:
       - Code execution starts at the first register of the page.
-      - Pages aren't reloaded if avoidable (so the code must reset itself if it self-modifies).
-      - Pages aren't cached back to the hub (so they can't store information).
+      - Pages aren't reloaded if avoidable, so the code must reset itself if it self-modifies.
+      - Pages aren't cached back to the hub, so they can't store information.
       - The page table is considered static (unlike the user ports table), so it is not protected by a hardware lock.
     Arguments/Results
         Before: _page = index in page table of page to execute
@@ -1803,23 +1801,22 @@ ExecutePage
 
                                 shl         _page, #2                               '@(PageTable[i]) = @PageTable + 4*i
                                 add         _page, pageTableAddr
-                                rdword      _pageAddr, _page                        '_pageAddr is address of page
+                                rdword      _pageAddr, _page                        '_pageAddr is address of page in hub
                                 add         _page, #3
                                 rdbyte      _pageTmp_SH, _page                      '_pageTmp is page size in longs
  
-:load                           rdlong      0-0, _page
+:load                           rdlong      0-0, _pageAddr
                                 add         :load, kOneInDField
-                                add         _page, #4
+                                add         _pageAddr, #4
                                 djnz        _pageTmp_SH, #:load
 
                                 jmp         #cPage
 
 
-{ CloseTransaction
+{ CloseTransaction (call)
     Used to close the transaction, preventing any more transmissions until the next command.
   Redundant calls are safe.
     Arguments/Results: none
-    Usage:  call    #CloseTransaction
 }
 CloseTransaction                andn        flagsAndBadF16, isOpenFlag              'clear isOpen flag
                                 andn        dira, txMask                            'release the line (make tx pin high-z)
@@ -1831,11 +1828,13 @@ CloseTransaction_ret            ret
   Crow error response. This routine determines whether the error should be reported, and then calls the
   sending code if necessary. In any case execution eventually goes to ReceiveCommand. 
     Arguments/Results
-        Before: _x = error code, (optional: _y = data for some custom errors)
+        Before:  _x  = error code,
+                (_y) = extra data for some custom errors
+        After:  not applicable, execution goes to ReceiveCommand
 }
 ErrorHandler
-                                test        otherOptions, #cSendErrorFlag   wc  'c=0 error responses disabled
-                                test        flagsAndBadF16, isOpenFlag      wz  'z=1 no open transaction
+                                test        otherOptions, #cSendErrorFlag   wc      'c=0 error responses disabled
+                                test        flagsAndBadF16, isOpenFlag      wz      'z=1 no open transaction
                    if_nc_or_z   jmp         #ReceiveCommand 
 
                                 mov         _page, #cSendError
@@ -1846,32 +1845,34 @@ ErrorHandler
     These routines are for copying NUL-terminated strings from one location in hub RAM to another.
   The CopyStringFromTable routine is for copying implementation defined strings that are in
   the StringTable (which is in the DatConstants block).
+    Note: no NUL is written at the end of the destination string -- it will have to be added intentionally
+  by the calling code. This behavior reduces code size when using these routines to assemble larger
+  strings from string fragments.
 
   CopyString
     This routine copies a NUL-terminated string up to a given maximum size (not including the NUL).
-  There must be at least _copyMaxSize+1 free bytes starting at _copyDestAddr since this routine will
-  always write a NUL, regardless if it copies one or not.
+  There must be at least _copyMaxSize free bytes starting at _copyDestAddr. No NUL is written to the 
+  destination string, regardless of whether the routine encountered one in the source string or not.
     Before: _copySrcAddr = address of NUL-terminated string to copy
-            _copyDestAddr = address to copy string to (it always writes a NUL at end)
+            _copyDestAddr = address to copy string to (NUL is never copied or written)
             _copyMaxSize = maximum size of string to copy, not including NUL
-    After:  _copySrcAddr = address immediately after last byte copied (which may not have been a NUL)
-            _copyDestAddr = address immediately after NUL
-            _copySize = the size of the string copied, not including the NUL which was written
+    After:  _copySrcAddr = address immediately after last byte copied (may/not have been a NUL, see z-flag)
+            _copyDestAddr = address immediately after last non-NUL character
+            _copySize = the size of the string copied, not including any NUL
             _copyMaxSize unchanged
             z-flag = 1: _copySrcAddr-1 is NUL, 0: _copySrcAddr-1 is not NUL
 
   CopyStringFromTable
     For this routine the string to copy is identified by its index in the table. The routine then loads
   the address and proceeds as with CopyString (all strings in StringTable should be NUL-terminated).
-    Before: _copyIndex = the index of the string in StringTable (in the DatConstants block)
+    Before: _copyIndex = the index of the string in StringTable (located in the DatConstants block)
             _copyMaxSize = maximum size of string to copy, not including NUL
-            _copyDestAddr = the address to copy the string to (a NUL is always written at end)
+            _copyDestAddr = the address to copy the string to
     After:  same as for CopyString
 }
 CopyStringFromTable
-                                shl         _copyIndex, #2                              '@(StringTable[i]) = @StringTable + 4*i
-                                add         _copyIndex, deviceInfoAddr
-                                add         _copyIndex, #(StringTable-DatConstants)
+                                shl         _copyIndex, #1                              '@(StringTable[i]) = @StringTable + 2*i
+                                add         _copyIndex, datConstantsAddr                'assuming @StringTable = @DatConstants
                                 rdword      _copySrcAddr, _copyIndex
 CopyString
                                 mov         _copyTmp_SH, _copyMaxSize
@@ -1879,21 +1880,14 @@ CopyString
 
 :loop                           rdbyte      _copyByte, _copySrcAddr             wz
                                 add         _copySrcAddr, #1
+                        if_z    jmp         CopyString_ret                              'NUL found, exit now without copying it
                                 wrbyte      _copyByte, _copyDestAddr
                                 add         _copyDestAddr, #1
-                        if_z    jmp         CopyString_ret                              'copied NUL, so all done
                                 add         _copySize, #1
                                 djnz        _copyTmp_SH, #:loop
-
-                                { Didn't copy NUL, need to write one manually. }
-                                wrbyte      kOneInDField, _copyDestAddr                 'kOneInDField has bottom byte zero
-                                add         _copyDestAddr, #1
-
 CopyStringFromTable_ret
 CopyString_ret                  ret
                                 
-
-
 
 { CopyBytes (call)
     Before: _copySrcAddr = address of bytes to copy
@@ -1912,17 +1906,28 @@ CopyBytes
 CopyBytes_ret                   ret
 
 
+{ Trace (call)
+    Writes the current program counter and system clock (cnt) to hub for debugging.
+    Usage:  call   #Trace
+}
+Trace                           wrword      Trace_ret, tracePcAddr
+                                mov         traceCnt, cnt
+                                wrlong      traceCnt, traceCntAddr
+Trace_ret                       ret
+tracePcAddr     long    8
+traceCntAddr    long    12
+traceCnt        long    0
 
 
 
+{ Misc Variables and Constants}
+lowCounterMode      long    $3000_0000
+cmdBufferMaxSize    long    cCmdBufferMaxSize
+kUpperWordMask      long    $ffff_0000
 
 pin27 long |< 27
 
-'pause long 8_000_000
-total long 0
-
-
-
+pause long 40_000_000
 
 { This is the end of permanent code. Initialization code, paged code, and res'd variables follow. }
 
@@ -1932,43 +1937,55 @@ fit cPage 'On error: permanent code exceeds space allotted. Reduce code or incre
 { FinishInit
     The initialization process started in the first 16 registers, which will be overwritten with a nibble-based
   low bit count table (for the continuous recalibration code). Initialization continues here, in the code page
-  space. This code will be overwritten when the the first page is executed.
+  space. Some or all of this code will be overwritten when the the first page is executed.
 
 }
 FinishInit
-                                or          dira, pin27
-                                or          outa, pin27
+                                wrword      par, #8       'zero trace address
+                                wrlong      par, #12
+                                mov         _addr, par
+                                add         _addr, #26
 
+                                mov         numUserPortsAddr, _addr
+                                add         _addr, #2                           'maxUserPorts
 
+                                rdword      maxUserPorts, _addr
+                                add         _addr, #2                           'userPortsAddr
 
-                                add         _addr, #1                           'txPin
-'                                rdbyte      _x, _addr      
-'                                mov         txMask, #1
-'                                shl         txMask, _x
-'                                or          outa, txMask
+                                rdword      userPortsAddr, _addr
+                                add         _addr, #2
+
+                                add         _addr, #2                           'skip rx and tx pin
+
+                                { Setup rx low counter. }
+                                mov         frqb, #1              
+                                mov         ctrb, lowCounterMode            'pin number written in LoadSettings
                                
-                                add         _addr, #1                           'rxBufferAddr, cmdBufferResetAddr
+                                'rxBufferAddr, cmdBufferResetAddr
                                 rdword      rxBufferAddr, _addr 
                                 mov         cmdBufferResetAddr, rxBufferAddr    'cmdBufferResetAddr = cmdBufferAddr - 1 due to pre-increment for writes
                                 sub         cmdBufferResetAddr, #1
+                                add         _addr, #2
+ 
+                                rdword      txBufferAddr, _addr                          'txBufferAddr
+                                add         _addr, #2
 
-                                add         _addr, #2                           'txBufferAddr
-                                rdword      txBufferAddr, _addr
+                                'rdword      maxRxPayloadSize, _addr                           'maxRxPayloadSize
+                                add         _addr, #4               'skip cmdBufferMaxSize and rspBufferMaxSize
 
-                                add         _addr, #2                           'maxRxPayloadSize
-                                'rdword      maxRxPayloadSize, _addr
+                                rdword      datConstantsAddr, _addr             'datConstantsAddr
+                                add         _addr, #2
 
-                                add         _addr, #4                           'deviceInfoAddr
-                                rdword      deviceInfoAddr, _addr
+                                rdword      pageTableAddr, _addr                'pageTableAddr
+                                add         _addr, #2
 
-                                add         _addr, #2                           'pageTableAddr
-                                rdword      pageTableAddr, _addr
 
-                                add         _addr, #3                           'crowAddress
-                                rdbyte      _x, _addr
+                                add         _addr, #1   'skip numPages
+
+                                rdbyte      _x, _addr                           'crowAddress
                                 movs        rxVerifyAddress, _x
-
                                 add         _addr, #1                           'accessLockID
+
                                 rdbyte      accessLockID, _addr
 
                                 add         _addr, #1                           'cogID (written to hub)
@@ -1986,86 +2003,91 @@ FinishInit
                                 add         _addr, #25
                                 rdbyte      otherOptions, _addr
 
-                                { load low bit count table from hub into registers 0-15 (this saves a trivial amount of hub memory) }
+                                { Load low bit count table from hub into registers 0-15 (this saves a trivial amount of hub memory). }
                                 mov         inb, #16
-                                mov         _addr, par
-                                add         _addr, #16
+                                mov         _addr, datConstantsAddr
+                                add         _addr, #(NibbleTable - DatConstants)
 :loop                           rdbyte      _x, _addr
-                                shl         _x, #16                             'lowBitCount is in upper word of _rxMixed (see "_rxMixed Notes")
+                                shl         _x, #16                             'lowBitCount is in upper word of _rxMixed (see "RX Mixed Notes")
                                 mov         0-0, _x
                                 add         $-1, kOneInDField
                                 add         _addr, #1
                                 djnz        inb, #:loop
 
+                                { todo: calculate -> load }
                                 { finally, execute the CalculateTimings page; it will automatically go to RecoveryMode afterwards }
                                 mov         _page, #cCalculateTimings
                                 jmp         #ExecutePage
 
 
-fit cPageLimit 'On error: the initialization code exceeds space available. Reduce code, or increase cPage and/or cPageMaxSize.
+fit cPageLimit 'On error: FinishInit exceeds space available. Reduce code, or increase cPage and/or cPageMaxSize.
 
+
+{ Res'd Variables 
+    These start after the paged code registers.
+    Note that some variables are aliased with special purpose registers -- these are defined in the CON block.
+}
 org cPageLimit
-
-{ ---- }
-
-'payloadAddr     res
 
 { Paging Temporaries
     These registers will be undefined after every call to ExecutePage, so alias them with care.
 }
-
 _page           res
 _pageAddr       res
 
 { ---- }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+_loadBaud
 _rcvyCurrPhsb
 _rxLastWait1
 _txMaxChunkRemaining    res
 
+_loadIBTimeoutMS
 _copyIndex
-_calcOptions
-_rxAddr
+_rxAddr         res
 
+_loadBreakMS
 _copySize
 _rcvyPrevPhsb
 _txAddr         res
 
-'_utilCount
+_loadOptions
 _copyMaxSize
-_calcClk
 _rxCountdown
 _txCount        res
 
+_loadClkFreq
 _copyCount
-_calcBaud
 _rxMixed  
 _txNextByte     res
 
+_loadClkMode
 _copyDestAddr
 _rxLockingUser
-'_utilFlags
-_calcIBTimeout
 _txByte         res
 
-'_utilY
+_loadTwoBit
 _copySrcAddr
-_calcBreak
 _txF16L
 _rxPrevByte         res
 
-'_utilX
+_loadClkPerMS
 _copyByte
-_calcTwoBit
 _txF16U
 _rxRemaining        res
-
-
-
-
-
-
-
 
 
 { Semi-Global Variables }
@@ -2100,7 +2122,7 @@ rxPhsbReset     res
 otherOptions    res
 
 { Constants (after initialization) }
-deviceInfoAddr          res
+datConstantsAddr        res
 accessLockID            res
 rxBufferAddr            res
 cmdBufferResetAddr      res
@@ -2113,7 +2135,6 @@ userPortsAddr           res
 txScratchAddr           res
 driverLockAddr          res
 
-serSettingsChangedAddr  res
 pageTableAddr           res
 
 
