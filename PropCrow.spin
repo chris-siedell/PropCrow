@@ -56,12 +56,35 @@ cAllowRemoteChanges = %0000_0010
 cSendErrorFlag      = %0000_0100
 
 { Paging Constants 
-    These control the register layout in the cog. If you're reading this you're probably
-  are getting FIT errors from the compiler.
+    Paging is used to increase code space. This is the layout of cog registers:
+
+        From          | To (inclusive)    | Description
+       ---------------|-------------------|------------------------------------
+        0             | cPageBLimit-1     | Page B, also Entry initialization
+        cPageBLimit   | cPageA-1          | Permanent
+        cPageA        | cPageALimit-1     | Page A, also FinishInit (may start in Permanent)
+        cPageALimit   | 495               | Res'd
+
+    See the LoadPageB and ExecutePageA routines for more information.
+    If you're reading this you might be getting FIT errors from the compiler. Here are
+  some remedies for various situations:
+    - Page too big
+        Decrease page's code, or increase cPageAMaxSize or cPageBLimit.
+    - Permanent code too big
+        Decrease permanent code, decrease cPageBLimit, or increase cPageA.
+    - FinishInit too big.
+        Decrease FinishInit code (maybe move to Entry initialization area), decrease
+        cPageBLimit, or increase cPageA or cPageAMaxSize.
+    - Entry initialization too big.
+        Decrease Entry initialization code (maybe move to FinishInit), or increase cPageBLimit.
+    - Too many res'd variables.
+        Decrease variables, or decrease cPageA or cPageAMaxSize.
 }
-cPage           = 402  'Starting address of paged code. Permanent code is below this address.
-cPageMaxSize    = 52    'Maximum size of pages.
-cPageLimit      = cPage + cPageMaxSize  'Res'd registers start at cPageLimit.
+cPageBLimit     = 35
+cPageA          = 408
+cPageAMaxSize   = 37
+cPageALimit     = cPageA + cPageAMaxSize
+
 
 { Crow Error Codes
     These are the error codes assigned by the Crow standard.
@@ -87,6 +110,7 @@ cWaitingForStr      = 1
 cToFinishStr        = 2
 cUnknownErrStr      = 3
 cSpinStr            = 4
+cDefaultUserName    = 5
 
 { page indices }
 cCalculateTimings   = 0
@@ -101,7 +125,8 @@ cCalc3              = 8
 cSendCustomError    = 9
 cSendErrorFinish    = 10
 cStandardAdminCont  = 11
-cNumPages           = 12
+cReceiveExtra_B     = 12
+cNumPages           = 13
 cInvalidPage        = 511   'signifies no valid page loaded
 
 
@@ -181,12 +206,14 @@ pub new | __pause
     word[@PageTable][18] := @SendCustomErrorPg
     word[@PageTable][20] := @SendErrorFinishPg
     word[@PageTable][22] := @StandardAdminCont
+    word[@PageTable][24] := @ReceiveExtra_B
 
     word[@StringTable][0] := @PropCrowStr
     word[@StringTable][1] := @WaitingForStr
     word[@StringTable][2] := @ToFinishStr
     word[@StringTable][3] := @UnknownErrStr
     word[@StringTable][4] := @SpinStr
+    word[@StringTable][5] := @DefaultUserName
 
 
     __numUserPorts      := 3
@@ -208,7 +235,7 @@ pub new | __pause
     result := cnt
 
 
-    word[15000] := @SpinStr
+    word[15000] := string("Test Object")
 
     repeat
         __lockingUser := 0
@@ -290,6 +317,12 @@ byte    SendErrorFinishPg_end - SendErrorFinishPg + 1
 word    0
 byte    0
 byte    StandardAdminCont_end - StandardAdminCont + 1
+
+'12: ReceiveExtra_B
+word    @ReceiveExtra_B
+byte    0
+byte    ReceiveExtra_B_end - ReceiveExtra_B + 1
+
   
 { ControlBlock
 
@@ -433,11 +466,11 @@ long 0
 long 0
 
 '4 - SpinStr
-'5 - DidNotRespondStr
+'5 - DefaultUserName 
 long 0
 
-'6 - WasUnresponsiveStr
-'7 -
+'6 - 
+'7 - 
 long 0
 
 { DeviceInfoTemplate, part of DatConstants 
@@ -474,17 +507,104 @@ WaitingForStr       byte "Waiting for <", 0
 ToFinishStr         byte "> to finish.", 0
 UnknownErrStr       byte "Unknown error.", 0
 SpinStr             byte "Spin Object", 0
+DefaultUserName     byte "User Object", 0
 'DidNotRespondStr    byte "> never responded.", 0
 'WasUnresponsiveStr  byte "> was unresponsive.", 0
 
 
+{ ReceiveExtra_B
+    This page starts with a 16 register nibble table. This table contains the number of zero bits for the
+  numbers 0 to 15. It is used by the continuous recalibration code -- the values are in the upper word since
+  that's where zeroBitCount is located in _rxMixed.
+}
 
+org 0
+ReceiveExtra_B
+long    $0004_0000
+long    $0003_0000
+long    $0003_0000
+long    $0002_0000
+long    $0003_0000
+long    $0002_0000
+long    $0002_0000
+long    $0001_0000
+long    $0003_0000
+long    $0002_0000
+long    $0002_0000
+long    $0001_0000
+long    $0002_0000
+long    $0001_0000
+long    $0001_0000
+long    $0000_0000
+
+FramingError
+                                { todo: add logic }
+                                jmp         #RecoveryMode
+
+                            {todo: increment consecutive framing errors count
+                                    if count reaches limit and baud detect enabled, go to baud detect
+                                    otherwise, force reload the settings }
+ParsingError
+                       
+                            {todo: check if settings have changed, if so then reload
+                                    otherwise, go to recovery mode }
+ 
+{ RecoveryMode
+  When framing or parsing errors occur the implementation enters recovery mode. In this mode the implementation
+    waits for the rx line to be in high-idle for a certain period of time before attempting to receive another
+    command. If the line is low for long enough then the implementation determines that a break condition has occurred.
+  See page 99.
+}
+'todo (3/17): does the removal of the ctrb off code change any timings?
+RecoveryMode
+                                mov         cnt, recoveryTime
+                                add         cnt, cnt
+                                mov         _rcvyPrevPhsb, phsb                     'first interval always recoveryTime+1 counts, so at least one loop for break 
+                                mov         inb, breakMultiple                      'sh-inb is countdown to break detection
+rcvyLoop                        waitcnt     cnt, recoveryTime
+                                mov         _rcvyCurrPhsb, phsb
+                                cmp         _rcvyPrevPhsb, _rcvyCurrPhsb    wz      'z=1 line always high, so exit
+                        if_z    jmp         #ReceiveCommand                         '...exit: line is idle -- ready for next command
+                                mov         par, _rcvyPrevPhsb
+                                add         par, recoveryTime
+                                cmp         par, _rcvyCurrPhsb              wz      'z=0 line high at some point
+                        if_nz   mov         inb, breakMultiple                      'reset break detection countdown
+                                mov         _rcvyPrevPhsb, _rcvyCurrPhsb
+                                djnz        inb, #rcvyLoop
+
+                        { fall through when a break is detected }
+
+{ DetectBaud
+  PropCrow interprets the break condition as a command to enter baud detection mode.
+}
+DetectBaud
+
+BreakHandler    
+                                waitpeq     rxMask, rxMask                          'wait for break to end
+
+                                mov         _page, #cBlinky
+                                jmp         #ExecutePageA
+
+ReceiveExtra_B_end              long 0
+
+fit cPageBLimit 'On error: page too big. Refer to Paging Constants.
+
+{
+JumpTest
+                                mov         inb, #12
+                                mov         cnt, cnt
+                                add         cnt, fourMill
+:loop                           xor         outa, pin27
+                                waitcnt     cnt, fourMill
+                                jmp         #:loop
+fourMill                      
+}
 
 { SendEcho (page)
     This page is invoked by AdminCommandStart for sending an echo response.
     It is assumed that the command was valid and that a response is expected.
 }
-org cPage
+org cPageA
 SendEcho
                                 { The command is echo(numIntermediates=0, filler=[]).
                                   There is a mandatory second byte in echo commands for the number of intermediate responses
@@ -510,14 +630,14 @@ SendEcho
 :finalEcho                      mov         _addr, rxBufferAddr
                                 mov         _count, payloadSize
 SendEcho_end                    jmp        #SendFinalResponse
-fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
+fit cPageALimit 'On error: page is too big. Reduce code or increase cPageSize.
 
 
 { Blinky
 mov     _page, #cBlinky
-jmp     #ExecutePage
+jmp     #ExecutePageA
 }
-org cPage
+org cPageA
 Blinky  
 '                                call        #Trace
 '
@@ -536,7 +656,7 @@ Blinky
                                 jmp         #:loop
 '                                jmp         #RecoveryMode
 Blinky_end                      long 4_000_000
-fit cPageLimit
+fit cPageALimit
 
 
 { StandardAdminCont
@@ -544,7 +664,7 @@ fit cPageLimit
   At this point we know the command is not ping, echo, or hostPresence.
     Assumes:    _x = command type (first command payload byte)
 }
-org cPage
+org cPageA
 StandardAdminCont
                                 cmp         _x, #0                          wz
                         if_nz   jmp         #:checkNext
@@ -554,10 +674,10 @@ StandardAdminCont
                                 test        flagsAndBadF16, isOpenFlag      wc      'c=0 no open transaction
                     if_nc_or_nz jmp         #ReceiveCommand
                                 mov         _page, #cGetDeviceInfo
-                                jmp         #ExecutePage
+                                jmp         #ExecutePageA
 :checkNext
 StandardAdminCont_end           jmp         #ReceiveCommand
-fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
+fit cPageALimit 'On error: page is too big. Reduce code or increase cPageSize.
 
 
 { PgSendErrorResponse
@@ -570,7 +690,7 @@ fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
   the error response should be sent, in which case it will execute this page.
     Some errors require _y to be set as well. See SendCustomError.
 }
-org cPage
+org cPageA
 SendErrorPg
                                 { It is assumed that _x has been set to a standard error number (< 32) or a custom error number (32-63).
                                   If _x is a standard error number then the error response will include no implementation
@@ -585,7 +705,7 @@ SendErrorPg
                                 { Is the error number a standard error number? Custom errors on separate page. }
                                 cmp         _x, #31                     wc
                         if_nc   mov         _page, #cSendCustomError
-                        if_nc   jmp         #ExecutePage
+                        if_nc   jmp         #ExecutePageA
 
                                 { If a standard error number was passed (_x < 32) we will not include any implementation
                                     specific details. This means E1 and E2 are undefined and can have any values. }
@@ -619,8 +739,8 @@ SendErrorPg
                         if_z    wrbyte      port_SH, _copyDestAddr                  'port LSB
 
                                 mov         _page, #cSendErrorFinish
-SendErrorPg_end                 jmp         #ExecutePage
-fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
+SendErrorPg_end                 jmp         #ExecutePageA
+fit cPageALimit 'On error: page is too big. Reduce code or increase cPageSize.
 
 
 { SendCustomErrorPg
@@ -629,7 +749,7 @@ fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
     Additional parameters expected:
             Driver Locked:      _y = user block address for user object with lock
 }
-org cPage
+org cPageA
 SendCustomErrorPg
                                 { Currently, all custom errors have no standard details, and just one implementation detail (the
                                     ascii message). This makes things relatively simple:
@@ -670,10 +790,19 @@ SendCustomErrorPg
                                 call        #CopyStringFromTable
                                 mov         _count, _copySize
 
-                                { objectName, address is first word of userObject block }
-                                rdword      _copySrcAddr, _y
-                                call        #CopyString
-                                add         _count, _copySize
+                                { objectName address is first word of userObjectBlock (_y). If the address is NULL
+                                    then the default string is used. }
+
+                                rdword      _copySrcAddr, _y            wz
+                        if_nz   jmp         #:nameNotNull
+
+                                mov         _copyIndex, #cDefaultUserName       'use default name
+                                call        #CopyStringFromTable
+                                jmp         #:doneWithName
+
+:nameNotNull                    call        #CopyString
+
+:doneWithName                   add         _count, _copySize
 
                                 { "> to finish." }
                                 mov         _copyIndex, #cToFinishStr
@@ -700,15 +829,15 @@ SendCustomErrorPg
                                 or          _x, #%1000_0000
                                
                                 mov         _page, #cSendErrorFinish
-SendCustomErrorPg_end           jmp         #ExecutePage 
-fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
+SendCustomErrorPg_end           jmp         #ExecutePageA
+fit cPageALimit 'On error: page is too big. Reduce code or increase cPageSize.
 
 
 { SendErrorFinishPg
     Executed at the very end of preparing an error response, when it is almost ready to be sent.
   Assumes _x = E0 and _count = response payload size.
 }
-org cPage
+org cPageA
 SendErrorFinishPg
                                 { Write first byte of response payload. }
                                 mov         _addr, txBufferAddr
@@ -716,12 +845,12 @@ SendErrorFinishPg
                 
                                 { Both _count and _addr ready, so send. }
 SendErrorFinishPg_end           jmp         #SendFinalResponse
-fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
+fit cPageALimit 'On error: page is too big. Reduce code or increase cPageSize.
 
 
 { UserCommandPg
 }
-org cPage
+org cPageA
 UserCommand
 
                                 'mov         payloadAddr, rxBufferAddr
@@ -738,7 +867,7 @@ UserCommand
                                 mov         payloadSize, #2
                                 mov         payloadAddr, txBufferAddr
 }
-
+{
                                 'report calibration observations
                                 mov         _addr, txBufferAddr
                                 wrlong      cmdLowBits, _addr
@@ -752,22 +881,22 @@ UserCommand
                                 call        #Divide
                                 add         _addr, #4
                                 wrlong      _y, _addr
-
+}
                                 mov         _count, #16
                                 mov         _addr, rxBufferAddr
 
 UserCommand_end                 jmp         #SendFinalResponse
-fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
+fit cPageALimit 'On error: page is too big. Reduce code or increase cPageSize.
 
 
-org cPage
+org cPageA
 PropCrowAdmin
                                 mov         _addr, #0
                                 mov         _count, #8
 PropCrowAdmin_end               jmp         #SendFinalResponse
-fit cPageLimit 'Page is too big. Reduce code or increase cPageSize.
+fit cPageALimit 'Page is too big. Reduce code or increase cPageSize.
 
-org cPage
+org cPageA
 GetDeviceInfo
                                 'call        #LockSharedAccess
 
@@ -777,11 +906,11 @@ GetDeviceInfo
 
                                 mov         _count, _x                         'response payload size is 12 + 2*<num user ports> (assumes 2 admin protocols)
                                 shl         _count, #1
-                                add         _count, #4*(DeviceInfoTemplate - DatConstants)
+                                add         _count, #12
                                 call        #SendFinalHeader
 
                                 mov         _addr, datConstantsAddr
-                                add         _addr, #12
+                                add         _addr, #4*(DeviceInfoTemplate - DatConstants)
                                 mov         _count, #7
                                 call        #SendPayloadBytes                       'send up to num reported user ports
 
@@ -815,9 +944,9 @@ GetDeviceInfo
                                 'call        #UnlockSharedAccess
                                 
 GetDeviceInfo_end               jmp         #ReceiveCommand
-fit cPageLimit 'Page is too big. Reduce code or increase cPageSize.
+fit cPageALimit 'Page is too big. Reduce code or increase cPageSize.
 
-org cPage
+org cPageA
 
 { CalculateTimings
   This routine calculates the serial timings (in clocks) based on the settings stored in the hub.
@@ -865,13 +994,13 @@ CalculateTimings
             
                                 mov         _page, #cCalc2
 CalculateTimings_end
-                                jmp         #ExecutePage
+                                jmp         #ExecutePageA
 
-fit cPageLimit 'Page is too big. Reduce code or increase cPageSize.
+fit cPageALimit 'Page is too big. Reduce code or increase cPageSize.
 
 
 
-org cPage
+org cPageA
 Calc2
                                 mov         _x, _loadClkFreq
                                 mov         _y, #10
@@ -914,17 +1043,17 @@ Calc2
                                 add         rxPhsbReset, bitPeriod0                 'rxPhsbReset ready (= 5 + startBitWait + bitPeriod0 + 5 + 4 + 4 + 1)
 
                                 mov         _page, #cCalc3
-                                jmp         #ExecutePage
+                                jmp         #ExecutePageA
 
 Calc2_end
 k1000                           long    1000
 
-fit cPageLimit 'On error: page is too big. Reduce code or increase cPageSize.
+fit cPageALimit 'On error: page is too big. Reduce code or increase cPageSize.
 
 
 
 
-org cPage
+org cPageA
 Calc3 
 
                                 { rxPin and txPin are one byte values in the control block. txPin is immediately
@@ -947,6 +1076,9 @@ Calc3
 
                                 call        #Trace
 
+                                mov         _page, #cReceiveExtra_B
+                                call        #LoadPageB
+
 Calc3_end                       jmp         #RecoveryMode
             
 org 0
@@ -958,12 +1090,49 @@ Entry
                                 
                                 or          dira, pin27
                                 or          outa, pin27
+
+
+                                wrword      par, #8       'zero trace address
+                                wrlong      par, #12
+                                mov         _addr, par
+                                add         _addr, #26
+
+                                mov         numUserPortsAddr, _addr
+                                add         _addr, #2                           'maxUserPorts
+
+                                rdword      maxUserPorts, _addr
+                                add         _addr, #2                           'userPortsAddr
+
+                                rdword      userPortsAddr, _addr
+                                add         _addr, #2
+
+                                add         _addr, #2                           'skip rx and tx pin
+
+                                { Setup rx low counter. }
+                                mov         frqb, #1              
+                                mov         ctrb, lowCounterMode            'pin number written in LoadSettings
+                               
+                                'rxBufferAddr, cmdBufferResetAddr
+                                rdword      rxBufferAddr, _addr 
+                                mov         cmdBufferResetAddr, rxBufferAddr    'cmdBufferResetAddr = cmdBufferAddr - 1 due to pre-increment for writes
+                                sub         cmdBufferResetAddr, #1
+                                add         _addr, #2
+ 
+                                rdword      txBufferAddr, _addr                          'txBufferAddr
+                                add         _addr, #2
+
+                                'rdword      maxRxPayloadSize, _addr                           'maxRxPayloadSize
+                                add         _addr, #4               'skip cmdBufferMaxSize and rspBufferMaxSize
+
+
                                 jmp         #FinishInit
 
 
-long 0[16-$]
-fit 16
-org 16
+long 0[cPageBLimit-$]
+fit cPageBLimit 'On error: Entry initialization too big.
+
+{ Permanent code starts here. }
+org cPageBLimit
 
 { Multiply
     Algorithm from the Spin interpreter, with sign code removed.
@@ -1012,6 +1181,9 @@ Divide_ret                      ret
 ReceiveCommand
                                 call        #Trace
                                 xor         outa, pin27
+
+                                mov         _page, #cReceiveExtra_B
+                                call        #LoadPageB
 
                                 { pre-loop initialization }
                                 mov         rxStartWait, rxContinue
@@ -1127,57 +1299,7 @@ rxAddUpperNibble        if_z    add         _rxMixed, 0-0                       
                         if_z    sub         _rxTmp_SH, _rxWait1                     'Timeout 2 - see page 98 for timeout notes
                         if_z    cmp         _rxTmp_SH, ibTimeout            wc      'Timeout 3 - c=0 reset, c=1 no reset
                         if_z    djnz        _rxMixed, #rxLoopTop                    'Mixed - add to byteCount (negative)
-                    
-                        { fall through for framing errors }
-
-FramingError
-                                { todo: add logic }
-                                jmp         #RecoveryMode
-
-
-ParsingError
-                        
-                        { fall through to recovery mode }
-
-{ RecoveryMode
-  When framing or parsing errors occur the implementation enters recovery mode. In this mode the implementation
-    waits for the rx line to be in high-idle for a certain period of time before attempting to receive another
-    command. If the line is low for long enough then the implementation determines that a break condition has occurred.
-  See page 99.
-}
-'todo (3/17): does the removal of the ctrb off code change any timings?
-RecoveryMode
-                                mov         cnt, recoveryTime
-                                add         cnt, cnt
-                                mov         _rcvyPrevPhsb, phsb                     'first interval always recoveryTime+1 counts, so at least one loop for break 
-                                mov         inb, breakMultiple                      'sh-inb is countdown to break detection
-rcvyLoop                        waitcnt     cnt, recoveryTime
-                                mov         _rcvyCurrPhsb, phsb
-                                cmp         _rcvyPrevPhsb, _rcvyCurrPhsb    wz      'z=1 line always high, so exit
-                        if_z    jmp         #ReceiveCommand                         '...exit: line is idle -- ready for next command
-                                mov         par, _rcvyPrevPhsb
-                                add         par, recoveryTime
-                                cmp         par, _rcvyCurrPhsb              wz      'z=0 line high at some point
-                        if_nz   mov         inb, breakMultiple                      'reset break detection countdown
-                        call    #Trace
-                                mov         _rcvyPrevPhsb, _rcvyCurrPhsb
-                                djnz        inb, #rcvyLoop
-
-                        { fall through when a break is detected }
-
-
-{ DetectBaud
-  PropCrow interprets the break condition as a command to enter baud detection mode.
-}
-DetectBaud
-
-BreakHandler    
-                                mov         _page, #cBlinky
-                                jmp         #ExecutePage
-
-                                waitpeq     rxMask, rxMask                          'wait for break to end
-                                { todo }
-                                jmp         #ReceiveCommand
+                                jmp         #FramingError                           'note: the djnz never reaches zero 
 
 
 
@@ -1347,7 +1469,7 @@ ReceiveCommandFinish
                             xor outa, pin27
 
                                 { save the number of low clock counts; used by cont-recal and admin commands }
-                                mov         cmdLowClocks, phsb
+'                                mov         cmdLowClocks, phsb
 
                                 { check final checksums }
                                 add         _rxF16L, _rxPrevByte                    'compute F16L for last byte
@@ -1356,7 +1478,7 @@ ReceiveCommandFinish
 
                                 { what to do for a bad final checksum (z=0) depends on whether it is for header or payload chunk }
                         if_nz   cmp         payloadSize, #1                 wc      'c=1 empty payload => F16 is header's
-                if_nz_and_c     jmp         #ParsingError                           '...exit: bad header F16 is a parsing error
+                    if_nz_and_c jmp         #ParsingError                           '...exit: bad header F16 is a parsing error
                         if_nz   add         flagsAndBadF16, kOneInUpperWord         'if last payload chunk is bad, increment badF16Count; deal with it later
 
                                 { Verify reserved bit 5 of CH3 is zero. In future Crow versions this may be used for a CRC option. }
@@ -1441,7 +1563,7 @@ ProcessCommand
 
                                 cmp         port_SH, propCrowAdminPort      wz      'z=1 PropCrow admin command
                         if_z    mov         _page, #cPropCrowAdmin
-                        if_z    jmp         #ExecutePage
+                        if_z    jmp         #ExecutePageA
 
                                 cmp         port_SH, #0                     wz      'z=1 standard admin from Crow specification
                         if_nz   mov         _x, #cPortNotOpen
@@ -1464,7 +1586,7 @@ StandardAdminStart
                                 { if type not 1 (echo/hostPresence) then continue on paged code }
                                 cmp         _x, #1                          wz
                         if_nz   mov         _page, #cStandardAdminCont
-                        if_nz   jmp         #ExecutePage
+                        if_nz   jmp         #ExecutePageA
 
                                 { echo/hostPresence require minimum of two bytes of payload }
                                 cmp         payloadSize, #2                 wc      'c=1 payload size too small (require 2+ bytes)
@@ -1473,7 +1595,7 @@ StandardAdminStart
                                 { the difference between echo/hostPresence is that echo expects a response }
                                 test        flagsAndBadF16, isOpenFlag      wc      'c=1 open transaction => response expected
                         if_c    mov         _page, #cSendEcho
-                        if_c    jmp         #ExecutePage                            'echo handled with paged code
+                        if_c    jmp         #ExecutePageA                           'echo handled with paged code
 
                                 { The command is hostPresence, for which nothing needs to be done. It is supported as a way for the host
                                     to send inert data for continuous recalibration. }
@@ -1486,7 +1608,7 @@ StandardAdminStart
 }
 UserPortLookup
                                 mov         _page, #cUserCommand
-                                jmp         #ExecutePage
+                                jmp         #ExecutePageA
 
 
 
@@ -1776,41 +1898,55 @@ rxMixedReset            long    $3fff       'byteCount = -1, nonPayloadFlag = 1,
 'nonPayloadFlag, driverLockedFlag, tooBigFlag, and writeVetoesMask are located in shifted parsing code as spacer nops
 
 
-{ ExecutePage (jmp)
-    The code for PropCrow exceeds the cog's space, so a paging mechanism must be used. This paging mechanism
-  also makes it easier to expand the base PropCrow implementation.
+{ ExecutePageA (jmp), LoadPageB (call)
+    PropCrow uses paging to expand the code space. There are two paging areas:
+        Page A - registers [cPageA, cPageALimit) - used for loading code that will be immediately executed
+        Page B - registers [0, cPageBLimit) - used for code or constants that other code may need
+    For more details see the Paging Constants notes in the CON section.
+    Pages are loaded or executed by index in the page table. The page table contains both types of pages.
+  It is the responsibility of the programmer to invoke the correct routine for the type of page.
     Rules:
-      - Code execution starts at the first register of the page.
-      - Pages aren't reloaded if avoidable, so the code must reset itself if it self-modifies.
+      - For page A code execution starts at the first register of the page.
+      - Pages aren't reloaded if avoidable, so code must reset itself if it self-modifies.
       - Pages aren't cached back to the hub, so they can't store information.
       - The page table is considered static (unlike the user ports table), so it is not protected by a hardware lock.
     Arguments/Results
-        Before: _page = index in page table of page to execute
-    Usage:  mov     _page, #<page index>
-            call    #ExecutePage
-    Note: _page (and ExecutePage's local variables) do not alias the Arguments/Results group of variables (e.g. _x).
-  This allows using those registers to pass information to the loaded page. 
+        Before: _page = index in table of page to load or execute
+        After: _page is undefined
+    Usage:  mov     _page, #<page A index>
+            jmp     #ExecutePageA
+        -or-
+            mov     _page, #<page B index>
+            call    #LoadPageB
 }
-ExecutePage
-:currPage                       cmp         _page, #cInvalidPage            wz      'curr page index stored in s-field (initially set to cInvalidPage)
-                        if_z    jmp         #cPage                                  'if page already loaded then go
+LoadPageB
+:currPageB                      cmp         _page, #cInvalidPage            wz      'curr page B index stored in s-field (initially set to cInvalidPage)
+                        if_z    jmp         LoadPageB_ret                           'return -- page already loaded
 
-                                movs        :currPage, _page                        'update the current page (will repurpose _page later)
+                                movs        :currPageB, _page
+                                movd        _PageLoad, #0                           'page B starts at 0
+                                
+                                jmp         #_PageLookup
+ExecutePageA
+:currPageA                      cmp         _page, #cInvalidPage            wz      'curr page A index stored in s-field (initially set to cInvalidPage)
+                        if_z    jmp         #cPageA                                 'exit to page if already loaded
 
-                                movd        :load, #cPage
+                                movs        :currPageA, _page
+                                movd        _PageLoad, #cPageA
+                                movs        _PageExit, #cPageA                      'jmp to page when done
 
-                                shl         _page, #2                               '@(PageTable[i]) = @PageTable + 4*i
+_PageLookup                     shl         _page, #2                               '@(PageTable[i]) = @PageTable + 4*i
                                 add         _page, pageTableAddr
                                 rdword      _pageAddr, _page                        '_pageAddr is address of page in hub
                                 add         _page, #3
                                 rdbyte      _pageTmp_SH, _page                      '_pageTmp is page size in longs
  
-:load                           rdlong      0-0, _pageAddr
-                                add         :load, kOneInDField
+_PageLoad                       rdlong      0-0, _pageAddr
+                                add         _PageLoad, kOneInDField
                                 add         _pageAddr, #4
-                                djnz        _pageTmp_SH, #:load
-
-                                jmp         #cPage
+                                djnz        _pageTmp_SH, #_PageLoad
+_PageExit
+LoadPageB_ret                   ret
 
 
 { CloseTransaction (call)
@@ -1838,7 +1974,7 @@ ErrorHandler
                    if_nc_or_z   jmp         #ReceiveCommand 
 
                                 mov         _page, #cSendError
-                                jmp         #ExecutePage
+                                jmp         #ExecutePageA
 
 
 { CopyString, CopyStringFromTable (both call)
@@ -1929,56 +2065,22 @@ pin27 long |< 27
 
 pause long 40_000_000
 
-{ This is the end of permanent code. Initialization code, paged code, and res'd variables follow. }
+{ This is the end of permanent code. Initialization code, paged code, and res'd variables follow. (The
+    initialization code -- FinishInit -- may actually start within the designated permanent code area.) }
 
-fit cPage 'On error: permanent code exceeds space allotted. Reduce code or increase cPage.
+fit cPageA 'On error: permanent code too big.
 
 
 { FinishInit
-    The initialization process started in the first 16 registers, which will be overwritten with a nibble-based
-  low bit count table (for the continuous recalibration code). Initialization continues here, in the code page
-  space. Some or all of this code will be overwritten when the the first page is executed.
-
+    Initialization continues here from the Entry initialization.
 }
 FinishInit
-                                wrword      par, #8       'zero trace address
-                                wrlong      par, #12
-                                mov         _addr, par
-                                add         _addr, #26
-
-                                mov         numUserPortsAddr, _addr
-                                add         _addr, #2                           'maxUserPorts
-
-                                rdword      maxUserPorts, _addr
-                                add         _addr, #2                           'userPortsAddr
-
-                                rdword      userPortsAddr, _addr
-                                add         _addr, #2
-
-                                add         _addr, #2                           'skip rx and tx pin
-
-                                { Setup rx low counter. }
-                                mov         frqb, #1              
-                                mov         ctrb, lowCounterMode            'pin number written in LoadSettings
-                               
-                                'rxBufferAddr, cmdBufferResetAddr
-                                rdword      rxBufferAddr, _addr 
-                                mov         cmdBufferResetAddr, rxBufferAddr    'cmdBufferResetAddr = cmdBufferAddr - 1 due to pre-increment for writes
-                                sub         cmdBufferResetAddr, #1
-                                add         _addr, #2
- 
-                                rdword      txBufferAddr, _addr                          'txBufferAddr
-                                add         _addr, #2
-
-                                'rdword      maxRxPayloadSize, _addr                           'maxRxPayloadSize
-                                add         _addr, #4               'skip cmdBufferMaxSize and rspBufferMaxSize
 
                                 rdword      datConstantsAddr, _addr             'datConstantsAddr
                                 add         _addr, #2
 
                                 rdword      pageTableAddr, _addr                'pageTableAddr
                                 add         _addr, #2
-
 
                                 add         _addr, #1   'skip numPages
 
@@ -2003,37 +2105,28 @@ FinishInit
                                 add         _addr, #25
                                 rdbyte      otherOptions, _addr
 
-                                { Load low bit count table from hub into registers 0-15 (this saves a trivial amount of hub memory). }
-                                mov         inb, #16
-                                mov         _addr, datConstantsAddr
-                                add         _addr, #(NibbleTable - DatConstants)
-:loop                           rdbyte      _x, _addr
-                                shl         _x, #16                             'lowBitCount is in upper word of _rxMixed (see "RX Mixed Notes")
-                                mov         0-0, _x
-                                add         $-1, kOneInDField
-                                add         _addr, #1
-                                djnz        inb, #:loop
 
                                 { todo: calculate -> load }
                                 { finally, execute the CalculateTimings page; it will automatically go to RecoveryMode afterwards }
                                 mov         _page, #cCalculateTimings
-                                jmp         #ExecutePage
+                                jmp         #ExecutePageA
 
 
-fit cPageLimit 'On error: FinishInit exceeds space available. Reduce code, or increase cPage and/or cPageMaxSize.
+fit cPageALimit 'On error: FinishInit too big.
 
 
 { Res'd Variables 
-    These start after the paged code registers.
+    These start after the page A area. 
     Note that some variables are aliased with special purpose registers -- these are defined in the CON block.
 }
-org cPageLimit
+org cPageALimit
 
 { Paging Temporaries
-    These registers will be undefined after every call to ExecutePage, so alias them with care.
+    These registers will be undefined after every call to ExecutePageA or LoadPageB, so alias them with care.
 }
 _page           res
 _pageAddr       res
+'_pageTmp in SPRs
 
 { ---- }
 
@@ -2095,7 +2188,7 @@ _rxRemaining        res
 rspChunkRemaining
 cmdLowBits       res
 
-cmdLowClocks     res
+'cmdLowClocks     res
 
 payloadSize     res
 
@@ -2145,7 +2238,7 @@ pageTableAddr           res
     These registers are used by the receiving code (_rx), which means they will be undefined immediately
   after a command is received, but their values will be stable and predictable after that.
 }
-fit 489 'On error: too many res variables. Reduce variables, cPage, or cPageMaxSize.
+fit 489 'On error: Too many res'd variables.
 org 489
 
 _x
