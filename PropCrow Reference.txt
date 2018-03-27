@@ -69,6 +69,7 @@ Initial Setup and Launch
 
 Some setup must be done before launch. Once the driver is launched it can not be relaunched -- as originally written, the driver repurposes some of its code space as a buffer.
 
+{todo: move to driver settings, default to "Propeller P8X32A (cog X)" }
 .setDeviceName(nameAddr)
 This method gives the device a descriptive name for diagnostic and debugging purposes. nameAddr should point to a static, NUL-terminated string with up to 32 characters (not including the NUL). The default is "PropCrow v1". Returns 0 on success, -1 if the device name was already set by this or another cog (before launch), or -2 if the driver has been launched.
 
@@ -100,7 +101,9 @@ This setting is the minimum amount of time the rxPin must be low before a break 
 PropCrow assumes all bytes of a command will arrive in a timely manner. If the interbyte timeout is exceeded the driver will discard any command packet that it was receiving. Setting to 0 will result in 4 bit periods being used as the timeout. Defaults to 100 ms.
 
 .setResponseDelay(microseconds)
-The response delay is the minimum amount of time the line must be idle before a response is sent. This applies to the time between a command and response, as well as between responses when intermediate responses are used. Long values accepted. Defaults to 0 µs.
+The response delay is the minimum amount of time the line must be idle before
+a response is sent. This applies to the time between a command and response,
+as well as between responses when intermediate responses are used. Three-byte values accepted. Defaults to 0 µs.
 
 .setClockOptions(xtalOptions, xinOptions, rcfastOptions, rcslowOptions)
 PropCrow recognizes four different clock sources: xtal (any), xin, rcfast, and rcslow. Each source has three boolean settings associated with it: useSource, useBaudDetect, and useContRecal. These settings are stored in the options bitfield for each clock source. The bitmasks are:

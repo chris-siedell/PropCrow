@@ -17,21 +17,23 @@ _xinfreq = 5_000_000
   These cMax* settings determine the sizes of the reserved buffers.
   By specification, Crow command payloads may not exceed 2047 bytes (MaxRxPayloadSize).
 }
-cCmdBufferMaxSize   = 300 'Commands with payloads over this limit will receive OverCapacity error responses.
-'cRspBufferMaxSize   = 200 'This is the limit only for the dedicated response buffer. 
-cMaxUserPorts       = 10    'The maximum number of open user ports. May be any two byte value (as memory allows).
+cCmdBuffSize    = 300   'Commands with payloads over this limit will receive PayloadTooBig error responses.
+cRspBuffSize    = 200   'This just limits the size of responses composed in the buffer -- the device is always allowed to send up to 2047.
 
-'cMaxRxPayloadSize   = 300   'may be 2-2047 (lower limit due to mechanism to avoid buffer overruns)
-cMaxTxPayloadSize   = 100   'may be 0-2047
+cMaxNumUserPorts    = 10    'The maximum number of open user ports. May be any two byte value (as memory allows).
 
-cRxBufferLongs   = (cCmdBufferMaxSize/4) + 1
-cTxBufferLongs   = (cMaxTxPayloadSize/4) + 1
-cUserPortsLongs  = ((cMaxUserPorts*6) / 4) + 1
-
-{ other }
-cPropCrowID         = $abcd 'must be two byte value
+cRxBufferLongs   = (cCmdBuffSize/4) + 1
+cTxBufferLongs   = (cRspBuffSize/4) + 1
+cUserPortsLongs  = ((cMaxNumUserPorts*6) / 4) + 1
 
 
+{ Abort Codes }
+cFailedToObtainLock     = -1000
+
+
+
+{ Other Constants }
+cPropCrowID     = $abcd     'must be two byte value
 
 
 { Flags and Masks }
@@ -54,6 +56,10 @@ cUseTwoStopBits     = %1000_0000
 cEnableReset        = %0000_0001
 cAllowRemoteChanges = %0000_0010
 cSendErrorFlag      = %0000_0100
+
+{ ...for clockOptions }
+
+
 
 { Paging Constants 
     Paging is used to increase code space. This is the layout of cog registers:
@@ -197,6 +203,9 @@ pub new | __pause
     word[30000] := @PageTable
     word[30002] := @Entry
     word[30004] := @ControlBlock
+
+
+{
  
     word[@PageTable][0] := @CalculateTimings
     word[@PageTable][2] := @GetDeviceInfo
@@ -221,25 +230,31 @@ pub new | __pause
     word[@StringTable][4] := @SpinStr
     word[@StringTable][5] := @DefaultUserName
 
-
+}
     __numUserPorts      := 3
     __userPorts.word[0] := 0
     __userPorts.word[3] := 1
     __userPorts.word[6] := 78
 
+{
     __userPortsAddr     := @__userPorts
     __rxBufferAddr      := @__rxBuffer
     __txBufferAddr      := @__txBuffer
     __datConstantsAddr  := @DatConstants
     __pageTableAddr     := @PageTable
+}
 
-    __objBaseAddr       := @@0
+    if __lockID > 7
+        __lockID := locknew()
+        if __lockID > 7
+            abort cFailedToObtainLock
 
-    cognew(@Entry, @ControlBlock)
+    __addrOffset := @@0
 
-    __pause := 160_000_000
+    result := cognew(@Entry, @DriverBlock)
+
+    __pause := 120_000_000
     result := cnt
-
 
     word[15000] := string("Test Object")
 
@@ -253,11 +268,89 @@ pub new | __pause
 
 dat
 
+{ DriverBlock
+    This is the primary data structure for setting up and interfacing with the driver cog.
+  The address of DriverBlock is passed as the PAR parameter to the driver cog.
+    User code may change some of these values after cog launch, but only under hardware lock (__lockID).
+    Key for field type:
+        I - initialization value. Must be set before launch and remain constant after.
+        D - only driver writes these values.
+        L - locked settings. All cogs must use hardware lock protection (__lockID) to read and write.
+        Lf - any cog may write with hardware lock, driver cog will read without hardward lock.
+        U - Only driver cog may set to any value, only user object with same ID may set to zero. All changes
+            require hardware lock, except the driver setting it to a non-zero value.
+        s - Settings that may be read or written by any cog without obtaining hardware lock (if done atomically).
+        - - reserved fields. Must be zero.
+}
+DriverBlock
+                                                    '   pos len typ notes
+__changedFlag               byte 0                  '   0   1   Lf  non-zero indicates settings need to be applied
+__driverState               byte 0                  '   1   1   D
+__lockingUser               word 0                  '   2   2   U
+
+__currBaudrate              long 115200             '   4   4   L
+
+__currInterbyteTimeout      word 200                '   8   2   L   in milliseconds
+__currBreakThreshold        word 100                '   10  2   L   in milliseconds 
+
+__currMinResponseDelay      byte 0[3]               '   12  3   L   in MICROseconds
+__currSerialOptions         byte 0                  '   15  1   L   see serialOptions Bitfield
+
+__currClockOptions          long 0                  '   16  4   L   see clockOptions Bitfield
+
+__resetBaudrate             long 9600               '   20  4   L
+
+__resetInterbyteTimeout     word 200                '   24  2   L   in milliseconds
+__resetBreakThreshold       word 100                '   26  2   L   in milliseconds
+
+__resetMinResponseDelay     byte 0[3]               '   28  3   L   in MICROseconds
+__resetSerialOptions        byte 0                  '   31  1   L   see serialOptions Bitfield
+
+__resetClockOptions         long 0                  '   32  4   L   see clockOptions Bitfield
+
+__otherOptions              byte 0                  '   36  1   L   see otherOptions Bitfield
+                            byte 0                  '   37  1   -
+__userCodeTimeout           word 200                '   38  2   L   in milliseconds
+
+__rxPin                     byte 31                 '   40  1   L
+__txPin                     byte 30                 '   41  1   L
+__address                   byte 1                  '   42  1   L   must be 1 to 31
+                            byte 0                  '   43  1   -
+
+__numUserPorts              word 0                  '   44  2   L
+                            word 0                  '   46  2   -
+
+__cmdBuffSize               word cCmdBuffSize       '   48  2   I
+__rspBuffSize               word cRspBuffSize       '   50  2   I
+
+__maxNumUserPorts           word cMaxNumUserPorts   '   52  2   I
+__numPages                  byte cNumPages          '   54  1   I
+__numStrings                byte cNumStrings        '   55  1   I
+
+__lockID                    byte 254                '   56  1   I   must be set before launch
+__cogID                     byte 254                '   57  1   D   set by driver cog during initialization
+__addrOffset                word 0                  '   58  2   I   added to Ia addresses to get full hub address
+
+__cmdBuffAddr               word @CmdBuffer         '   60  2   Ia
+__rspBuffAddr               word @RspBuffer         '   62  2   Ia
+
+__userPortsTableAddr        word @UserPortsTable    '   64  2   Ia
+__pageTableAddr             word @PageTable         '   66  2   Ia
+
+__stringTableAddr           word @StringTable       '   68  2   Ia
+__txBlockAddr               word @TxBlock           '   70  2   Ia
+
+__deviceAsciiNameAddr       word 0                  '   72  2   s   0 disables
+__deviceAsciiDescAddr       word $ffff              '   74  2   s   0 disables, $ffff selects "Propeller P8X32A (cog X) running PropCrow vM.m."
+
+
 { PageTable
-   
+    Pages are blocks of code or constants loaded into the cog's registers dynamically.
+    The addresses in this table are relative to addrOffset in the DriverBlock. They are adjusted once
+  during the driver cog's initialization, and will be absolute hub addresses thereafter.
     Format:
       pos  len  value
-      0    2    address of page
+      0    2    address of page (see note above)
       2    1    (not used)
       3    1    length of page
 }    
@@ -265,62 +358,62 @@ dat
 PageTable
 
 '0: CalculateTimings
-word    0
+word    @CalculateTimings
 byte    0
 byte    CalculateTimings_end - CalculateTimings + 1
 
 '1: GetDeviceInfo
-word    0
+word    @GetDeviceInfo
 byte    0
 byte    GetDeviceInfo_end - GetDeviceInfo + 1
 
 '2: UserCommand
-word    0
+word    @UserCommand
 byte    0
 byte    UserCommand_end - UserCommand + 1
 
 '3: PropCrowAdmin
-word    0
+word    @PropCrowAdmin
 byte    0
 byte    PropCrowAdmin_end - PropCrowAdmin + 1
 
 '4: SendError
-word    0
+word    @SendErrorPg
 byte    0
 byte    SendErrorPg_end - SendErrorPg + 1
 
 '5: Blinky
-word    0
+word    @Blinky
 byte    0
 byte    Blinky_end - Blinky + 1
 
 '6: SendEcho
-word    0
+word    @SendEcho
 byte    0
 byte    SendEcho_end - SendEcho + 1
 
 '7: Calc2
-word    0
+word    @Calc2
 byte    0
 byte    Calc2_end - Calc2 + 1
 
 '8: Calc3
-word    0
+word    @Calc3
 byte    0
 byte    Calc3_end - Calc3 + 1
 
 '9: SendCustomError
-word    0
+word    @SendCustomError
 byte    0
 byte    SendCustomErrorPg_end - SendCustomErrorPg + 1
 
 '10: SendErrorFinish
-word    0
+word    @SendErrorFinish
 byte    0
 byte    SendErrorFinishPg_end - SendErrorFinishPg + 1
 
 '11: StandardAdminCont
-word    0
+word    @StandardAdminCont
 byte    0
 byte    StandardAdminCont_end - StandardAdminCont + 1
 
@@ -340,105 +433,9 @@ byte    0
 byte    BaudDetect_A_end - BaudDetect_A + 1
 
 
-  
-{ ControlBlock
-
-    The control block stores both initialization and runtime settings to control an instance
-  of PropCrow. It's address is passed to the instance via par.
-
-    The block must be long-aligned.
-
-    Format:
-      pos  len  type value
-      0    4    s    activeBaudrate
-      4    2    s    activeInterbyteTimeout, in milliseconds
-      6    2    s    activeBreakThreshold, in milliseconds
-      8    4    s    activeSerialOptions, bitfield
-      12   4    s    resetBaudrate
-      16   2    s    resetInterbyteTimeout, in milliseconds
-      18   2    s    resetBreakThreshold, in milliseconds
-      20   4    s    resetSerialOptions, bitfield
-      24   1    s    activeSerialSettingsChanged, flag (other cogs set to non-zero, PropCrow sets to zero)
-      25   1    I    otherOptions, bitfield
-      26   2    s    numUserPorts
-      28   2    I    maxUserPorts
-      30   2    I    userPortsAddr
-      32   1    I    rxPin
-      33   1    I    txPin
-      34   2    I    rxBufferAddr
-      36   2    I    txBufferAddr
-      38   2    I    maxRxPayloadSize
-      40   2    I    maxTxPayloadSize
-      42   2    I    datConstantsAddr
-      44   2    I    pageTableAddr
-      46   1    I    numPages
-      47   1    I    crowAddress
-      48   1    I    accessLockID, values 8-255 => lock is disabled
-      49   1    D    cogID
-      50   2    D    objBaseAddr
-      52   4    -    txScratch, used for composing response headers
-      56   2         lockingUser (address of user block)
-      58   2    -    -
-     (60)
-
-    The first four items (baudrate through options bitfield) are the active serial settings used by
-  the implementation when it starts up. The second set of serial settings are those used when the
-  implementation receives a reset command (either a break condition or an explicit command). On reset,
-  the reset settings are copied to the active settings.
-  
-    If another cog changes any of the active serial settings after launch it will need to raise the
-  active serial settings changed flag by setting it to a non-zero value (all under shared access lock).
-  The PropCrow implementation will clear the flag when it incorporates the changes. The implementation
-  will not load the settings from the hub unless it experiences framing or parsing errors, or it is
-  commanded to do so by the host. Framing errors can by induced by other cogs by making the rx pin a
-  brief low output, but make sure the other hardware (i.e. the host's UART) can tolerate this.
-
-    Types:
-      s: shared setting, all cogs must use lock to read and write (if access lock is enabled)
-      I: initialization constant, must be set before cog launches, and remain constant thereafter
-      D: diagnostic, set by PropCrow cog only
-
-    The access lock allows other cogs to change settings in a safe way. If settings never change then
-  the access lock may be disabled. (Values of 0-7 enable the lock, anything else disables it.)
-
-    PropCrow assumes hub[0:4] is the clock frequency, and hub[4] is the clock mode. It considers
-  these settings to be protected by the access lock. 
-}
-
-ControlBlock
-__controlBlock
-                    long    115200              'activeBaudrate
-                    word    250                 'activeInterbyteTimeout, in milliseconds
-                    word    100                 'activeBreakThreshold, in milliseconds
-                    long    $0707_0101          'activeSerialOptions
-                    long    115200              'resetBaudrate
-                    word    250                 'resetInterbyteTimeout, in milliseconds
-                    word    100                 'resetBreakThreshold, in milliseconds
-                    long    $0707_0101          'resetSerialOptions
-                    byte    0                   'activeSerialSettingsChanged
-                    byte    cSendErrorFlag | cAllowRemoteChanges | cEnableReset                   'otherOptions
-__numUserPorts      word    0                   'numUserPorts
-                    word    cMaxUserPorts       'maxUserPorts
-__userPortsAddr     word    0-0                 'userPortsAddr
-__rxPin             byte    31                  'rxPin
-__txPin             byte    30                  'txPin
-__rxBufferAddr      word    0-0                 'rxBufferAddr
-__txBufferAddr      word    0-0                 'txBufferAddr
-                    word    cCmdBufferMaxSize   'cCmdBufferMaxSize
-                    word    cMaxTxPayloadSize   'maxTxPayloadSize
-__datConstantsAddr  word    0-0                 'datConstantsAddr
-__pageTableAddr     word    0-0                 'pageTableAddr
-                    byte    cNumPages           'numPages
-                    byte    1                   'crowAddress
-                    byte    255                 'accessLockID
-                    byte    0-0                 'cogID
-__objBaseAddr       word    0-0                 'objBaseAddr
-                    long    0                   'txScratch
-__lockingUser       word    0                   'lockingUser
-                    word    0
-
-
 { UserPortsTable
+
+    todo: implement
 
     Each entry in this table defines a port opened by user code, and specifies what code to invoke
   to process data received on that port.
@@ -462,52 +459,49 @@ __lockingUser       word    0                   'lockingUser
       - numUserPorts in [0, maxNumUserPorts)
 }
 
-{ DatConstants
-    A block of hub RAM containing constant data used by driver.
-}
-DatConstants
 
-{ StringTable, MUST be first part of DatConstants
-    Placing the string table first saves an instruction of permanent code in the
-  string copying routines.
-    Each entry in the table is a word containing the address of a NUL-terminated string.
+{ StringTable
+    Each entry in the table is a word containing the address of a NUL-terminated 7-bit ascii string.
+  The addresses are relative to addrOffset (in DriverBlock) at cog launch. The driver cog will adjust
+  these values so that they are absolute hub addresses after initialization.
 }
 StringTable
+word @PropCrowStr
+word @WaitingForStr
+word @ToFinishStr
+word @UnknownErrStr
+word @SpinStr
+word @DefaultUserName   '5
 
-'0 - PropCrowStr
-'1 - WaitingForStr
-long 0
+{ Strings }
+PropCrowStr         byte "PropCrow", 0
+WaitingForStr       byte "Waiting for ", 0
+ToFinishStr         byte " to finish.", 0
+UnknownErrStr       byte "Unknown error.", 0
+SpinStr             byte "Spin Object", 0
+DefaultUserName     byte "User Object", 0
+DefaultDeviceDesc   byte "Propeller P8X32A (cog ", 0
+'DidNotRespondStr    byte " never responded.", 0
+'WasUnresponsiveStr  byte " was unresponsive.", 0
 
-'2 - ToFinishStr
-'3 - UnknownErrStr
-long 0
 
-'4 - SpinStr
-'5 - DefaultUserName 
-long 0
+{ TxBlock
+    This block is used by the driver cog for various sending purposes. No other
+  cog should modify this data.
+}
+TxBlock
+long    0       'first long assumed to be txScratch
 
-'6 - 
-'7 - 
-long 0
-
-{ DeviceInfoTemplate, part of DatConstants 
+{ DeviceInfoTemplate, part of TxBlock 
     A template for sending getDeviceInfo responses. The mutable parts (for user ports) are
   sent separately.
 }
 DeviceInfoTemplate
-
-
 long    $0000_0200 | ((cPropCrowID & $ff) << 24) | ((cPropCrowID & $ff00) << 8)             'Crow v2, implementationID = cPropCrowID
-long    $0002_0000 | ((cCmdBufferMaxSize & $ff) << 8) | ((cCmdBufferMaxSize & $700) >> 8)   'max commmand payload size, 2 admin ports (top byte not sent from here) 
+long    $FF02_0000 | ((cCmdBufferMaxSize & $ff) << 8) | ((cCmdBufferMaxSize & $700) >> 8)   'max commmand payload size, 2 admin ports (top byte not sent from here) 
 long    $0000_0000 | ((cPropCrowID & $ff) << 24) | ((cPropCrowID & $ff00) << 8)             'admin ports 0 and PropCrowID
 
-{ NibbleTable, part of DatConstants
-  A table of low bit counts for integers 0 to 15. Used for continuous recalibration.
-}
-NibbleTable
-byte 4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0
-
-{ ErrorResponseTemplate, part of DatConstants
+{ ErrorResponseTemplate, part of TxBlock
     This template sets up an error response with no standard details, and one implementation provided
   ascii error message. After writing this template to the response buffer, all that remains is to set
   the first byte (type OR'd with 0x80), set byte 8 to message length (assuming it is less than 256),
@@ -518,15 +512,7 @@ long    $0003_00FF      'bottom byte written later
 long    $0009_0001      'top byte of message length is zero (assume all messages are less than 256 characters)
 
 
-{ Strings }
-PropCrowStr         byte "PropCrow", 0
-WaitingForStr       byte "Waiting for <", 0
-ToFinishStr         byte "> to finish.", 0
-UnknownErrStr       byte "Unknown error.", 0
-SpinStr             byte "Spin Object", 0
-DefaultUserName     byte "User Object", 0
-'DidNotRespondStr    byte "> never responded.", 0
-'WasUnresponsiveStr  byte "> was unresponsive.", 0
+
 
 
 { FramingError_A
@@ -750,8 +736,8 @@ SendErrorPg
                                 cmp         _x, #cPayloadTooBig         wz
                         if_z    or          _x, #%0100_0000                     'standard details are included
                         if_z    add         _count, #4                          '+2 for E1-E2, +2 for details
-                        if_z    mov         _copySrcAddr, datConstantsAddr      'copy max size from device info template
-                        if_z    add         _copySrcAddr, #4*(DeviceInfoTemplate - DatConstants + 1)
+                        if_z    mov         _copySrcAddr, txBlockAddr           'copy max size from device info template
+                        if_z    add         _copySrcAddr, #4*(DeviceInfoTemplate - TxBlock + 1)
                         if_z    mov         _copyCount, #2
                         if_z    call        #CopyBytes
 
@@ -792,8 +778,8 @@ SendCustomErrorPg
                                 
                                 { Start by copying the template to the response buffer. }
                                 mov         _copyDestAddr, txBufferAddr
-                                mov         _copySrcAddr, datConstantsAddr
-                                add         _copySrcAddr, #4*(ErrorResponseTemplate - DatConstants)
+                                mov         _copySrcAddr, txBlockAddr
+                                add         _copySrcAddr, #4*(ErrorResponseTemplate - TxBlock)
                                 mov         _copyCount, #8
                                 call        #CopyBytes
 
@@ -940,8 +926,8 @@ GetDeviceInfo
                                 add         _count, #12
                                 call        #SendFinalHeader
 
-                                mov         _addr, datConstantsAddr
-                                add         _addr, #4*(DeviceInfoTemplate - DatConstants)
+                                mov         _addr, txBlockAddr
+                                add         _addr, #4*(DeviceInfoTemplate - TxBlock)
                                 mov         _count, #7
                                 call        #SendPayloadBytes                       'send up to num reported user ports
 
@@ -950,8 +936,8 @@ GetDeviceInfo
                                 mov         _count, #1
                                 call        #SendPayloadBytes                       'send number of reported user ports
 
-                                mov         _addr, datConstantsAddr
-                                add         _addr, #4*(DeviceInfoTemplate - DatConstants + 2)
+                                mov         _addr, txBlockAddr
+                                add         _addr, #4*(DeviceInfoTemplate - TxBlock + 2)
                                 mov         _count, #4
                                 call        #SendPayloadBytes                       'send open admin ports from template
 
@@ -1299,7 +1285,7 @@ _RxMovD                         mov         _RxShiftedD, 0-0                    
 'bit 5 - 33 clocks
 :bit5                           waitcnt     _rxWait1, bitPeriod0
                                 test        rxMask, ina                     wc
-_RxHubop                        long    0-0                                         'see RX Hubop; may be rxWriteByte (uses z flag), rxReadDriverLock, or nop
+_RxHubop                        long    0-0                                         'see RX Hubop; may be rxWriteByte (has 'if_z'), rxReadDriverLock, or nop
 
 'bit 6 - 34 clocks
 :bit6                           waitcnt     _rxWait1, bitPeriod1
@@ -1324,7 +1310,7 @@ _RxShiftedD                     long    0-0                                     
 :stopBit                        waitcnt     _rxWait1, bitPeriod0                    'see page 98
                                 testn       rxMask, ina                     wz      'z=0 framing error
 
-_RxStartWait                    long    0-0                                         'see RX StartWait; may be rxContinue, rxExit, or rxParsingErrorExit (all only if_z)
+_RxStartWait                    long    0-0                                         'see RX StartWait; may be rxContinue, rxExit, or rxParsingErrorExit (all 'if_z')
 
                         if_z    add         _rxWait0, cnt                           'Wait 1
 
@@ -1452,7 +1438,7 @@ nonPayloadFlag                  long    |< 13                                   
                                 mov         cmdDetails, rxByte                      ' C - save CH3 for later processing (address, mute flag, reserved bit 5)
                         if_nc   mov         _rxOffset, #12                          ' D - c = bit7 = 1 for explicit port; skip H4 and H5 if using implicit port
 rxH4_Optional
-kCrowPayloadLimit               long    2047                                        'A - (spacer nop) payload size limit is 11 bits in v1 and v2
+kCrowPayloadLimit               long    2047                                        'A - (spacer nop) payload size limit is 11 bits in Crow v1 and v2
 rxByte                          long    0-0                                         ' B - (spacer nop) rxByte must have upper bytes zero for F16 and cont-recal
                                 mov         port_SH, rxByte                         ' C - start saving explicit port
                                 shl         port_SH, #8                             ' D
@@ -2056,9 +2042,10 @@ ErrorHandler
             _copyDestAddr = the address to copy the string to
     After:  same as for CopyString
 }
+{ todo: consider non-printable character substitution }
 CopyStringFromTable
                                 shl         _copyIndex, #1                              '@(StringTable[i]) = @StringTable + 2*i
-                                add         _copyIndex, datConstantsAddr                'assuming @StringTable = @DatConstants
+                                add         _copyIndex, stringTableAddr
                                 rdword      _copySrcAddr, _copyIndex
 CopyString
                                 mov         _copyTmp_SH, _copyMaxSize
@@ -2122,7 +2109,7 @@ fit cPageA 'On error: permanent code too big.
 
 
 { FinishInit
-    Initialization continues here from the Entry initialization.
+    Initialization continues here from the Entry area.
 }
 FinishInit
 
@@ -2267,7 +2254,6 @@ rxPhsbReset     res
 otherOptions    res
 
 { Constants (after initialization) }
-datConstantsAddr        res
 accessLockID            res
 rxBufferAddr            res
 cmdBufferResetAddr      res
@@ -2277,10 +2263,20 @@ maxUserPorts            res
 userPortsAddr           res
 
 'maxRxPayloadSize        res
-txScratchAddr           res
 driverLockAddr          res
 
+
+
+{ Addresses
+    These address registers MUST appear in the same order as in the driver block.
+}
+cmdBufferAddr           res
+rspBufferAddr           res
+userPortsTableAddr      res
 pageTableAddr           res
+stringTableAddr         res
+txScratchAddr
+txBlockAddr             res
 
 
 
