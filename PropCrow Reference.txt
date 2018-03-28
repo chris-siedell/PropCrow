@@ -8,6 +8,7 @@ todo: reset settings
 
 todo: option to turn off crow error responses (for v1 host implementations)
 todo: inverted signals
+todo: break handler
 
 
 PropCrow is a feature-rich device implementation of the Crow protocol (v2) for the Parallax Propeller microcontroller (P8X32A).

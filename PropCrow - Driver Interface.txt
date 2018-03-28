@@ -1,103 +1,30 @@
-
-D - only driver cog may write
-L - after launch, any cog must have lock to read or write
-Lf - any cog may change under lock, driver cog will read without lock
-- - reserved, must remain 0
-C - compile time constant, no cog may write
-I - initialization constant set by launching cog, must remain constant after
-Ia - compile time address constants, addresses are relative to the offsetAddr (so offsetAddr + userPortsTableAddr = hub address of user ports table)
-U - only driver cog may set to any value, only specified user may set to zero (locks?)
-s - settings that may be set by any cog without obtaining lock (if written
-atomically), and which should not cause the changedFlag to be raised
-
-pos     len     type    name                    notes
-0       1       Lf      changedFlag             raised to non-zero by other cogs when L settings have changed, lowered to zero by driver when settings applied
-1       1       D       driverState
-2       2       U       lockingUser             zero: driver unlocked; non-zero: address of UserObjectBlock of locking user 
----
-4       4       L       currBaudrate
----
-8       2       L       currInterbyteTimeout    in milliseconds
-        2       L       currBreakThreshold      in milliseconds
----
-12      1       L       currSerialOptions       see serialOptions Bitfield
-        3       -       -
----
-16      4       L       resetBaudrate
----
-20      2       L       resetInterbyteTimeout
-        2       L       resetBreakThreshold
----
-24      1       L       resetSerialOptions
-        3       -       -
----
-28      4       L       clockOptions
----
-32      2       L       otherOptions
-        2       L       userCodeTimeout         in milliseconds
----
-36      3       L       minResponseDelay        in MICROseconds
-        1       L       interruptThreshold      levels 0-4 (5+ = 4)
----
-40      1       L       rxPin                   must be 0 to 31
-        1       L       txPin                   must be 0 to 31
-        1       L       address                 must be 1 to 31
-        1       -       -
----
-44      2       L       numUserPorts            the number of open ports in table
-        2       -       -
----
-48      2       C       cmdBufferSize           max supported cmd payload
-        2       C       rspBufferSize           does not restrict rps size
----
-52      2       C       maxNumUserPorts
-        1       C       numPages
-        1       C       numStrings
----
-56      2       I       offsetAddr
-        1       I       lockID
-        1       D       cogID
----
-60      2       Ia      cmdBufferAddr
-        2       Ia      rspBufferAddr
----
-64      2       Ia      userPortsTableAddr
-        2       Ia      pageTableAddr
----
-68      2       Ia      stringTableAddr
-        2       Ia      txBlockAddr
----
-72      2       s       deviceAsciiNameAddr     NULL disables, 0xffff (default) selects "Propeller P8X32A (cog X)" 
-        2       s       deviceAsciiDescAddr     NULL disables (default)
----
-
-
-serialOptions Bitfield
-----------------------
-useTwoStopBits 1     = %1
-rxLevelInverted
-txLevelInverted
-interruptLevel 3
-ignoreFeedback
+otherOptions
+-------------
+shutdownDriver          = %0_0000_0001      1 instructs driver to do graceful cog stop
+enableDriver            = %0_0000_0010      0 puts driver in idle mode until setting changes
+rxLevelInverted         = %0_0000_0100
+txLevelInverted         = %0_0000_1000
+useTwoStopBits          = %0_0001_0000
+interruptLevel          = %0_nnn0_0000
+enableErrorResponses    = %1_0000_0000
 
 
 clockOptions Bitfield
 ---------------------
 in four identically formatted bytes for each of four clock sources
+bytes: 0: xtal, 1: xin, 2: rcfast, 3: rcslow
 for each clock source:
-useSource           = %0001
-enableBaudDetect    = %0010
-requireBaudDetect   = %0100
-useContRecal        = %1000
-
-otherOptions Bitfield
----------------------
-enableErrorResponses
+useSource           = %0001   if false, driver will be idle until setting or source changes
+enableAutobaud      = %0010   enables autobaud features (baud detect, cont recal) if framing errors threshold is met or if commanded
+requireBaudDetect   = %0100   ignored if enableAutobaud is false
+requireContRecal    = %1000   ignored if enableAutobaud is false
 
 
-allowRemoteChanges
-allowRemoteReset
-forceReleaseDriverLockOnReset
+
+remotePermissions
+------------------
+allowChanges
+allowBreakReset
 
 
 

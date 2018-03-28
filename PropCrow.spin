@@ -14,16 +14,38 @@ _xinfreq = 5_000_000
 
 
 { Buffer Size Settings
-  These cMax* settings determine the sizes of the reserved buffers.
-  By specification, Crow command payloads may not exceed 2047 bytes (MaxRxPayloadSize).
+    These settings determine the sizes of the reserved buffers.
+    PropCrow has two dedicated buffers for command and response payloads (cmdBuff and rspBuff).
+  These buffers may actually be identical (overlap) to save space, but doing this would make
+  simultaneously parsing a command and composing a response more difficult (only user code
+  would need to worry about this -- the driver code would be OK).
+    By specification, Crow payloads (both kinds) may not exceed 2047 bytes, so the buffers do not
+  need to be larger than this.
+    The minimum command buffer size is two bytes due to the mechanism used to prevent overruns.
+    The minimum response buffer size is 200 bytes since the driver uses the response buffer to
+  compose error messages.
+
+todo: buffer size checks on error messages
+
+ It assumes (without checking) that it has at least this many bytes
+  bret
+    The command payload buffer must be at least two bytes due to the mechanism used to prevent
+  buffer overruns.
+    The driver uses the response buffer for composing low-level error messages, so it must
+  be at least 256 bytes (the driver does not     The command and response buffers may be the same to conserve space. However, doing this
+  would make parsing a command and composing a response more difficult (only user code would
+  need to worry about this, the driver .
+
+do not have to come from the response buffer.
+
 }
-cCmdBuffSize    = 300   'Commands with payloads over this limit will receive PayloadTooBig error responses.
-cRspBuffSize    = 200   'This just limits the size of responses composed in the buffer -- the device is always allowed to send up to 2047.
+cCmdBuffSizeInLongs     = 100
+cRspBuffSizeInLongs     = 80
 
-cMaxNumUserPorts    = 10    'The maximum number of open user ports. May be any two byte value (as memory allows).
+cCmdBuffSize    = 4*cCmdBuffSizeInLongs
+cRspBuffSize    = 4*cRspBuffSizeInLongs
+cMaxNumUserPorts    = 10    'May be any two-byte value (as memory allows).
 
-cRxBufferLongs   = (cCmdBuffSize/4) + 1
-cTxBufferLongs   = (cRspBuffSize/4) + 1
 cUserPortsLongs  = ((cMaxNumUserPorts*6) / 4) + 1
 
 
@@ -204,52 +226,29 @@ pub new | __pause
     word[30002] := @Entry
     word[30004] := @ControlBlock
 
+    repeat index from 0 to cNumPages-1
+        word[@PageTable][2*index] += @@0
 
-{
- 
-    word[@PageTable][0] := @CalculateTimings
-    word[@PageTable][2] := @GetDeviceInfo
-    word[@PageTable][4] := @UserCommand
-    word[@PageTable][6] := @PropCrowAdmin
-    word[@PageTable][8] := @SendErrorPg
-    word[@PageTable][10] := @Blinky
-    word[@PageTable][12] := @SendEcho
-    word[@PageTable][14] := @Calc2
-    word[@PageTable][16] := @Calc3
-    word[@PageTable][18] := @SendCustomErrorPg
-    word[@PageTable][20] := @SendErrorFinishPg
-    word[@PageTable][22] := @StandardAdminCont
-    word[@PageTable][24] := @ReceiveExtra_B
-    word[@PageTable][26] := @FramingError_A
-    word[@PageTable][28] := @BaudDetect_A
+    repeat index from 0 to cNumStrings-1
+        word[@StringTable][index] += @@0
+    
+    __cmdBuffAddr           := @CmdBuffer
+    __rspBuffAddr           := @RspBuffer
+    __userPortsTableAddr    := @UserPortsTable
+    __pageTableAddr         := @PageTable
+    __stringTableAddr       := @StringTable
+    __txBlockAddr           := @TxBlock
 
-    word[@StringTable][0] := @PropCrowStr
-    word[@StringTable][1] := @WaitingForStr
-    word[@StringTable][2] := @ToFinishStr
-    word[@StringTable][3] := @UnknownErrStr
-    word[@StringTable][4] := @SpinStr
-    word[@StringTable][5] := @DefaultUserName
-
-}
     __numUserPorts      := 3
     __userPorts.word[0] := 0
     __userPorts.word[3] := 1
     __userPorts.word[6] := 78
 
-{
-    __userPortsAddr     := @__userPorts
-    __rxBufferAddr      := @__rxBuffer
-    __txBufferAddr      := @__txBuffer
-    __datConstantsAddr  := @DatConstants
-    __pageTableAddr     := @PageTable
-}
+'    if __lockID > 7
+'        __lockID := locknew()
+'        if __lockID > 7
+'            abort cFailedToObtainLock
 
-    if __lockID > 7
-        __lockID := locknew()
-        if __lockID > 7
-            abort cFailedToObtainLock
-
-    __addrOffset := @@0
 
     result := cognew(@Entry, @DriverBlock)
 
@@ -271,90 +270,160 @@ dat
 { DriverBlock
     This is the primary data structure for setting up and interfacing with the driver cog.
   The address of DriverBlock is passed as the PAR parameter to the driver cog.
-    User code may change some of these values after cog launch, but only under hardware lock (__lockID).
+    The format of this structure is hardcoded into the driver's code. Changes here may require
+  significant code rewrites (search for "Assumes DriverBlock Layout").
     Key for field type:
-        I - initialization value. Must be set before launch and remain constant after.
-        D - only driver writes these values.
-        L - locked settings. All cogs must use hardware lock protection (__lockID) to read and write.
-        Lf - any cog may write with hardware lock, driver cog will read without hardward lock.
-        U - Only driver cog may set to any value, only user object with same ID may set to zero. All changes
-            require hardware lock, except the driver setting it to a non-zero value.
+        I - Initialization value. Must be set before launch and remain constant after.
+        D - Only driver cog writes these values.
+        ID -
+        L - Locked settings -- all cogs must use a hardware lock (memLockID) to read and write. If other cogs
+            change any of these settings they must raise changedFlag (write a non-zero byte) before releasing the lock.
+            The driver cog will clear changedFlag (under lock) when it applies the settings.
+        Lf - Any cog may read without hardware lock, but all cogs must have lock to write.
+        U - Only driver cog may set to any value, only user object with same address may set to zero. All changes
+            require hardware lock.
         s - Settings that may be read or written by any cog without obtaining hardware lock (if done atomically).
-        - - reserved fields. Must be zero.
+            Changes do not raise the changedFlag.
+        - - reserved fields.
+    The driver considers clkfreq (LONG[0]) and clkmode (BYTE[4]) to be L-settings. Cooperating code should
+  change these only under hardware lock (memLockID), and should raise changedFlag before releasing the lock.
+  If these are changed without raising the changedFlag and framing errors occur the driver will notice that the
+  values have changed and will reload the settings (assuming those hub locations are updated).
+
+Framining Errors
+- first check if settings have changed, including clkfreq and clkmode
+- if so, reload settings
+- if framing errors continue, eventually enter baud detect mode, if autobaud enabled
+
+
+otherOptions
+-------------
+shutdownDriver          = %0_0000_0001      1 instructs driver to do graceful cog stop
+enableDriver            = %0_0000_0010      0 puts driver in idle mode until setting changes
+rxLevelInverted         = %0_0000_0100
+txLevelInverted         = %0_0000_1000
+interruptLevel          = %0_0nnn_0000
+useTwoStopBits          = %0_1000_0000
+enableErrorResponses    = %1_0000_0000
+
+
+interruptLevel:
+    otherOptions & $70 =
+        $00 - lowest - 1 clock
+        $10 - low - 0.75 bit period
+        $20 - medium - 10 bit periods
+        $30 - high - 1/16th break
+        else - off
+
+
+
+clockOptions Bitfield
+---------------------
+in four identically formatted bytes for each of four clock sources
+bytes: 0: xtal, 1: xin, 2: rcfast, 3: rcslow
+for each clock source:
+useSource           = %0001   if false, driver will be idle until setting or source changes
+enableAutobaud      = %0010   enables autobaud features (baud detect, cont recal) if framing errors threshold is met or if commanded
+requireBaudDetect   = %0100   ignored if enableAutobaud is false
+requireContRecal    = %1000   ignored if enableAutobaud is false
+
+
+
 }
+
 DriverBlock
                                                     '   pos len typ notes
-__changedFlag               byte 0                  '   0   1   Lf  non-zero indicates settings need to be applied
-__driverState               byte 0                  '   1   1   D
-__lockingUser               word 0                  '   2   2   U
+'Runtime State
 
-__currBaudrate              long 115200             '   4   4   L
+__changedFlag               byte 0                  '   0   1   Lf  non-zero value: values changed; bits indicate which ones; 0: settings loaded
+__driverState               byte 0                  '   1   1   ID  launching code must set this to 0 before launching
+__lockingUser               word 0                  '   2   2   U   0: driver unlocked: non-zero: address of locking user
 
-__currInterbyteTimeout      word 200                '   8   2   L   in milliseconds
-__currBreakThreshold        word 100                '   10  2   L   in milliseconds 
+'Current Settings
 
-__currMinResponseDelay      byte 0[3]               '   12  3   L   in MICROseconds
-__currSerialOptions         byte 0                  '   15  1   L   see serialOptions Bitfield
+__currRxPin                 byte 31                 '   4   1   L
+__currTxPin                 byte 30                 '   5   1   L
+__currAddress               byte 1                  '   6   1   L   must be 1 to 31
+                            byte 0                  '   7   1   -
 
-__currClockOptions          long 0                  '   16  4   L   see clockOptions Bitfield
+__currBaudrate              long 115200             '   8   4   L
 
-__resetBaudrate             long 9600               '   20  4   L
+__currClockOptions          long $1f1f_0b01         '   12  4   L
 
-__resetInterbyteTimeout     word 200                '   24  2   L   in milliseconds
-__resetBreakThreshold       word 100                '   26  2   L   in milliseconds
+__currOtherOptions          word 0                  '   16  2   L
+__currBreakThreshold        word 100                '   18  2   L   in milliseconds 
 
-__resetMinResponseDelay     byte 0[3]               '   28  3   L   in MICROseconds
-__resetSerialOptions        byte 0                  '   31  1   L   see serialOptions Bitfield
+__currInterbyteTimeout      long 150_000            '   20  4   L   in MICROseconds (bit 31 = 0) or bit periods (bit 31 = 1)
 
-__resetClockOptions         long 0                  '   32  4   L   see clockOptions Bitfield
+__currMinResponseDelay      long 0                  '   24  4   L   in MICROseconds
 
-__otherOptions              byte 0                  '   36  1   L   see otherOptions Bitfield
-                            byte 0                  '   37  1   -
-__userCodeTimeout           word 200                '   38  2   L   in milliseconds
+                            long 0                  '   28  4   -
 
-__rxPin                     byte 31                 '   40  1   L
-__txPin                     byte 30                 '   41  1   L
-__address                   byte 1                  '   42  1   L   must be 1 to 31
-                            byte 0                  '   43  1   -
+'Reset Settings
 
-__numUserPorts              word 0                  '   44  2   L
-                            word 0                  '   46  2   -
+long 0[7]
 
-__cmdBuffSize               word cCmdBuffSize       '   48  2   I
-__rspBuffSize               word cRspBuffSize       '   50  2   I
+'Other Settings (Non-Resettable)
 
-__maxNumUserPorts           word cMaxNumUserPorts   '   52  2   I
-__numPages                  byte cNumPages          '   54  1   I
-__numStrings                byte cNumStrings        '   55  1   I
+__userCodeTimeout           long 100_000            '   60  4   L   in MICROseconds (bit 31 = 0) or clocks (bit 31 = 1)
 
-__lockID                    byte 254                '   56  1   I   must be set before launch
-__cogID                     byte 254                '   57  1   D   set by driver cog during initialization
-__addrOffset                word 0                  '   58  2   I   added to Ia addresses to get full hub address
+__breakHandler              word 0                  '   64  2   s   0 selects driver's internal handler that resets settings (allowBreakReset must still be true)
+                            word 0                  '   66  2   -
 
-__cmdBuffAddr               word @CmdBuffer         '   60  2   Ia
-__rspBuffAddr               word @RspBuffer         '   62  2   Ia
+__remotePermissions         byte 0                  '   68  1   L
+                            byte 0[3]               '   69  3   -
 
-__userPortsTableAddr        word @UserPortsTable    '   64  2   Ia
-__pageTableAddr             word @PageTable         '   66  2   Ia
+                            long                    '   72  4   -
 
-__stringTableAddr           word @StringTable       '   68  2   Ia
-__txBlockAddr               word @TxBlock           '   70  2   Ia
+'Initialization Constants
 
-__deviceAsciiNameAddr       word 0                  '   72  2   s   0 disables
-__deviceAsciiDescAddr       word $ffff              '   74  2   s   0 disables, $ffff selects "Propeller P8X32A (cog X) running PropCrow vM.m."
+__memLockID                 byte 200                '   76  1   I
+                            byte 0[3]               '   77  3   -
+
+__cmdBuffAddr               word 0-0                '   80  2   I
+__rspBuffAddr               word 0-0                '   82  2   I
+
+__userPortsTableAddr        word 0-0                '   84  2   I
+__pageTableAddr             word 0-0                '   86  2   I
+
+__stringTableAddr           word 0-0                '   88  2   I
+__txBlockAddr               word 0-0                '   90  2   I
+
+__cmdBuffSize               word cCmdBuffSize       '   92  2   I
+__rspBuffSize               word cRspBuffSize       '   94  2   I
+
+__maxNumUserPorts           word cMaxNumUserPorts   '   96  2   I
+__numPages                  byte cNumPages          '   98  1   I
+__numStrings                byte cNumStrings        '   99  1   I
+
+                            long 0                  '   100 4   -
+'Informational Settings
+
+__deviceNameAddr            word 0                  '   104 2   s   0 disables
+__deviceDescAddr            word $ffff              '   106 2   s   0 disables, $ffff selects "Propeller P8X32A (cog X) running PropCrow vM.m."
+
+'Internal and Diagnostic
+
+__cogID                     byte 200                '   108 1   D   set by driver cog during initialization
+__lastClkMode               byte 0                  '   109 1   D   value of BYTE[4] the last time settings were loaded
+                            word 0                  '   110 2   -   
+
+__lastClkFreq               long 0                  '   112 4   D   value of LONG[0] the last time settings were loaded
+
+
+
 
 
 { PageTable
-    Pages are blocks of code or constants loaded into the cog's registers dynamically.
-    The addresses in this table are relative to addrOffset in the DriverBlock. They are adjusted once
-  during the driver cog's initialization, and will be absolute hub addresses thereafter.
+    Pages are blocks of code or constants loaded into the cog's registers at runtime.
+    Refer to Paging Constants.
+    This table is used for both kinds of pages (A and B).
     Format:
       pos  len  value
-      0    2    address of page (see note above)
+      0    2    address of page
       2    1    (not used)
       3    1    length of page
 }    
-
 PageTable
 
 '0: CalculateTimings
@@ -462,8 +531,6 @@ byte    BaudDetect_A_end - BaudDetect_A + 1
 
 { StringTable
     Each entry in the table is a word containing the address of a NUL-terminated 7-bit ascii string.
-  The addresses are relative to addrOffset (in DriverBlock) at cog launch. The driver cog will adjust
-  these values so that they are absolute hub addresses after initialization.
 }
 StringTable
 word @PropCrowStr
@@ -1016,6 +1083,91 @@ CalculateTimings_end
 fit cPageALimit 'On error: page is too big.
 
 
+{ LoadSettingsStart_A
+
+}
+org cPageA
+LoadSettingsStart_A
+                                call        #RetainLock
+
+                                { * Following Assumes DriverBlock Layout * }
+
+                                { First, load clockOptions and otherOptions. }
+                                mov         _addr, par
+                                add         _addr, #12
+                                rdlong      clockOptions, _addr                     'clockOptions
+                                add         _addr, #4
+                                rdbyte      otherOptions, _addr                     'otherOptions
+
+
+
+                                { rx pin }
+                                mov         _addr, par
+                                add         _addr, #4
+                                rdbyte      _x, _addr
+                                mov         rxMask, #1
+                                shl         rxMask, _x
+                                movs        ctrb, _x                                'ctrb mode comes later (at rxLevelIsInverted)
+
+                                { tx pin }
+                                add         _addr, #1
+                                rdbyte      _x, _addr
+                                mov         txMask, #1
+                                shl         txMask, _x                              'prepping outa comes later (at txLevelIsInverted)
+
+                                { crow device address }
+                                add         _addr, #1
+                                rdbyte      _x, _addr
+                                min         _x, #1
+                                max         _x, #31
+                                movs        _RxVerifyAddress, _x
+
+                                { use baudrate and clkfreq (LONG[0]) }
+                                add         _addr, #2
+                                rdword      _loadBaud, _addr
+
+
+
+
+LoadSettingsStart_A_end
+fit cPageALimit 'On error: page is too big.
+
+
+{ LoadSettingsStart_A
+
+}
+org cPageA
+LoadSettingsStart_A
+
+
+LoadSettingsStart_A_end
+fit cPageALimit 'On error: page is too big.
+
+
+{ LoadSettingsStart_A
+
+}
+org cPageA
+LoadSettingsStart_A
+
+
+LoadSettingsStart_A_end
+fit cPageALimit 'On error: page is too big.
+
+{ LoadSettingsFinish_A
+
+}
+org cPageA
+LoadSettingsFinish_A
+
+                                call        #ReleaseLock
+
+LoadSettingsFinish_A_end
+fit cPageALimit 'On error: page is too big.
+
+
+
+
 
 
 org cPageA
@@ -1111,39 +1263,13 @@ Entry
                                 or          dira, pin27
                                 or          outa, pin27
 
-
                                 wrword      par, #8       'zero trace address
                                 wrlong      par, #12
-                                mov         _addr, par
-                                add         _addr, #26
-
-                                mov         numUserPortsAddr, _addr
-                                add         _addr, #2                           'maxUserPorts
-
-                                rdword      maxUserPorts, _addr
-                                add         _addr, #2                           'userPortsAddr
-
-                                rdword      userPortsAddr, _addr
-                                add         _addr, #2
-
-                                add         _addr, #2                           'skip rx and tx pin
-
-                                { Setup rx low counter. }
-                                mov         frqb, #1              
-                                mov         ctrb, lowCounterMode            'pin number written in LoadSettings
-                               
-                                'rxBufferAddr, cmdBufferResetAddr
-                                rdword      rxBufferAddr, _addr 
-                                mov         cmdBufferResetAddr, rxBufferAddr    'cmdBufferResetAddr = cmdBufferAddr - 1 due to pre-increment for writes
-                                sub         cmdBufferResetAddr, #1
-                                add         _addr, #2
- 
-                                rdword      txBufferAddr, _addr                          'txBufferAddr
-                                add         _addr, #2
-
-                                'rdword      maxRxPayloadSize, _addr                           'maxRxPayloadSize
-                                add         _addr, #4               'skip cmdBufferMaxSize and rspBufferMaxSize
-
+'
+'                                { Setup rx low counter. }
+'                                mov         frqb, #1              
+'                                mov         ctrb, lowCounterMode            'pin number written in LoadSettings
+'
 
                                 jmp         #FinishInit
 
@@ -2044,16 +2170,16 @@ ErrorHandler
 }
 { todo: consider non-printable character substitution }
 CopyStringFromTable
-                                shl         _copyIndex, #1                              '@(StringTable[i]) = @StringTable + 2*i
+                                shl         _copyIndex, #1                          '@(StringTable[i]) = @StringTable + 2*i
                                 add         _copyIndex, stringTableAddr
                                 rdword      _copySrcAddr, _copyIndex
 CopyString
                                 mov         _copyTmp_SH, _copyMaxSize
                                 mov         _copySize, #0
 
-:loop                           rdbyte      _copyByte, _copySrcAddr             wz
+:loop                           rdbyte      _copyByte, _copySrcAddr         wz
                                 add         _copySrcAddr, #1
-                        if_z    jmp         CopyString_ret                              'NUL found, exit now without copying it
+                        if_z    jmp         CopyString_ret                          'NUL found, exit now without copying it
                                 wrbyte      _copyByte, _copyDestAddr
                                 add         _copyDestAddr, #1
                                 add         _copySize, #1
@@ -2079,16 +2205,24 @@ CopyBytes
 CopyBytes_ret                   ret
 
 
+RetainLock
+                                lockset     memLockID                       wc
+                        if_c    jmp         #$-1
+RetainLock_ret                  ret
+
+
+ReleaseLock
+                                lockclr     memLockID
+ReleaseLock_ret                 ret
+
 { Trace (call)
     Writes the current program counter and system clock (cnt) to hub for debugging.
     Usage:  call   #Trace
 }
-Trace                           wrword      Trace_ret, tracePcAddr
+Trace                           wrword      Trace_ret, #6
                                 mov         traceCnt, cnt
-                                wrlong      traceCnt, traceCntAddr
+                                wrlong      traceCnt, #8
 Trace_ret                       ret
-tracePcAddr     long    8
-traceCntAddr    long    12
 traceCnt        long    0
 
 
@@ -2107,48 +2241,51 @@ pause long 40_000_000
 
 fit cPageA 'On error: permanent code too big.
 
-
 { FinishInit
     Initialization continues here from the Entry area.
 }
 FinishInit
+                                { todo: mechanism to guarantee only one driver cog per driver block }
 
-                                rdword      datConstantsAddr, _addr             'datConstantsAddr
+                                { * Following Assumes DriverBlock Layout * }
+
+                                mov         _addr, par
+                                add         _addr, #76
+                                rdbyte      memLockID, _addr                        'memLockID
+
+                                { Disable the memory locking mechanism if no valid lock ID provided. }
+                                cmp         memLockID, #8                       wc  'c=0 no valid lock ID
+                        if_nc   mov         RetainLock, initRetainLockSkip
+                        if_nc   mov         ReleaseLock, initReleaseLockSkip
+
+                                { The next nine initialization constants can be loaded with a loop if the corresponding
+                                    cog registers are in the correct sequence. }
+
+                                mov         _initTmp_SH, #9
+                                movd        :load, #cmdBuffAddr
+
                                 add         _addr, #2
 
-                                rdword      pageTableAddr, _addr                'pageTableAddr
-                                add         _addr, #2
+:loop                           add         _addr, #2
+:load                           rdword      0-0, _addr                          'cmdBuffAddr to maxNumUserPorts
+                                add         :load, kOneInDField
+                                djnz        _initTmp_SH, #:loop
 
-                                add         _addr, #1   'skip numPages
-
-                                rdbyte      _x, _addr                           'crowAddress
-                                movs        _RxVerifyAddress, _x
-                                add         _addr, #1                           'accessLockID
-
-                                {todo: move address to load settings }
-
-                                rdbyte      accessLockID, _addr
-
-                                add         _addr, #1                           'cogID (written to hub)
+                                { Write the cogID field. }
+                                add         _addr, #12
                                 cogid       _x
                                 wrbyte      _x, _addr
 
-                                add         _addr, #3                           'txScratchAddr
-                                mov         txScratchAddr, _addr
+                                { Misc }
+                                mov         frqb, #1
 
-                                add         _addr, #4
-                                mov         driverLockAddr, _addr               'driverLockAddr
+                                { Done with one-time initialization constants, now load settings. }
 
-                                { todo: reorder }
-                                mov         _addr, par
-                                add         _addr, #25
-                                rdbyte      otherOptions, _addr
-
-
-                                { todo: calculate -> load }
-                                { finally, execute the CalculateTimings page; it will automatically go to RecoveryMode afterwards }
-                                mov         _page, #cCalculateTimings
+                                mov         _page, #cLoadSettingsStart_A
                                 jmp         #ExecutePageA
+
+initRetainLockSkip              jmp         RetainLock_ret
+initReleaseLockSkip             jmp         ReleaseLock_ret
 
 
 fit cPageALimit 'On error: FinishInit too big.
@@ -2168,15 +2305,6 @@ _pageAddr       res
 '_pageTmp in SPRs
 
 { ---- }
-
-
-
-
-
-
-
-
-
 
 
 
@@ -2267,16 +2395,20 @@ driverLockAddr          res
 
 
 
-{ Addresses
-    These address registers MUST appear in the same order as in the driver block.
+{ Initialization Constants
+    After memLockID, these must appear in the same order as in the driver block.
 }
-cmdBufferAddr           res
-rspBufferAddr           res
+memLockID               res
+cmdBuffAddr             res
+rspBuffAddr             res
 userPortsTableAddr      res
 pageTableAddr           res
 stringTableAddr         res
 txScratchAddr
 txBlockAddr             res
+cmdBuffSize             res
+rspBuffSize             res
+maxNumUserPorts         res
 
 
 
@@ -2314,6 +2446,20 @@ org 494
 
 txBitPeriodA    res 'must be at even address
 txBitPeriodB    res 'must be at address immediately after txBitPeriodA
+
+
+{ Payload Buffers
+    The sizes are set in the CON section.
+
+    The payload buffers must be long-aligned.
+}
+CmdBuffer           long    0[cCmdBuffSizeInLongs]
+RspBuffer           long    0[cRspBuffSizeInLongs]
+
+{ UserPortsTable
+    
+}
+UserPortsTable      word    0[3*cMaxNumUserPorts]
 
 
 
