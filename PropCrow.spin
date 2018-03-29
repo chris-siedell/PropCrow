@@ -52,6 +52,12 @@ cUserPortsLongs  = ((cMaxNumUserPorts*6) / 4) + 1
 { Abort Codes }
 cFailedToObtainLock     = -1000
 
+{ Driver States }
+cPreLaunch              = 0
+cInitializing           = 1
+cIdleWithBD             = 2
+cIdleNoBD               = 3
+
 
 
 { Other Constants }
@@ -83,6 +89,8 @@ cSendErrorFlag      = %0000_0100
 
 
 
+
+
 { Paging Constants 
     Paging is used to increase code space. This is the layout of cog registers:
 
@@ -110,7 +118,7 @@ cSendErrorFlag      = %0000_0100
 }
 cPageBLimit     = 35
 cPageA          = 408
-cPageAMaxSize   = 37
+cPageAMaxSize   = 39
 cPageALimit     = cPageA + cPageAMaxSize
 
 
@@ -181,6 +189,7 @@ token_SH        = $1F2      'sh-ina     must remain unchanged for sending respon
 _txWait_SH      = $1F1      'sh-cnt
 _rxF16U_SH      = $1F1      'sh-cnt
 
+_idleWait_SH    = $1F3
 _mathTmp_SH     = $1F3
 _copyTmp_SH     = $1F3
 _pageTmp_SH     = $1F3      'sh-inb
@@ -302,14 +311,14 @@ Framining Errors
 
 otherOptions
 -------------
-shutdownDriver          = %0_0000_0001      1 instructs driver to do graceful cog stop
-enableDriver            = %0_0000_0010      0 puts driver in idle mode until setting changes
-rxLevelInverted         = %0_0000_0100
-txLevelInverted         = %0_0000_1000
-interruptLevel          = %0_0nnn_0000
-useTwoStopBits          = %0_1000_0000
-enableErrorResponses    = %1_0000_0000
-
+shutdownDriver          = %00_0000_0001      1 instructs driver to do graceful cog stop
+enableDriver            = %00_0000_0010      0 puts driver in idle mode until setting changes
+rxLevelInverted         = %00_0000_0100
+txLevelInverted         = %00_0000_1000
+interruptLevel          = %00_0nnn_0000
+useTwoStopBits          = %00_1000_0000
+enableErrorResponses    = %01_0000_0000
+enableBreakDetection    = %10_0000_0000
 
 interruptLevel:
     otherOptions & $70 =
@@ -318,8 +327,7 @@ interruptLevel:
         $20 - medium - 10 bit periods
         $30 - high - 1/16th break
         else - off
-
-
+At very low baudrates or short break thresholds the high level may be shorter than low or medium, but the defitions do not change.
 
 clockOptions Bitfield
 ---------------------
@@ -331,6 +339,13 @@ enableAutobaud      = %0_0010   enables autobaud features (baud detect, cont rec
 requireBaudDetect   = %0_0100   ignored if enableAutobaud is false
 requireContRecal    = %0_1000   ignored if enableAutobaud is false
 writeClkfreq        = %1_0000   if autobaud is used the driver will write its best estimate of clkfreq to LONG[0] (assuming host provides a nominal baudrate)
+
+breakThreshold notes
+- the break threshold time must not exceed the cnt rollover time (e.g. 53s @ 80 MHz) -- this should not be a problem (remember, to disable, set to zero)
+- this threshold is the minimum duration of a break condition before PropCrow will detect it. In practice, the actual break condition sent
+  must be greater than this threshold to be reliably detected. todo: how must greater? 1/16th + margin?
+- break thresholds less than 160ms may not work reliably at slowest clock speeds (todo: explain)
+- connection between break threshold and recovery time
 }
 
 
@@ -349,72 +364,73 @@ __currTxPin                 byte 30                 '   5   1   L
 __currAddress               byte 1                  '   6   1   L   must be 1 to 31
                             byte 0                  '   7   1   -
 
-__currBaudrate              long 115200             '   8   4   L
+__currBaudrate              long 115200             '   8   4   L   <300 becomes 300
 
 __currClockOptions          long $1f1f_0b01         '   12  4   L
 
 __currOtherOptions          word 0                  '   16  2   L
-__currBreakThreshold        word 100                '   18  2   L   in milliseconds, 0 disables break detection; the break threshold time must not exceed the cnt rollover
+__currBreakThreshold        word 200                '   18  2   L   in MILLIseconds; 0 becomes 1 (set enableBreakDetection=0 to disable)
 
-__currInterbyteTimeout      long 150_000            '   20  4   L   in MICROseconds (bit 31 = 0) or bit periods (bit 31 = 1)
+__currCommandPorch          long 16 | |< 31         '   20  4   L   in microseconds (bit 31 = 0) or bit periods (bit 31 = 1); 0 becomes 1
 
-__currMinResponseDelay      long 0                  '   24  4   L   in MICROseconds
+__currInterbyteTimeout      long 150_000            '   24  4   L   in microseconds (bit 31 = 0) or bit periods (bit 31 = 1)
 
-                            long 0                  '   28  4   -
+__currMinResponseDelay      long 0                  '   28  4   L   in microseconds
+
+__currPostResponseWait      long 0                  '   32  4   L   in microseconds
+
+__currUserCodeTimeout       long 100_000            '   36  4   L   in microseconds (bit 31 = 0) or clocks (bit 31 = 1)
+
+                            long 0                  '   40  4   -
 
 'Reset Settings
 
-long 0[7]
+long 0[10]
 
 'Other Settings (Non-Resettable)
 
-__userCodeTimeout           long 100_000            '   60  4   L   in MICROseconds (bit 31 = 0) or clocks (bit 31 = 1)
+__breakHandler              word 0                  '   84  2   s   enableBreakDetection must be 1 even if defined; 0 selects driver's internal handler
+                            word 0                  '   86  2   -
 
-__breakHandler              word 0                  '   64  2   s   0 selects driver's internal handler that resets settings (allowBreakReset must still be true)
-                            word 0                  '   66  2   -
+__remotePermissions         byte 0                  '   88  1   L
+                            byte 0[3]               '   89  3   -
 
-__remotePermissions         byte 0                  '   68  1   L
-                            byte 0[3]               '   69  3   -
-
-                            long                    '   72  4   -
+                            long                    '   92  4   -
 
 'Initialization Constants
 
-__memLockID                 byte 200                '   76  1   I
-                            byte 0[3]               '   77  3   -
+__memLockID                 byte 200                '   96  1   I
+                            byte 0[3]               '   97  3   -
 
-__cmdBuffAddr               word 0-0                '   80  2   I
-__rspBuffAddr               word 0-0                '   82  2   I
+__cmdBuffAddr               word 0-0                '   100 2   I
+__rspBuffAddr               word 0-0                '   102 2   I
 
-__userPortsTableAddr        word 0-0                '   84  2   I
-__pageTableAddr             word 0-0                '   86  2   I
+__userPortsTableAddr        word 0-0                '   104 2   I
+__pageTableAddr             word 0-0                '   106 2   I
 
-__stringTableAddr           word 0-0                '   88  2   I
-__txBlockAddr               word 0-0                '   90  2   I
+__stringTableAddr           word 0-0                '   108 2   I
+__txBlockAddr               word 0-0                '   110 2   I
 
-__cmdBuffSize               word cCmdBuffSize       '   92  2   I
-__rspBuffSize               word cRspBuffSize       '   94  2   I
+__cmdBuffSize               word cCmdBuffSize       '   112 2   I
+__rspBuffSize               word cRspBuffSize       '   114 2   I
 
-__maxNumUserPorts           word cMaxNumUserPorts   '   96  2   I
-__numPages                  byte cNumPages          '   98  1   I
-__numStrings                byte cNumStrings        '   99  1   I
+__maxNumUserPorts           word cMaxNumUserPorts   '   116 2   I
+__numPages                  byte cNumPages          '   118 1   I
+__numStrings                byte cNumStrings        '   119 1   I
 
-                            long 0                  '   100 4   -
+                            long 0                  '   120 4   -
+
 'Informational Settings
 
-__deviceNameAddr            word 0                  '   104 2   s   0 disables
-__deviceDescAddr            word $ffff              '   106 2   s   0 disables, $ffff selects "Propeller P8X32A (cog X) running PropCrow vM.m."
+__deviceNameAddr            word 0                  '   124 2   s   0 disables
+__deviceDescAddr            word $ffff              '   126 2   s   0 disables, $ffff selects "Propeller P8X32A (cog X) running PropCrow vM.m."
 
 'Internal and Diagnostic
 
-__cogID                     byte 200                '   108 1   D   set by driver cog during initialization
-__lastClkMode               byte 0                  '   109 1   D   value of BYTE[4] the last time settings were loaded
-                            word 0                  '   110 2   -   
-
-__lastClkFreq               long 0                  '   112 4   D   value of LONG[0] the last time settings were loaded
+__cogID                     byte 200                '   128 1   D   set by driver cog during initialization; 200 is pre-initial-launch flag value
+                            byte 0[3]               '   129 3   -
 
 
-                            long 0                  '               nominal baudrate in use as reported by host
 
 
 { PageTable
@@ -1137,7 +1153,8 @@ fit cPageALimit 'On error: page is too big.
 
 
 { Idle_A
-    This page MUST be called only by LoadSettingsFinish (_idle* inherits/aliases some values from _load*).
+    This page MUST be executed only by LoadSettings (_idle* inherits/aliases some values from _load*).
+    This page will change the reported driver status to IdleWithBD or IdleNoBD.
 }
 org cPageA
 Idle_A
@@ -1147,58 +1164,110 @@ Idle_A
                                     (3) baudrate is too fast (depends on clkfreq and baudrate) and enableAutobaud=0.
 
                                   In each of these cases the decision to enter idle mode was made in LoadSettings. Note that 
-                                    if enableAutobaud=1 the baudrate being too fast will never cause the driver to enter idle mode.
-                                    Instead, it will keep trying to determine the baudrate until it succeeds or the settings change.
+                                    if enableAutobaud=1 the calculated baudrate being too fast will never cause the driver to enter
+                                    idle mode. Instead, it will enter and stay in baud detect mode until it successfully determines
+                                    the baud rate or the settings change.
 
-                                  Exiting idle mode occurs when:
+                                  Exiting the Idle page (not necessarily idle mode) occurs when:
                                     (1) the changedFlag is raised, or
                                     (2) the clkfreq or clkmode values change (compared to those used last time in LoadSettings), or
-                                    (3) a break was detected (requires breakThreshold>0).
+                                    (3) a break was detected (requires enableBreakDetection, and depends on _idleBreakClocks and ctrb being setup).
 
-                                  In cases 1 and 2 idle mode exits by executing the LoadSettingsStart page. In case 3 it exits by
-                                    invoking the break handler.
+                                  In cases 1 and 2 the page exits by executing the LoadSettingsStart page. In case 3 it exits by
+                                    executing the BreakHandler page.
 
                                   One purpose of idle mode is to put the driver into a safe standby state when changing the clock source.
-                                    If clkfreq is reduced significantly while the driver is receiving or sending data not only will the
-                                    data be corrupted, but it may be a long time before the driver loads the new settings (e.g. going from
-                                    80MHz to 13kHz is a 6000x slowdown). For this reason the driver always polls at a fixed interval in idle mode.
-                                }
-
-                                { Since this page should be called only from LoadSettingsFinish we can inherit some values by aliasing:
+                                    If the system clock is reduced significantly while the driver is receiving or sending data not only will the
+                                    data be corrupted, but it may be a long time before the driver finishes its task and loads the new settings
+                                    (e.g. going from 80MHz to 13kHz is a 6000x slowdown). For this reason, in idle mode the driver always polls
+                                    for changes at an interval that should work at any anticipated clock speed.
+                                
+                                  Since this page is called only from LoadSettings* we can inherit some values by aliasing:
                                     _idleClkfreq = _loadClkfreq = clkfreq used in last LoadSettings,
                                     _idleClkmode = _loadClkmode = clkmode used in last LoadSettings, and
-                                    _idleBreakClocks = _loadBreakClocks = clocks per break threshold interval. }
+                                    _idleBreakClocks = _loadBreakClocks = clocks per break threshold interval (guaranteed non-zero).
 
-                                mov         _idleTmp_SH, cnt
-                                add         _idleTmp_SH, idlePollInterval
+                                  There are two subtypes of idle mode -- with and without break detection: 
+                                    - With break detection the polling interval is given by the following formula:
+                                        pollClocks = max( min(idleMaxPollClocks, _idleBreakClocks/16), idleMinPollClocks)
+                                      where min and max have their conventional meanings (not the PASM instructions), and
+                                        idleMaxPollClocks = some constant that is sufficiently low enough to keep the driver responsive
+                                                          at any anticipated clock speed. A value of 5000 means that the driver should respond
+                                                          within half-a-second at the lowest supported speed of 10kHz.
+                                        _idleBreakClocks/16 = 1/16th the break threshold in clocks, from the latest LoadSettings call.
+                                        idleMinPollClocks = a constant that is sufficiently large enough to prevent the polling
+                                                          loop from experiencing waitcnt rollover.
+                                    - Without break detection idleMaxPollClocks is used. }
 
-                                { Sleep for fixed amount of time. }
-:loop                           waitcnt     _idleTmp_SH, idlePollInterval
+                                { Determine the poll interval, in clocks, according to the formula in the notes above. }
+                                mov         _idlePoll, idleMaxPollClocks            'default if no break detection used
+                                test        stateAndFlags, #cEnableBreaks   wc
+                        if_c    mov         _x, _idleBreakClocks
+                        if_c    shr         _x, #4                                  '_x is 1/16th of break threshold in clocks
+                        if_c    max         _idlePoll, _x                           '(_x being zero is OK) 
+                        if_c    min         _idlePoll, idleMinPollClocks
 
-                                { Check changedFlag, clkmode, and clkfreq. We don't retain the lock since detecting a change before user code is done
-                                    is harmless -- the LoadSettings page will block until the user code releases the lock. }
+                                { Update driver state. }
+                        if_c    movs        stateAndFlags, #cIdleWithBD
+                        if_nc   movs        stateAndFlags, #cIdleNoBD
+                                wrbyte      stateAndFlags, stateAddr
+
+                                { A break condition is detected if _idleBreakClocks/_idlePoll consecutive polling intervals pass with
+                                    the rx line always at zero (or one interval when _idleBreakClocks < _idlePoll). }
+                        if_c    mov         _x, _idleBreakClocks                    '_idleBreakClocks is always non-zero by LoadSettings (but would be OK anyway)
+                        if_c    mov         _y, _idlePoll                           '_idlePoll >= idleMinPollClocks > 0
+                        if_c    call        #Divide                                 '_y = floor(_x-before/_y-before) = num poll intervals per break threshold
+                                test        stateAndFlags, #cEnableBreaks   wc      'reset c after Divide call
+                        if_c    mov         _idleBDReset, _y                wz      'z=1 result of division was zero (_idleBreakClocks < _idlePoll)
+                  if_c_and_z    mov         _idleBDReset, #1                        '  require a minimum of one full interval in that case (would get djnz wraparound othws)
+                        if_c    add         _idleBDReset, #1                        'add 1 since the djnz test occurs immediately after the reset
+
+                                { Pre-loop setup. Given the following arrangement, the first time through the loop we will have
+                                    _idlePrevCount = phsb0, and _idleCurrCount = phsb0 + 18 (todo: check).
+                                  Since _idlePoll >= idleMinPollClocks > 18, there is a guaranteed countdown reset. }
+                                mov         _idlePrevCount, phsb
+                                mov         _idleWait_SH, cnt
+                                add         _idleWait_SH, #9
+
+                                { WARNING: any code changes inside the loop below require that idleMinPollClocks be recalculated and tested.
+                                    A too-low value will cause the loop to freeze due to waitcnt rollover (53s @ 80MHz, 5 days @ 10kHz). }
+
+:loop                           waitcnt     _idleWait_SH, _idlePoll
+                        if_c    mov         _idleCurrCount, phsb
+                                { Check changedFlag, clkmode, and clkfreq. We don't retain the lock since detecting a change before user code
+                                    is done is harmless -- the LoadSettingsStart page will block until the user code releases the lock. 
+                                  The break detection instructions ('if_c') are interleaved to take advantage of obligate hubop timing and reduce
+                                    idleMinPollClocks. If a change condition occurs (z=0) they execute harmlessly. }
                                 rdbyte      _x, par                         wz      'z=0 changedFlag is raised
+                         if_c   mov         _idleCheck, _idlePrevCount
+                         if_c   add         _idleCheck, _idlePoll                   '_idleCheck will be = _idleCurrCount IF rx line zero for entire poll interval
                         if_z    rdbyte      _x, #4
                         if_z    cmp         _x, _idleClkmode                wz      'z=0 clkmode has changed
+                         if_c   mov         _idlePrevCount, _idleCurrCount
                         if_z    rdlong      _x, #0
                         if_z    cmp         _x, _idleClkfreq                wz      'z=0 clkfreq has changed
-                        if_nz   jmp         #:exitToLoadSettings
+                        if_nz   jmp         #:exit                                  'exit due to settings change (z=0)
 
-                                { If we reach this point that means there was no official change in the settings over the past polling
-                                    interval. So we can safely use _idleBreakMultiple to check if a break condition exists. }
+                                { Reset break detection countdown if the line was non-zero at any point in the past interval. }
+                        if_c    cmp         _idleCheck, _idleCurrCount      wz      'z=0 rx line was non-zero at some point
+                    if_c_and_nz mov         _idleBDCountdown, _idleBDReset
 
-                                {todo: redo for polling interval that is max(min(5000, breakThresholdInClocks/breakMultiple), minClocksPerPoll) }
+                                { Now test if a break condition exists (only 'if_c'). }
+                        if_c    djnz        _idleBDCountdown, #:loop        wz      'exit (don't jump) if break condition detected (z=1)
+                        if_nc   jmp         #:loop
 
-                                jmp         #:loop
+                                { REPEAT WARNING: don't change loop above without recalculating idleMinPollClocks. }
 
+:exit                   if_z    mov         _page, #cBreakHandler_A
+                        if_nz   mov         _page, #cLoadSettingsStart_A
+                                jmp         #ExecutePageA
 
-                                { The polling interval is fixed since idle mode exists in part to facilitate clock changes (we can't rely
-                                    on a clkfreq based interval or we may end up sleeping for a long time). It is important to choose an interval
-                                    sufficiently low enough to keep the driver responsive at any anticipated clock speed. A value of 
-                                    5000 means that the driver will respond within half-a-second even at the lowest supported speed of 10kHz. }
+idleMinPollClocks     long    100       'based on instructions in loop; manual count gives 89, so 100 should be safe (todo: test)
 Idle_A_end
-idlePollInterval    long    5000
+idleMaxPollClocks     long    5000      'see notes at top of code page
 fit cPageALimit 'On error: page is too big.
+
+
 
 { CalculateBitPeriods_A
     This page calculates the bit periods based on currBaudrate and clkfreq (LONG[0]). It also calculates startBitWait.
@@ -1220,6 +1289,8 @@ org cPageA
 CalculateBitPeriods_A
                                 { * Assumes Lock Retained * }
                                 { * Assumes DriverBlock Layout * }
+
+                                { todo: redo}
 
                                 { todo: prove that it is not worth it to attempt 32 clock support (which tx code can handle). }
 
@@ -2384,7 +2455,11 @@ FinishInit
                                 { * Following Assumes DriverBlock Layout * }
 
                                 mov         _addr, par
-                                add         _addr, #76
+
+                                add         _addr, #1
+                                mov         stateAddr, _addr                        'stateAddr
+
+                                add         _addr, #96
                                 rdbyte      memLockID, _addr                        'memLockID
 
                                 { Disable the memory locking mechanism if no valid lock ID provided. }
@@ -2441,43 +2516,54 @@ _pageAddr       res
 { ---- }
 
 
+'_idle* must not alias _math*
+'_idleWait in SPRs
 
 
-
+_idleBDReset
 _loadBaud
 _rcvyCurrPhsb
 _rxLastWait1
 _txMaxChunkRemaining    res
 
+_idlePoll
 _loadIBTimeoutMS
 _copyIndex
 _rxAddr         res
 
-_loadBreakMS
+_idleCountdown      'may alias _idleBreakClocks since _idleBreakClocks not used in loop
+_idleBreakClocks    'must alias _loadBreakClocks
+_loadBreakMS    'todo update
 _copySize
 _rcvyPrevPhsb
 _txAddr         res
 
+_idlePrevCount
 _loadOptions
 _copyMaxSize
 _rxCountdown
 _txCount        res
 
+_idleClkfreq     'must alias _loadClkfreq
 _loadClkFreq
 _copyCount
 _rxMixed  
 _txNextByte     res
 
+
+_idleClkmode     'must alias _loadClkmode
 _loadClkMode
 _copyDestAddr
 _rxLockingUser
 _txByte         res
 
+_idleCheck
 _loadTwoBit
 _copySrcAddr
 _txF16L
 _rxPrevByte         res
 
+_idleCurrCount
 _loadClkPerMS
 _copyByte
 _txF16U
@@ -2554,6 +2640,15 @@ rxPhsbReset         res
 
 minRspDelay         res
 userCodeTimeout     res
+
+{ stateAndFlags
+    byte 0 - the driver state; WriteState writes this byte to the driver block for diagnostic and runtime use by outside code
+    bit 9 - not used; this allows using movs to set the state
+    bit 10 - enableBreaksFlag
+
+}
+stateAndFlags       res
+stateAddr           res
 
 { Argument/Result Variables
     The following registers are never used by the sending or utility routines except as calling arguments
