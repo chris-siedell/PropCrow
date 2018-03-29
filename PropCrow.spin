@@ -181,6 +181,7 @@ token_SH        = $1F2      'sh-ina     must remain unchanged for sending respon
 _txWait_SH      = $1F1      'sh-cnt
 _rxF16U_SH      = $1F1      'sh-cnt
 
+_mathTmp_SH     = $1F3
 _copyTmp_SH     = $1F3
 _pageTmp_SH     = $1F3      'sh-inb
 _txTmp_SH       = $1F3      'sh-inb
@@ -276,7 +277,7 @@ dat
         I - Initialization value. Must be set before launch and remain constant after.
         D - Only driver cog writes these values.
         ID -
-        L - Locked settings -- all cogs must use a hardware lock (memLockID) to read and write. If other cogs
+        L - Locked settings -- all cogs must use a hardware lock (memLockID) to read and write*. If other cogs
             change any of these settings they must raise changedFlag (write a non-zero byte) before releasing the lock.
             The driver cog will clear changedFlag (under lock) when it applies the settings.
         Lf - Any cog may read without hardware lock, but all cogs must have lock to write.
@@ -289,6 +290,9 @@ dat
   change these only under hardware lock (memLockID), and should raise changedFlag before releasing the lock.
   If these are changed without raising the changedFlag and framing errors occur the driver will notice that the
   values have changed and will reload the settings (assuming those hub locations are updated).
+
+*If user code just wants to know the value of setting at the given instant it can use an atomic read
+without getting the lock. Correlating multiple fields (including the changed flag) requires a lock.
 
 Framining Errors
 - first check if settings have changed, including clkfreq and clkmode
@@ -322,14 +326,13 @@ clockOptions Bitfield
 in four identically formatted bytes for each of four clock sources
 bytes: 0: xtal, 1: xin, 2: rcfast, 3: rcslow
 for each clock source:
-useSource           = %0001   if false, driver will be idle until setting or source changes
-enableAutobaud      = %0010   enables autobaud features (baud detect, cont recal) if framing errors threshold is met or if commanded
-requireBaudDetect   = %0100   ignored if enableAutobaud is false
-requireContRecal    = %1000   ignored if enableAutobaud is false
-
-
-
+useSource           = %0_0001   if false, driver will be idle until setting or source changes
+enableAutobaud      = %0_0010   enables autobaud features (baud detect, cont recal) if framing errors threshold is met or if commanded
+requireBaudDetect   = %0_0100   ignored if enableAutobaud is false
+requireContRecal    = %0_1000   ignored if enableAutobaud is false
+writeClkfreq        = %1_0000   if autobaud is used the driver will write its best estimate of clkfreq to LONG[0] (assuming host provides a nominal baudrate)
 }
+
 
 DriverBlock
                                                     '   pos len typ notes
@@ -351,7 +354,7 @@ __currBaudrate              long 115200             '   8   4   L
 __currClockOptions          long $1f1f_0b01         '   12  4   L
 
 __currOtherOptions          word 0                  '   16  2   L
-__currBreakThreshold        word 100                '   18  2   L   in milliseconds 
+__currBreakThreshold        word 100                '   18  2   L   in milliseconds, 0 disables break detection; the break threshold time must not exceed the cnt rollover
 
 __currInterbyteTimeout      long 150_000            '   20  4   L   in MICROseconds (bit 31 = 0) or bit periods (bit 31 = 1)
 
@@ -411,7 +414,7 @@ __lastClkMode               byte 0                  '   109 1   D   value of BYT
 __lastClkFreq               long 0                  '   112 4   D   value of LONG[0] the last time settings were loaded
 
 
-
+                            long 0                  '               nominal baudrate in use as reported by host
 
 
 { PageTable
@@ -639,7 +642,7 @@ ParsingErrorHandler_B
     command. If the line is low for long enough then the implementation determines that a break condition has occurred.
   See page 99.
 }
-'todo (3/17): does the removal of the ctrb off code change any timings?
+'todo (3/17): does the removal of the ctrb off code change any timings? (3/28: don't think so)
 RecoveryMode
                                 mov         cnt, recoveryTime
                                 add         cnt, cnt
@@ -1133,6 +1136,143 @@ LoadSettingsStart_A_end
 fit cPageALimit 'On error: page is too big.
 
 
+{ Idle_A
+    This page MUST be called only by LoadSettingsFinish (_idle* inherits/aliases some values from _load*).
+}
+org cPageA
+Idle_A
+                                { The driver will enter idle mode for these reasons:
+                                    (1) enableDriver=0, or
+                                    (2) useSource=0 for clock source (clkmode), or
+                                    (3) baudrate is too fast (depends on clkfreq and baudrate) and enableAutobaud=0.
+
+                                  In each of these cases the decision to enter idle mode was made in LoadSettings. Note that 
+                                    if enableAutobaud=1 the baudrate being too fast will never cause the driver to enter idle mode.
+                                    Instead, it will keep trying to determine the baudrate until it succeeds or the settings change.
+
+                                  Exiting idle mode occurs when:
+                                    (1) the changedFlag is raised, or
+                                    (2) the clkfreq or clkmode values change (compared to those used last time in LoadSettings), or
+                                    (3) a break was detected (requires breakThreshold>0).
+
+                                  In cases 1 and 2 idle mode exits by executing the LoadSettingsStart page. In case 3 it exits by
+                                    invoking the break handler.
+
+                                  One purpose of idle mode is to put the driver into a safe standby state when changing the clock source.
+                                    If clkfreq is reduced significantly while the driver is receiving or sending data not only will the
+                                    data be corrupted, but it may be a long time before the driver loads the new settings (e.g. going from
+                                    80MHz to 13kHz is a 6000x slowdown). For this reason the driver always polls at a fixed interval in idle mode.
+                                }
+
+                                { Since this page should be called only from LoadSettingsFinish we can inherit some values by aliasing:
+                                    _idleClkfreq = _loadClkfreq = clkfreq used in last LoadSettings,
+                                    _idleClkmode = _loadClkmode = clkmode used in last LoadSettings, and
+                                    _idleBreakClocks = _loadBreakClocks = clocks per break threshold interval. }
+
+                                mov         _idleTmp_SH, cnt
+                                add         _idleTmp_SH, idlePollInterval
+
+                                { Sleep for fixed amount of time. }
+:loop                           waitcnt     _idleTmp_SH, idlePollInterval
+
+                                { Check changedFlag, clkmode, and clkfreq. We don't retain the lock since detecting a change before user code is done
+                                    is harmless -- the LoadSettings page will block until the user code releases the lock. }
+                                rdbyte      _x, par                         wz      'z=0 changedFlag is raised
+                        if_z    rdbyte      _x, #4
+                        if_z    cmp         _x, _idleClkmode                wz      'z=0 clkmode has changed
+                        if_z    rdlong      _x, #0
+                        if_z    cmp         _x, _idleClkfreq                wz      'z=0 clkfreq has changed
+                        if_nz   jmp         #:exitToLoadSettings
+
+                                { If we reach this point that means there was no official change in the settings over the past polling
+                                    interval. So we can safely use _idleBreakMultiple to check if a break condition exists. }
+
+                                {todo: redo for polling interval that is max(min(5000, breakThresholdInClocks/breakMultiple), minClocksPerPoll) }
+
+                                jmp         #:loop
+
+
+                                { The polling interval is fixed since idle mode exists in part to facilitate clock changes (we can't rely
+                                    on a clkfreq based interval or we may end up sleeping for a long time). It is important to choose an interval
+                                    sufficiently low enough to keep the driver responsive at any anticipated clock speed. A value of 
+                                    5000 means that the driver will respond within half-a-second even at the lowest supported speed of 10kHz. }
+Idle_A_end
+idlePollInterval    long    5000
+fit cPageALimit 'On error: page is too big.
+
+{ CalculateBitPeriods_A
+    This page calculates the bit periods based on currBaudrate and clkfreq (LONG[0]). It also calculates startBitWait.
+    It is designed to pass execution on to another page specified by the _addr variable. It sets _z before executing the
+  next page, which can allow another page to call this one and then return (assume _z is always set accordingly before
+  calling the other page). 
+    Before: _addr - index of page to execute afterwards
+            lock: assumed retained if data consistency is important (baudrate and clkfreq)
+    After:  _x bit 0 = 1 - bit period had to be raised to 33 clocks (baudrate too fast for clock),
+                       0 - bit period was not adjusted,
+               bits 1-31 undefined
+            _y = two bit period, in clocks
+            _z = 0 (required as flag for pages calling this one with the intention to return)
+            c-flag = 0 - bit period is 34+
+                     1 - bit period is 33/33.5
+            lock: status unchanged
+}
+org cPageA
+CalculateBitPeriods_A
+                                { * Assumes Lock Retained * }
+                                { * Assumes DriverBlock Layout * }
+
+                                { todo: prove that it is not worth it to attempt 32 clock support (which tx code can handle). }
+
+                                { Calculate two bit period. }
+                                rdlong      _x, #0                                  '_x = clkfreq
+                                mov         _z, par
+                                add         _z, #8
+                                rdlong      _y, _z                                  '_y = currBaudrate
+                                min         _y, #300                                'silently enforce 300 bps minimum (can be supported at 10kHz < worst rcslow)
+                                shl         _x, #1
+                                call        #Divide                                 '_y = 2*clkfreq/baudrate = two bit period, in clocks
+                           
+                                { Limit bit period to at least 33 clocks and record if adjusted. Then determine if
+                                    bit period is less than 34 clocks (a special case). } 
+                                min         _y, #66                         wc      'c=1 bit period less than 33 (baudrate too fast for clock)
+                                muxc        _x, #1
+                                cmp         _y, #68                         wc      'c=1 bit period is 33/33.5; c=0 34+
+
+                                { Two bit periods -- A and B -- are used to approximate the true bit period to half clock resolution. 
+                                    The transmit code can support 33 clocks without problems. }
+                                mov         txBitPeriodA, _y
+                                shr         txBitPeriodA, #1
+                                mov         txBitPeriodB, txBitPeriodA
+                                test        _y, #1                          wz      'z=0 the two bit period is odd, so bit period is x.5
+                        if_nz   add         txBitPeriodB, #1
+                                
+                                { For bit periods of 34+ the rx bit periods are the same as the tx ones. }
+                        if_nc   mov         rxBitPeriodA, txBitPeriodA
+                        if_nc   mov         rxBitPeriodB, txBitPeriodB
+                        if_nc   mov         startBitWait, rxBitPeriodB              'startBitWait = 1/2 bit period - 10 clocks (10 clocks are 'baked-in' to wait instrs)
+                        if_nc   shr         startBitWait, #1                        '(using B with the idea that truncation tends to underestimate true value)
+                        if_nc   sub         startBitWait, #10                       'must be >= 5, which it will be since rxBitPeriodA >= 34
+
+                                { Bit periods of 33/33.5 constitute a special case since the lowest supported bit period
+                                    for most steps in the receive loop is 34 clocks. Sampling the stop bit as early as possible
+                                    and using the lowest bit periods may allow it to work. }
+                                { Todo: test this. }
+                        if_c    mov         rxBitPeriodA, #34
+                        if_c    mov         rxBitPeriodB, #34
+                        if_c    mov         startBitWait, #5                        '5 is smallest supported
+
+                                { In both cases -- 33/33.5 or 34+ -- rxBitPeriod5 is txBitPeriodA, since the interval after sampling
+                                    bit 5 (the hubop interval) can be 33 clocks. Therefore, rxBitPeriod5 aliases txBitPeriodA. }
+            
+                                { All done. }
+                                mov         _z, #0                                  '_z used as flag value by Idle page
+                                mov         _page, _addr
+CalculateBitPeriods_A_end       jmp         #ExecutePageA
+fit cPageALimit 'On error: page is too big.
+
+
+
+
 { LoadSettingsStart_A
 
 }
@@ -1220,10 +1360,6 @@ k1000                           long    1000
 
 fit cPageALimit 'On error: page is too big.
 
-
-
-
-
 org cPageA
 Calc3 
 
@@ -1252,25 +1388,20 @@ Calc3
 
 Calc3_end                       jmp         #RecoveryMode
 fit cPageALimit 'On error: page is too big.
-            
+
+
+{ Entry
+    Beginning of driver code used on launch. On launch this begins with initialization code. After
+  initialization this space is used for page B.
+} 
 org 0
-
 Entry
-
-{ The first 16 cog registers will contain a lookup table after initialization. At launch, it
-  contains initialization code. par = address of control block. }
-                                
                                 or          dira, pin27
                                 or          outa, pin27
 
-                                wrword      par, #8       'zero trace address
+                                wrword      par, #8       'zero trace addresses
                                 wrlong      par, #12
-'
-'                                { Setup rx low counter. }
-'                                mov         frqb, #1              
-'                                mov         ctrb, lowCounterMode            'pin number written in LoadSettings
-'
-
+                                
                                 jmp         #FinishInit
 
 
@@ -1280,40 +1411,42 @@ fit cPageBLimit 'On error: Entry initialization too big.
 { Permanent code starts here. }
 org cPageBLimit
 
-{ Multiply
+{ Multiply (call)
     Algorithm from the Spin interpreter, with sign code removed.
     Before: _x = multiplier
             _y = multiplicand
-    After: _x = lower half of product
-           _z = upper half of product
+    After:  _x = lower half of product
+            _z = upper half of product
+            _y unchanged
 }
 Multiply
                                 mov         _z, #0
-                                mov         inb, #32
+                                mov         _mathTmp_SH, #32
                                 shr         _x, #1              wc
 :mmul                   if_c    add         _z, _y              wc
                                 rcr         _z, #1              wc
                                 rcr         _x, #1              wc
-                                djnz        inb, #:mmul
+                                djnz        _mathTmp_SH, #:mmul
 Multiply_ret                    ret
 
-{ Divide 
+{ Divide (call)
     Algorithm from the Spin interpreter, with sign code removed.
     Before: _x = dividend
             _y = divisor
-    After: _x = remainder
-           _y = quotient
+    After:  _x = remainder
+            _y = quotient
+            _z undefined
 }
 Divide
                                 mov         _z, #0
-                                mov         inb, #32
+                                mov         _mathTmp_SH, #32
 :mdiv                           shr         _y, #1              wc, wz
                                 rcr         _z, #1
-                        if_nz   djnz        inb, #:mdiv
+                        if_nz   djnz        _mathTmp_SH, #:mdiv
 :mdiv2                          cmpsub      _x, _z              wc
                                 rcl         _y, #1 
                                 shr         _z, #1
-                                djnz        inb, #:mdiv2
+                                djnz        _mathTmp_SH, #:mdiv2
 Divide_ret                      ret
 
 
@@ -1348,7 +1481,7 @@ ReceiveCommand
 
                         if_nz   waitpne     rxMask, rxMask                          'wait for start bit edge
                         if_nz   add         _rxWait0, cnt
-                        if_nz   waitcnt     _rxWait0, bitPeriod0                    'wait to sample start bit
+                        if_nz   waitcnt     _rxWait0, rxBitPeriodA                  'wait to sample start bit
                         if_nz   test        rxMask, ina                     wc      'c=1 framing error; c=0 continue, with parser reset
                         if_z    jmp         #RecoveryMode                           '...exit for missed falling edge (need edge for accurate cont-recal)
                         if_c    jmp         #FramingErrorHandler
@@ -1359,7 +1492,7 @@ ReceiveCommand
 _RxLoopTop              if_nc   mov         _rxMixed, rxMixedReset                  'Mixed - reset byteCount, lowBitCount, writeVetoes (nonPayloadFlag is set)
                        
 'bit0 - 34 clocks
-:bit0                           waitcnt     _rxWait0, bitPeriod1
+:bit0                           waitcnt     _rxWait0, rxBitPeriodB
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0000_0001
                         if_nc   mov         phsb, rxPhsbReset                       'Cont-Recal 1 - reset low clocks count on reset; MUST change rxPhsbReset calculation if moved
@@ -1369,7 +1502,7 @@ _RxLoopTop              if_nc   mov         _rxMixed, rxMixedReset              
                         if_nc   mov         _rxF16L, #0                             'F16 1 - zero checksums on reset; see page 90
 
 'bit1 - 34 clocks
-:bit1                           waitcnt     _rxWait1, bitPeriod0
+:bit1                           waitcnt     _rxWait1, rxBitPeriodA
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0000_0010
                         if_nc   mov         _rxF16U_SH, #0                          'F16 2
@@ -1379,7 +1512,7 @@ _RxLoopTop              if_nc   mov         _rxMixed, rxMixedReset              
                         if_c    cmpsub      _rxF16U_SH, #255                        'F16 6 -  to work, which is not necc. true the first pass through, but is after.)
 
 'bit 2 - 34 clocks
-:bit2                           waitcnt     _rxWait1, bitPeriod1
+:bit2                           waitcnt     _rxWait1, rxBitPeriodB
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0000_0100
                         if_nc   mov         _rxOffset, _rxResetOffset               'Shift 1 - go back to first parsing group on reset (see page 93)
@@ -1389,7 +1522,7 @@ _RxLoopTop              if_nc   mov         _rxMixed, rxMixedReset              
                                 adds        _RxMovC, _rxOffset                      'Shift 5
 
 'bit 3 - 34 clocks
-:bit3                           waitcnt     _rxWait1, bitPeriod0
+:bit3                           waitcnt     _rxWait1, rxBitPeriodA
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0000_1000
                                 adds        _RxMovD, _rxOffset                      'Shift 6
@@ -1399,7 +1532,7 @@ _RxMovB                         mov         _RxShiftedB, 0-0                    
 _RxMovC                         mov         _RxShiftedC, 0-0                        'Shift 10
 
 'bit 4 - 34 clocks
-:bit4                           waitcnt     _rxWait1, bitPeriod1
+:bit4                           waitcnt     _rxWait1, rxBitPeriodB
                                 testn       rxMask, ina                     wz
                                 muxz        rxByte, #%0001_0000
 _RxMovD                         mov         _RxShiftedD, 0-0                        'Shift 11
@@ -1409,12 +1542,12 @@ _RxMovD                         mov         _RxShiftedD, 0-0                    
                         if_z    add         _rxAddr, #1                             'Write 2 - increment address (pre-increment saves re-testing the flag)
 
 'bit 5 - 33 clocks
-:bit5                           waitcnt     _rxWait1, bitPeriod0
+:bit5                           waitcnt     _rxWait1, rxBitPeriod5
                                 test        rxMask, ina                     wc
 _RxHubop                        long    0-0                                         'see RX Hubop; may be rxWriteByte (has 'if_z'), rxReadDriverLock, or nop
 
 'bit 6 - 34 clocks
-:bit6                           waitcnt     _rxWait1, bitPeriod1
+:bit6                           waitcnt     _rxWait1, rxBitPeriodB
                                 testn       rxMask, ina                     wz
                                 muxc        rxByte, #%0010_0000
                                 muxz        rxByte, #%0100_0000
@@ -1424,7 +1557,7 @@ _RxShiftedA                     long    0-0                                     
 _RxShiftedB                     long    0-0                                         'Shift 13
 
 'bit 7 - 34 clocks
-:bit7                           waitcnt     _rxWait1, bitPeriod0
+:bit7                           waitcnt     _rxWait1, rxBitPeriodA
                                 test        rxMask, ina                     wc
                                 muxc        rxByte, #%1000_0000
 _RxShiftedC                     long    0-0                                         'Shift 14
@@ -1433,7 +1566,7 @@ _RxShiftedD                     long    0-0                                     
                                 shr         rxByte, #4                              'Cont-Recal 6 - start getting low bits count for upper nibble
                                 movs        _RxAddUpperNibble, rxByte               'Cont-Recal 7 - (spacer required before Cont-Recal 8)
 'stop bit
-:stopBit                        waitcnt     _rxWait1, bitPeriod0                    'see page 98
+:stopBit                        waitcnt     _rxWait1, rxBitPeriodA                  'see page 98
                                 testn       rxMask, ina                     wz      'z=0 framing error
 
 _RxStartWait                    long    0-0                                         'see RX StartWait; may be rxContinue, rxExit, or rxParsingErrorExit (all 'if_z')
@@ -1441,7 +1574,7 @@ _RxStartWait                    long    0-0                                     
                         if_z    add         _rxWait0, cnt                           'Wait 1
 
 'start bit - 34 clocks (last instr at _RxLoopTop)
-:startBit               if_z    waitcnt     _rxWait0, bitPeriod0
+:startBit               if_z    waitcnt     _rxWait0, rxBitPeriodA
                         if_z    test        rxMask, ina                     wz      'z=0 framing error
 _RxAddUpperNibble       if_z    add         _rxMixed, 0-0                           'Cont-Recal 8 - finish adding low bit count for upper nibble of previous byte
                         if_z    mov         _rxTmp_SH, _rxWait0                     'Timeout 1
@@ -1474,6 +1607,7 @@ FramingErrorHandler
 rxReadDriverLock                rdword      _rxLockingUser, driverLockAddr          'check if user code has driver lock (will be zero if unlocked)
 rxWriteByte             if_z    wrbyte      _rxPrevByte, _rxAddr                    'Write 4 - write byte to command payload buffer (if writeVetoes are clear) 
 
+{ todo: (3/28) can tx hubop be used to provide state information to ensure safety when out-cogs change clock rate? }
 
 { RX StartWait, used by ReceiveCommand
     These instructions are shifted to _RxStartWait in the receive loop to either receive more bytes or exit the loop.
@@ -2353,9 +2487,12 @@ _rxRemaining        res
 { Semi-Global Variables }
 
 rspChunkRemaining
-cmdLowBits       res
+'cmdLowBits       res
 
 'cmdLowClocks     res
+
+cmdZeroClocks   res
+cmdZeroBits     res
 
 payloadSize     res
 
@@ -2367,36 +2504,25 @@ payloadSize     res
 'rxBitPeriodB    res
 'rxBitPeriod5    res
 
-rxMask  res
-txMask  res
-
-bitPeriod0      res
-bitPeriod1      res
-startBitWait    res
-stopBitDuration res
-breakMultiple   res
-recoveryTime    res
-ibTimeout       res
-rxPhsbReset     res
-
-otherOptions    res
-
-{ Constants (after initialization) }
-accessLockID            res
-rxBufferAddr            res
-cmdBufferResetAddr      res
-txBufferAddr            res
-numUserPortsAddr        res
-maxUserPorts            res
-userPortsAddr           res
-
-'maxRxPayloadSize        res
-driverLockAddr          res
-
-
+'
+'otherOptions    res
+'
+'{ Constants (after initialization) }
+'accessLockID            res
+'rxBufferAddr            res
+'cmdBufferResetAddr      res
+'txBufferAddr            res
+'numUserPortsAddr        res
+'maxUserPorts            res
+'userPortsAddr           res
+'
+''maxRxPayloadSize        res
+'driverLockAddr          res
+'
+'
 
 { Initialization Constants
-    After memLockID, these must appear in the same order as in the driver block.
+    Starting with cmdBuffAddr, these must appear in the same order as in the driver block.
 }
 memLockID               res
 cmdBuffAddr             res
@@ -2411,6 +2537,23 @@ rspBuffSize             res
 maxNumUserPorts         res
 
 
+{ Global Settings Variables
+    These values are determined by the LoadSettings* pages.
+    See also Fixed Location Global Settings Variables.
+}
+rxMask              res
+txMask              res
+rxBitPeriodA        res
+rxBitPeriodB        res
+startBitWait        res
+stopBitDuration     res
+breakMultiple       res
+recoveryTime        res
+ibTimeout           res
+rxPhsbReset         res
+
+minRspDelay         res
+userCodeTimeout     res
 
 { Argument/Result Variables
     The following registers are never used by the sending or utility routines except as calling arguments
@@ -2437,20 +2580,20 @@ _count
 _rxF16L         res
 
 
-{ Fixed Location Globals
+{ Fixed Location Global Settings Variables
     The transmit loop uses a bit twiddling mechanism to toggle between the two bit periods. This requires
   that txBitPeriodA be at an even address, and txBitPeriodB immediately follow it.
 }
 fit 494
 org 494
 
-txBitPeriodA    res 'must be at even address
-txBitPeriodB    res 'must be at address immediately after txBitPeriodA
+rxBitPeriod5            'aliases txBitPeriodA (see CalculateBitPeriods)
+txBitPeriodA    res     'must be at even address
+txBitPeriodB    res     'must be at address immediately after txBitPeriodA
 
 
 { Payload Buffers
     The sizes are set in the CON section.
-
     The payload buffers must be long-aligned.
 }
 CmdBuffer           long    0[cCmdBuffSizeInLongs]
