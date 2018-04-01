@@ -49,15 +49,20 @@ cMaxNumUserPorts    = 10    'May be any two-byte value (as memory allows).
 cUserPortsLongs  = ((cMaxNumUserPorts*6) / 4) + 1
 
 
+{ Counter Modes for movi Use }
+cPosDetector    = $40
+cNegDetector    = $60
+
+
 { Abort Codes }
 cFailedToObtainLock     = -1000
 
 { Driver States }
-cPreLaunch              = 0
+cPreLaunch              = 0 'the only one set by cog other than driver
 cInitializing           = 1
 cIdleWithBD             = 2
 cIdleNoBD               = 3
-
+cDriverShutdown         = 4 'the driver has stopped its cog as demanded (shutdownDriver=1 in otherOptions)
 
 
 { Other Constants }
@@ -75,16 +80,22 @@ cAddressMask        = %0001_1111
 cMuteFlag           = %0100_0000
 
 { ...for serialOptions }
-cUseSource          = %0000_0001
-cUseBaudDetect      = %0000_0010
-cUseContRecal       = %0000_0100
-cUseTwoStopBits     = %1000_0000
+cUseSourceFlag          = %0000_0001
+cEnableAutobaudFlag     = %0000_0010
+cWriteClkfreqFlag       = %0001_0000
 
 { ...for otherOptions }
-cEnableReset        = %0000_0001
-cAllowRemoteChanges = %0000_0010
-cSendErrorFlag      = %0000_0100
+cShutdownFlag           = %0_0000_0001
+cEnableDriverFlag       = %0_0000_0010
+cRxLineInvertedFlag     = %0_0000_0100
+cTxLineInvertedFlag     = %0_0000_1000
+cInterruptLevelMask     = %0_0111_0000
+cEnableErrorRspFlag     = %0_1000_0000
+'enableBreaksFlag       = |< 9
+'useTwoStopBitsFlag     = |< 14
 
+cOtherOptionsDefault    = cEnableDriverFlag | cEnableErrorRspFlag | |<9 | |<14
+         
 { ...for clockOptions }
 
 
@@ -116,9 +127,9 @@ cSendErrorFlag      = %0000_0100
     - Too many res'd variables.
         Decrease variables, or decrease cPageA or cPageAMaxSize.
 }
-cPageBLimit     = 35
+cPageBLimit     = 38
 cPageA          = 408
-cPageAMaxSize   = 39
+cPageAMaxSize   = 41
 cPageALimit     = cPageA + cPageAMaxSize
 
 
@@ -147,34 +158,41 @@ cToFinishStr        = 2
 cUnknownErrStr      = 3
 cSpinStr            = 4
 cDefaultUserName    = 5
+cNumStrings         = 6
 
 { Page Indices
     The "_A" or "_B" suffix clarifies what kind of page it is -- refer to Paging Constants.
 }
-cCalculateTimings   = 0
-cGetDeviceInfo      = 1
-cUserCommand        = 2
-cPropCrowAdmin      = 3
-cSendError          = 4
-cBlinky             = 5
-cSendEcho           = 6
-cCalc2              = 7
-cCalc3              = 8
-cSendCustomError    = 9
-cSendErrorFinish    = 10
-cStandardAdminCont  = 11
-cReceiveExtra_B     = 12
-cFramingError_A     = 13
-cBaudDetect_A       = 14
-cNumPages           = 15
+cLoadSettings1_A    = 0
+cSetBitPeriods_A    = 1
+cLoadSettings3_A    = 2
+cLoadSettings4_A    = 3
+cLoadSettings5_A    = 4
+cLoadSettings6_A    = 5
+cSendError_A        = 6
+cSendCustomError_A  = 7
+cSendErrorFinish_A  = 8
+cUserCommand_A      = 9
+cStandardAdmin_A    = 10
+cSendEcho_A         = 11
+cGetDeviceInfo_A    = 12
+cPropCrowAdmin_A    = 13
+cFramingError_A     = 14
+cBaudDetect_A       = 15
+cReceiveExtra_B     = 16
+cCopyUtils_B        = 17
+cBlinky_A           = 18
+cIdle_A             = 19
+cBreakHandler_A     = 20
+cNumPages           = 21
 cInvalidPage        = 511   'signifies no valid page loaded
 
 
 { Special Purpose Register Usage
     Out of necessity PropCrow makes use of some special purpose registers for variables. 
     Variables aliased to shadow SPRs have a "_SH" suffix as a warning to use them only in the d-field.
-    The counter A and video generator registers are never used by PropCrow -- they have been left
-  available for custom code.
+    ctra and ctrb are configured to record the number of clocks the rx line is 1 (ctra) or 0 (ctrb).
+  The ctrb module is always running, but the ctra module runs only during part of baud detect mode.
 }
 
 { SPR Global Variables }
@@ -186,10 +204,11 @@ token_SH        = $1F2      'sh-ina     must remain unchanged for sending respon
 
 { SPR Local Variables }
 
+_idleWait_SH    = $1F1
 _txWait_SH      = $1F1      'sh-cnt
 _rxF16U_SH      = $1F1      'sh-cnt
 
-_idleWait_SH    = $1F3
+_initTmp_SH     = $1F3
 _mathTmp_SH     = $1F3
 _copyTmp_SH     = $1F3
 _pageTmp_SH     = $1F3      'sh-inb
@@ -217,14 +236,8 @@ obj
     peekpoke : "PeekPoke"
 
 
-var
 
-    long    __userPorts[cUserPortsLongs]
-    long    __rxBuffer[cRxBufferLongs]
-    long    __txBuffer[cTxBufferLongs]
-
-
-pub new | __pause
+pub new | __pause, __index
 
     dira[26] := 1
     outa[26] := 1
@@ -234,13 +247,13 @@ pub new | __pause
 
     word[30000] := @PageTable
     word[30002] := @Entry
-    word[30004] := @ControlBlock
+    word[30004] := @DriverBlock
 
-    repeat index from 0 to cNumPages-1
-        word[@PageTable][2*index] += @@0
+    repeat __index from 0 to cNumPages-1
+        word[@PageTable][2*__index] += @@0
 
-    repeat index from 0 to cNumStrings-1
-        word[@StringTable][index] += @@0
+    repeat __index from 0 to cNumStrings-1
+        word[@StringTable][__index] += @@0
     
     __cmdBuffAddr           := @CmdBuffer
     __rspBuffAddr           := @RspBuffer
@@ -249,10 +262,9 @@ pub new | __pause
     __stringTableAddr       := @StringTable
     __txBlockAddr           := @TxBlock
 
-    __numUserPorts      := 3
-    __userPorts.word[0] := 0
-    __userPorts.word[3] := 1
-    __userPorts.word[6] := 78
+    UserPortsTable.word[0] := 0
+    UserPortsTable.word[3] := 1
+    UserPortsTable.word[6] := 78
 
 '    if __lockID > 7
 '        __lockID := locknew()
@@ -350,38 +362,39 @@ breakThreshold notes
 
 
 DriverBlock
-                                                    '   pos len typ notes
+                                                        '   pos len typ notes
 'Runtime State
 
-__changedFlag               byte 0                  '   0   1   Lf  non-zero value: values changed; bits indicate which ones; 0: settings loaded
-__driverState               byte 0                  '   1   1   ID  launching code must set this to 0 before launching
-__lockingUser               word 0                  '   2   2   U   0: driver unlocked: non-zero: address of locking user
+__changedFlag               byte 0                      '   0   1   Lf  non-zero value: values changed; bits indicate which ones; 0: settings loaded
+__driverState               byte 0                      '   1   1   ID  launching code must set this to 0 before launching
+__lockingUser               word 0                      '   2   2   U   0: driver unlocked: non-zero: address of locking user
 
 'Current Settings
 
-__currRxPin                 byte 31                 '   4   1   L
-__currTxPin                 byte 30                 '   5   1   L
-__currAddress               byte 1                  '   6   1   L   must be 1 to 31
-                            byte 0                  '   7   1   -
+__currRxPin                 byte 31                     '   4   1   L
+__currTxPin                 byte 30                     '   5   1   L
+__currAddress               byte 1                      '   6   1   L   must be 1 to 31 or driver will not accept anything except broadcast commands
+                            byte 0                      '   7   1   -
 
-__currBaudrate              long 115200             '   8   4   L   <300 becomes 300
+__currBaudrate              long 115200                 '   8   4   L   should be 300 or greater
 
-__currClockOptions          long $1f1f_0b01         '   12  4   L
+__currClockOptions          long $1f1f_0b01             '   12  4   L
 
-__currOtherOptions          word 0                  '   16  2   L
-__currBreakThreshold        word 200                '   18  2   L   in MILLIseconds; 0 becomes 1 (set enableBreakDetection=0 to disable)
+__currOtherOptions          word cOtherOptionsDefault   '   16  2   L
+__currBreakThreshold        word 200                    '   18  2   L   in milliseconds; 0 becomes 1 (set enableBreakDetection=0 to disable); needs breakThreshold >> commandPorch (e.g. 10x) for reliable detection)
 
-__currCommandPorch          long 16 | |< 31         '   20  4   L   in microseconds (bit 31 = 0) or bit periods (bit 31 = 1); 0 becomes 1
+__currCommandPorch          word 10                     '   20  2   L   in 16-bit periods; 0 becomes 1
+__currInterbyteTimeout      word 5                      '   22  2   L   in 16-bit periods; 0 allowed; should be less than command porch
 
-__currInterbyteTimeout      long 150_000            '   24  4   L   in microseconds (bit 31 = 0) or bit periods (bit 31 = 1)
+                            long 0                      '   24  4   -
 
-__currMinResponseDelay      long 0                  '   28  4   L   in microseconds
+__currMinResponseDelay      long 0                      '   28  4   L   in microseconds
 
-__currPostResponseWait      long 0                  '   32  4   L   in microseconds
+__currPostTransWait         long 0                      '   32  4   L   in microseconds
 
-__currUserCodeTimeout       long 100_000            '   36  4   L   in microseconds (bit 31 = 0) or clocks (bit 31 = 1)
+__currUserCodeTimeout       long 100_000                '   36  4   L   in microseconds (bit 31 = 0) or clocks (bit 31 = 1)
 
-                            long 0                  '   40  4   -
+                            long 0                      '   40  4   -
 
 'Reset Settings
 
@@ -389,49 +402,64 @@ long 0[10]
 
 'Other Settings (Non-Resettable)
 
-__breakHandler              word 0                  '   84  2   s   enableBreakDetection must be 1 even if defined; 0 selects driver's internal handler
-                            word 0                  '   86  2   -
+__breakHandler              word 0                      '   84  2   s   enableBreakDetection must be 1 even if defined; 0 selects driver's internal handler
+                            word 0                      '   86  2   -
 
-__remotePermissions         byte 0                  '   88  1   L
-                            byte 0[3]               '   89  3   -
+__remotePermissions         byte 0                      '   88  1   L
+                            byte 0[3]                   '   89  3   -
 
-                            long                    '   92  4   -
+                            long 0                      '   92  4   -
 
 'Initialization Constants
 
-__memLockID                 byte 200                '   96  1   I
-                            byte 0[3]               '   97  3   -
+__memLockID                 byte 200                    '   96  1   I
+                            byte 0[3]                   '   97  3   -
 
-__cmdBuffAddr               word 0-0                '   100 2   I
-__rspBuffAddr               word 0-0                '   102 2   I
+__cmdBuffAddr               word 0-0                    '   100 2   I
+__rspBuffAddr               word 0-0                    '   102 2   I
 
-__userPortsTableAddr        word 0-0                '   104 2   I
-__pageTableAddr             word 0-0                '   106 2   I
+__userPortsTableAddr        word 0-0                    '   104 2   I
+__pageTableAddr             word 0-0                    '   106 2   I
 
-__stringTableAddr           word 0-0                '   108 2   I
-__txBlockAddr               word 0-0                '   110 2   I
+__stringTableAddr           word 0-0                    '   108 2   I
+__txBlockAddr               word 0-0                    '   110 2   I
 
-__cmdBuffSize               word cCmdBuffSize       '   112 2   I
-__rspBuffSize               word cRspBuffSize       '   114 2   I
+__cmdBuffSize               word cCmdBuffSize           '   112 2   I
+__rspBuffSize               word cRspBuffSize           '   114 2   I
 
-__maxNumUserPorts           word cMaxNumUserPorts   '   116 2   I
-__numPages                  byte cNumPages          '   118 1   I
-__numStrings                byte cNumStrings        '   119 1   I
+__maxNumUserPorts           word cMaxNumUserPorts       '   116 2   I
+__numPages                  byte cNumPages              '   118 1   I
+__numStrings                byte cNumStrings            '   119 1   I
 
-                            long 0                  '   120 4   -
+                            long 0                      '   120 4   -
 
 'Informational Settings
 
-__deviceNameAddr            word 0                  '   124 2   s   0 disables
-__deviceDescAddr            word $ffff              '   126 2   s   0 disables, $ffff selects "Propeller P8X32A (cog X) running PropCrow vM.m."
+__deviceNameAddr            word 0                      '   124 2   s   0 disables
+__deviceDescAddr            word $ffff                  '   126 2   s   0 disables, $ffff selects "Propeller P8X32A (cog X) running PropCrow vM.m."
 
 'Internal and Diagnostic
 
-__cogID                     byte 200                '   128 1   D   set by driver cog during initialization; 200 is pre-initial-launch flag value
-                            byte 0[3]               '   129 3   -
+__cogID                     byte 200                    '   128 1   D   set by driver cog during initialization; 200 is pre-initial-launch flag value
+                            byte 0[3]                   '   129 3   -
 
-
-
+'Debugging (From LoadSettings)
+                            long 0                      '   132 4   D   rxMask
+                            long 0                      '   136 4   D   txMask
+                            long 0                      '   140 4   D   rxBitPeriodA
+                            long 0                      '   144 4   D   rxBitPeriodB
+                            long 0                      '   148 4   D   startBitWait
+                            long 0                      '   152 4   D   stopBitDuration
+                            long 0                      '   156 4   D   breakThreshold
+                            long 0                      '   160 4   D   breakMultiple
+                            long 0                      '   164 4   D   recoveryTime
+                            long 0                      '   168 4   D   ibTimeout
+                            long 0                      '   172 4   D   rxPhsbReset
+                            long 0                      '   176 4   D   ucTimeoutMultiple
+                            long 0                      '   180 4   D   cmdPorch16Bits
+                            long 0                      '   184 4   D   ibTimeout16Bits
+                            long 0                      '   188 4   D   txBitPeriodA
+                            long 0                      '   192 4   D   txBitPeriodB
 
 { PageTable
     Pages are blocks of code or constants loaded into the cog's registers at runtime.
@@ -444,82 +472,110 @@ __cogID                     byte 200                '   128 1   D   set by drive
       3    1    length of page
 }    
 PageTable
-
-'0: CalculateTimings
-word    @CalculateTimings
+'0: LoadSettings1
+word    @LoadSettings1_A
 byte    0
-byte    CalculateTimings_end - CalculateTimings + 1
+byte    LoadSettings1_A_end - LoadSettings1_A + 1
 
-'1: GetDeviceInfo
-word    @GetDeviceInfo
+'1: SetBitPeriods_A
+word    @SetBitPeriods_A
 byte    0
-byte    GetDeviceInfo_end - GetDeviceInfo + 1
+byte    SetBitPeriods_A_end - SetBitPeriods_A + 1
 
-'2: UserCommand
-word    @UserCommand
+'2: LoadSettings3_A
+word    @LoadSettings3_A
 byte    0
-byte    UserCommand_end - UserCommand + 1
+byte    LoadSettings3_A_end - LoadSettings3_A + 1
 
-'3: PropCrowAdmin
-word    @PropCrowAdmin
+'3: LoadSettings4_A
+word    @LoadSettings4_A
 byte    0
-byte    PropCrowAdmin_end - PropCrowAdmin + 1
+byte    LoadSettings4_A_end - LoadSettings4_A + 1
 
-'4: SendError
-word    @SendErrorPg
+'4: LoadSettings5_A
+word    @LoadSettings5_A
 byte    0
-byte    SendErrorPg_end - SendErrorPg + 1
+byte    LoadSettings5_A_end - LoadSettings5_A + 1
 
-'5: Blinky
-word    @Blinky
+'5: LoadSettings6_A
+word    @LoadSettings6_A
 byte    0
-byte    Blinky_end - Blinky + 1
+byte    LoadSettings6_A_end - LoadSettings6_A + 1
 
-'6: SendEcho
-word    @SendEcho
+'6: SendError_A
+word    @SendError_A
 byte    0
-byte    SendEcho_end - SendEcho + 1
+byte    SendError_A_end - SendError_A + 1
 
-'7: Calc2
-word    @Calc2
+'7: SendCustomError_A
+word    @SendCustomError_A
 byte    0
-byte    Calc2_end - Calc2 + 1
+byte    SendCustomError_A_end - SendCustomError_A + 1
 
-'8: Calc3
-word    @Calc3
+'8: SendErrorFinish_A
+word    @SendErrorFinish_A
 byte    0
-byte    Calc3_end - Calc3 + 1
+byte    SendErrorFinish_A_end - SendErrorFinish_A + 1
 
-'9: SendCustomError
-word    @SendCustomError
+'9: UserCommand_A
+word    @UserCommand_A
 byte    0
-byte    SendCustomErrorPg_end - SendCustomErrorPg + 1
+byte    UserCommand_A_end - UserCommand_A + 1
 
-'10: SendErrorFinish
-word    @SendErrorFinish
+'10: StandardAdmin_A
+word    @StandardAdmin_A
 byte    0
-byte    SendErrorFinishPg_end - SendErrorFinishPg + 1
+byte    StandardAdmin_A_end - StandardAdmin_A + 1
 
-'11: StandardAdminCont
-word    @StandardAdminCont
+'11: SendEcho_A
+word    @SendEcho_A
 byte    0
-byte    StandardAdminCont_end - StandardAdminCont + 1
+byte    SendEcho_A_end - SendEcho_A + 1
 
-'12: ReceiveExtra_B
-word    @ReceiveExtra_B
+'12: GetDeviceInfo_A
+word    @GetDeviceInfo_A
 byte    0
-byte    ReceiveExtra_B_end - ReceiveExtra_B + 1
+byte    GetDeviceInfo_A_end - GetDeviceInfo_A + 1
 
-'13: FramingError_A
+'13: PropCrowAdmin_A
+word    @PropCrowAdmin_A
+byte    0
+byte    PropCrowAdmin_A_end - PropCrowAdmin_A + 1
+
+'14: FramingError_A
 word    @FramingError_A
 byte    0
 byte    FramingError_A_end - FramingError_A + 1
 
-'14: BaudDetect_A
+'15: BaudDetect_A
 word    @BaudDetect_A
 byte    0
 byte    BaudDetect_A_end - BaudDetect_A + 1
 
+'16: ReceiveExtra_B
+word    @ReceiveExtra_B
+byte    0
+byte    ReceiveExtra_B_end - ReceiveExtra_B + 1
+
+'17: CopyUtils_B
+word    @CopyUtils_B
+byte    0
+byte    CopyUtils_B_end - CopyUtils_B + 1
+
+'18: Blinky_A
+word    @Blinky_A
+byte    0
+byte    Blinky_A_end - Blinky_A + 1
+
+'19: Idle_A
+word    @Idle_A
+byte    0
+byte    Idle_A_end - Idle_A + 1
+
+'20: BreakHandler_A
+word    @BreakHandler_A
+byte    0
+byte    BreakHandler_A_end - BreakHandler_A + 1
 
 { UserPortsTable
 
@@ -568,7 +624,7 @@ SpinStr             byte "Spin Object", 0
 DefaultUserName     byte "User Object", 0
 DefaultDeviceDesc   byte "Propeller P8X32A (cog ", 0
 'DidNotRespondStr    byte " never responded.", 0
-'WasUnresponsiveStr  byte " was unresponsive.", 0
+'WasUnresponsiveStr  byte " stopped responding.", 0
 
 
 { TxBlock
@@ -583,9 +639,9 @@ long    0       'first long assumed to be txScratch
   sent separately.
 }
 DeviceInfoTemplate
-long    $0000_0200 | ((cPropCrowID & $ff) << 24) | ((cPropCrowID & $ff00) << 8)             'Crow v2, implementationID = cPropCrowID
-long    $FF02_0000 | ((cCmdBufferMaxSize & $ff) << 8) | ((cCmdBufferMaxSize & $700) >> 8)   'max commmand payload size, 2 admin ports (top byte not sent from here) 
-long    $0000_0000 | ((cPropCrowID & $ff) << 24) | ((cPropCrowID & $ff00) << 8)             'admin ports 0 and PropCrowID
+long    $0000_0200 | ((cPropCrowID & $ff) << 24) | ((cPropCrowID & $ff00) << 8)     'Crow v2, implementationID = cPropCrowID
+long    $FF02_0000 | ((cCmdBuffSize & $ff) << 8) | ((cCmdBuffSize & $700) >> 8)     'max commmand payload size, 2 admin ports (top byte not sent from here) 
+long    $0000_0000 | ((cPropCrowID & $ff) << 24) | ((cPropCrowID & $ff00) << 8)     'admin ports 0 and PropCrowID
 
 { ErrorResponseTemplate, part of TxBlock
     This template sets up an error response with no standard details, and one implementation provided
@@ -600,7 +656,21 @@ long    $0009_0001      'top byte of message length is zero (assume all messages
 
 
 
+'20
+{ BreakHandler
+}
+org cPageA
+BreakHandler_A
 
+
+BreakHandler_A_end              jmp         #ReceiveCommand
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
+
+
+
+
+
+'14
 { FramingError_A
     Handles framing errors.
 }
@@ -611,16 +681,20 @@ FramingError_A
                                     otherwise, force reload the settings }
 FramingError_A_end
                                 jmp         #ReceiveCommand
-fit cPageALimit 'On error: page too big.
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
 
+
+'15
 { BaudDetect_A
     Enters baud detection mode.
 }
 org cPageA
 BaudDetect_A
 BaudDetect_A_end                jmp         #ReceiveCommand
-fit cPageALimit 'On error: page too big.
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
 
+
+'16
 { ReceiveExtra_B
     This page starts with a 16 register nibble table. This table contains the number of zero bits for the
   numbers 0 to 15. It is used by the continuous recalibration code -- the values are in the upper word since
@@ -685,30 +759,34 @@ DetectBaud
 BreakHandler    
                                 waitpeq     rxMask, rxMask                          'wait for break to end
 
-                                mov         _page, #cBlinky
+                                mov         _page, #cBlinky_A
                                 jmp         #ExecutePageA
 
 ReceiveExtra_B_end              long 0
-
 fit cPageBLimit 'On error: page too big. Refer to Paging Constants.
 
-{
-JumpTest
-                                mov         inb, #12
-                                mov         cnt, cnt
-                                add         cnt, fourMill
-:loop                           xor         outa, pin27
-                                waitcnt     cnt, fourMill
-                                jmp         #:loop
-fourMill                      
-}
 
+'17
+{ CopyUtils
+}
+org 0
+CopyUtils_B
+
+
+CopyUtils_B_end
+                                jmp         #ReceiveCommand
+fit cPageBLimit 'On error: page too big. Refer to Paging Constants.
+
+
+
+
+'11
 { SendEcho (page)
     This page is invoked by AdminCommandStart for sending an echo response.
     It is assumed that the command was valid and that a response is expected.
 }
 org cPageA
-SendEcho
+SendEcho_A
                                 { The command is echo(numIntermediates=0, filler=[]).
                                   There is a mandatory second byte in echo commands for the number of intermediate responses
                                     to send. Only the bottom 3 bits are used, the rest are ignored (so a limit of 7 intermediates).
@@ -716,7 +794,7 @@ SendEcho
                                     and their values are ignored. For echo commands they are sent back verbatim to the host. }
 
                                 { Get number of intermediate responses in _y. }
-                                mov         _addr, rxBufferAddr
+                                mov         _addr, cmdBuffAddr
                                 add         _addr, #1
                                 rdbyte      _y, _addr
                                 and         _y, #%111                       wz
@@ -725,23 +803,24 @@ SendEcho
 
                         if_z    jmp         #:finalEcho
 
-:intermediateEcho               mov         _addr, rxBufferAddr
+:intermediateEcho               mov         _addr, cmdBuffAddr
                                 mov         _count, payloadSize
                                 call        #SendIntermediate
                                 djnz        _x, #:intermediateEcho
 
-:finalEcho                      mov         _addr, rxBufferAddr
+:finalEcho                      mov         _addr, cmdBuffAddr
                                 mov         _count, payloadSize
-SendEcho_end                    jmp        #SendFinalResponse
-fit cPageALimit 'On error: page is too big. Reduce code or increase cPageSize.
+SendEcho_A_end                  jmp         #SendFinalResponse
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
 
 
+'18
 { Blinky
 mov     _page, #cBlinky
 jmp     #ExecutePageA
 }
 org cPageA
-Blinky  
+Blinky_A 
 '                                call        #Trace
 '
 '                                mov         cnt, cnt
@@ -752,23 +831,24 @@ Blinky
 
                                 mov         inb, #12
                                 mov         cnt, cnt
-                                add         cnt, Blinky_end
+                                add         cnt, Blinky_A_end
 :loop                           xor         outa, pin27
-                                waitcnt     cnt, Blinky_end
+                                waitcnt     cnt, Blinky_A_end
 '                                djnz        inb, #:loop
                                 jmp         #:loop
 '                                jmp         #RecoveryMode
-Blinky_end                      long 4_000_000
-fit cPageALimit
+Blinky_A_end                    long 4_000_000
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
 
 
-{ StandardAdminCont
+'10
+{ StandardAdmin
     Invoked by StandardAdminStart, this page continues the work of processing a standard admin command.
   At this point we know the command is not ping, echo, or hostPresence.
     Assumes:    _x = command type (first command payload byte)
 }
 org cPageA
-StandardAdminCont
+StandardAdmin_A
                                 cmp         _x, #0                          wz
                         if_nz   jmp         #:checkNext
                                 
@@ -776,14 +856,16 @@ StandardAdminCont
                                 cmp         payloadSize, #1                 wz      'z=0 payload size incorrect (require exactly one byte)
                                 test        flagsAndBadF16, isOpenFlag      wc      'c=0 no open transaction
                     if_nc_or_nz jmp         #ReceiveCommand
-                                mov         _page, #cGetDeviceInfo
+                                mov         _page, #cGetDeviceInfo_A
                                 jmp         #ExecutePageA
 :checkNext
-StandardAdminCont_end           jmp         #ReceiveCommand
-fit cPageALimit 'On error: page is too big. Reduce code or increase cPageSize.
+StandardAdmin_A_end             jmp         #ReceiveCommand
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
 
 
-{ PgSendErrorResponse
+
+'SendError
+{ SendError
     This page starts the process of sending a Crow-level error response (not an upper-level protocol error response).
   Crow-level error responses indicate some problem that prevents an otherwise valid command from being responded to normally.
   Error responses are sent only for 'reportable' errors -- some errors have to be silently ignored (e.g. bad
@@ -794,7 +876,7 @@ fit cPageALimit 'On error: page is too big. Reduce code or increase cPageSize.
     Some errors require _y to be set as well. See SendCustomError.
 }
 org cPageA
-SendErrorPg
+SendError_A
                                 { It is assumed that _x has been set to a standard error number (< 32) or a custom error number (32-63).
                                   If _x is a standard error number then the error response will include no implementation
                                     specific error details (i.e. no ascii message).
@@ -807,12 +889,12 @@ SendErrorPg
 
                                 { Is the error number a standard error number? Custom errors on separate page. }
                                 cmp         _x, #31                     wc
-                        if_nc   mov         _page, #cSendCustomError
+                        if_nc   mov         _page, #cSendCustomError_A
                         if_nc   jmp         #ExecutePageA
 
                                 { If a standard error number was passed (_x < 32) we will not include any implementation
                                     specific details. This means E1 and E2 are undefined and can have any values. }
-                                mov         _copyDestAddr, txBufferAddr
+                                mov         _copyDestAddr, rspBuffAddr
                                 add         _copyDestAddr, #3                   '_copyDestAddr points to start of any standard details 
 
                                 { If no standard details are included we will send a minimal response payload. }
@@ -841,19 +923,20 @@ SendErrorPg
                         if_z    rol         port_SH, #8
                         if_z    wrbyte      port_SH, _copyDestAddr                  'port LSB
 
-                                mov         _page, #cSendErrorFinish
-SendErrorPg_end                 jmp         #ExecutePageA
-fit cPageALimit 'On error: page is too big. Reduce code or increase cPageSize.
+                                mov         _page, #cSendErrorFinish_A
+SendError_A_end                 jmp         #ExecutePageA
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
 
 
-{ SendCustomErrorPg
+'7
+{ SendCustomError
     Executed if _x is not a standard error number (< 32). Such numbers are used to indicate that an ascii 
   error message should be included, and the custom error number translated to a standard error number.
     Additional parameters expected:
-            Driver Locked:      _y = user block address for user object with lock
+            Driver Locked:      _y upper word = user block address for user object with lock
 }
 org cPageA
-SendCustomErrorPg
+SendCustomError_A
                                 { Currently, all custom errors have no standard details, and just one implementation detail (the
                                     ascii message). This makes things relatively simple:
                                         - copy the template
@@ -863,7 +946,7 @@ SendCustomErrorPg
                                         - make sure _x has form 0x80 OR'd with some valid Crow error type }
                                 
                                 { Start by copying the template to the response buffer. }
-                                mov         _copyDestAddr, txBufferAddr
+                                mov         _copyDestAddr, rspBuffAddr
                                 mov         _copySrcAddr, txBlockAddr
                                 add         _copySrcAddr, #4*(ErrorResponseTemplate - TxBlock)
                                 mov         _copyCount, #8
@@ -893,9 +976,11 @@ SendCustomErrorPg
                                 call        #CopyStringFromTable
                                 mov         _count, _copySize
 
-                                { objectName address is first word of userObjectBlock (_y). If the address is NULL
+                                { objectName address is first word of userObjectBlock. If the address is NULL
                                     then the default string is used. }
 
+                                { Before permanent code called SendError it should have set the upper word of _y to the user block address. }
+                                shr         _y, #16
                                 rdword      _copySrcAddr, _y            wz
                         if_nz   jmp         #:nameNotNull
 
@@ -921,7 +1006,7 @@ SendCustomErrorPg
 
 :finish
                                 { Write the message length to byte 8. }
-                                mov         _addr, txBufferAddr
+                                mov         _addr, rspBuffAddr
                                 add         _addr, #8
                                 wrbyte      _count, _addr
             
@@ -931,48 +1016,50 @@ SendCustomErrorPg
                                 { Set bit 7 (I flag) of E0 for implementation details. }
                                 or          _x, #%1000_0000
                                
-                                mov         _page, #cSendErrorFinish
-SendCustomErrorPg_end           jmp         #ExecutePageA
-fit cPageALimit 'On error: page is too big. Reduce code or increase cPageSize.
+                                mov         _page, #cSendErrorFinish_A
+SendCustomError_A_end           jmp         #ExecutePageA
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
 
 
-{ SendErrorFinishPg
+'8
+{ SendErrorFinish
     Executed at the very end of preparing an error response, when it is almost ready to be sent.
   Assumes _x = E0 and _count = response payload size.
 }
 org cPageA
-SendErrorFinishPg
+SendErrorFinish_A
                                 { Write first byte of response payload. }
-                                mov         _addr, txBufferAddr
+                                mov         _addr, rspBuffAddr
                                 wrbyte      _x, _addr
                 
                                 { Both _count and _addr ready, so send. }
-SendErrorFinishPg_end           jmp         #SendFinalResponse
-fit cPageALimit 'On error: page is too big. Reduce code or increase cPageSize.
+SendErrorFinish_A_end           jmp         #SendFinalResponse
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
 
 
-{ UserCommandPg
+'9
+{ UserCommand
 }
 org cPageA
-UserCommand
+UserCommand_A
 
-                                'mov         payloadAddr, rxBufferAddr
+                                'mov         payloadAddr, cmdBuffAddr
                                 'jmp         #SendFinalResponse
 
 
-                                rdlong      _x, rxBufferAddr
+                                rdlong      _x, cmdBuffAddr
                                 jmp         #ErrorHandler
 
 {
                                 'echo the port
                                 mov         _x, dirb
-                                wrword      _x, txBufferAddr
+                                wrword      _x, rspBuffAddr
                                 mov         payloadSize, #2
-                                mov         payloadAddr, txBufferAddr
+                                mov         payloadAddr, rspBuffAddr
 }
 {
                                 'report calibration observations
-                                mov         _addr, txBufferAddr
+                                mov         _addr, rspBuffAddr
                                 wrlong      cmdLowBits, _addr
                                 add         _addr, #4
                                 wrlong      cmdLowClocks, _addr
@@ -986,25 +1073,27 @@ UserCommand
                                 wrlong      _y, _addr
 }
                                 mov         _count, #16
-                                mov         _addr, rxBufferAddr
+                                mov         _addr, cmdBuffAddr
 
-UserCommand_end                 jmp         #SendFinalResponse
-fit cPageALimit 'On error: page is too big. Reduce code or increase cPageSize.
+UserCommand_A_end               jmp         #SendFinalResponse
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
 
 
+'13
 org cPageA
-PropCrowAdmin
+PropCrowAdmin_A
                                 mov         _addr, #0
                                 mov         _count, #8
-PropCrowAdmin_end               jmp         #SendFinalResponse
-fit cPageALimit 'Page is too big. Reduce code or increase cPageSize.
+PropCrowAdmin_A_end             jmp         #SendFinalResponse
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
+
 
 org cPageA
-GetDeviceInfo
+GetDeviceInfo_A
                                 'call        #LockSharedAccess
 
-
-                                rdword      _x, numUserPortsAddr                    '_x = num open user ports to report
+                                'todo: determine the number
+                                mov         _x, #3
                                 max         _x, #255                                'getDeviceInfo limited to reporting 255 user ports
 
                                 mov         _count, _x                         'response payload size is 12 + 2*<num user ports> (assumes 2 admin protocols)
@@ -1017,8 +1106,8 @@ GetDeviceInfo
                                 mov         _count, #7
                                 call        #SendPayloadBytes                       'send up to num reported user ports
 
-                                wrbyte      _x, txBufferAddr
-                                mov         _addr, txBufferAddr
+                                wrbyte      _x, rspBuffAddr
+                                mov         _addr, rspBuffAddr
                                 mov         _count, #1
                                 call        #SendPayloadBytes                       'send number of reported user ports
 
@@ -1030,7 +1119,7 @@ GetDeviceInfo
                                 cmp         _x, #0                   wz
                         if_z    jmp         #:finish                                '...skip if no user ports
 
-                                mov         _addr, userPortsAddr              'send the user port numbers directly from the table
+                                mov         _addr, userPortsTableAddr              'send the user port numbers directly from the table
                                 sub         _addr, #5
 
 :loop                           add         _addr, #6                         'MSB             
@@ -1046,112 +1135,356 @@ GetDeviceInfo
  
                                 'call        #UnlockSharedAccess
                                 
-GetDeviceInfo_end               jmp         #ReceiveCommand
-fit cPageALimit 'On error: page is too big.
+GetDeviceInfo_A_end             jmp         #ReceiveCommand
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
 
-org cPageA
 
-{ CalculateTimings
-  This routine calculates the serial timings (in clocks) based on the settings stored in the hub.
+
+
+
+{ Todo: implement the following:
+    - inverted line levels
+    - minResponseDelay
+    - postTransactionWait
 }
-CalculateTimings
-                                'call        #LockSharedAccess
 
-                                mov         _addr, par
-                                rdlong      _loadBaud, _addr
-                                add         _addr, #4
-                                rdword      _loadIBTimeoutMS, _addr                 'in milliseconds
-                                add         _addr, #2
-                                rdword      _loadBreakMS, _addr                     'in milliseconds
-                                add         _addr, #2
-                                rdlong      _loadOptions, _addr
-                                rdlong      _loadClkFreq, #0
-                                rdbyte      _loadClkMode, #4
-
-                                'call        #UnlockSharedAccess
-                            
-                                mov         _x, _loadClkFreq                    
-                                shl         _x, #1
-                                mov         _y, _loadBaud
-                                call        #Divide
-                                mov         _loadTwoBit, _y
-
-                                mov         bitPeriod0, _loadTwoBit
-                                shr         bitPeriod0, #1
-                                min         bitPeriod0, #34                         'bitPeriod0 ready
-                           
-                                mov         txBitPeriodA, bitPeriod0
- 
-                                mov         bitPeriod1, bitPeriod0
-                                test        _loadTwoBit, #1                     wc
-                        if_c    add         bitPeriod1, #1                          'bitPeriod1 ready
-
-                                mov         txBitPeriodB, bitPeriod1
-
-                                'mov         rxBitPeriod5, bitPeriod0
-                                'min         rxBitPeriod5, #33
-
-                                mov         startBitWait, bitPeriod0
-                                shr         startBitWait, #1
-                                sub         startBitWait, #10                       'startBitWait ready; must not be < 5 (won't if bitPeriod0 >= 34)
-            
-                                mov         _page, #cCalc2
-CalculateTimings_end
-                                jmp         #ExecutePageA
-
-fit cPageALimit 'On error: page is too big.
-
-
-{ LoadSettingsStart_A
-
+'0
+{ LoadSettings1_A
+    This is the first of several pages dedicated to loading the settings.
 }
 org cPageA
-LoadSettingsStart_A
+LoadSettings1_A
                                 call        #RetainLock
 
-                                { * Following Assumes DriverBlock Layout * }
+                                { load clkfreq and clkmode }
+                                rdlong      _loadClkfreq, #0                        'assumed >= 10kHz
+                                rdbyte      _loadClkmode, #4
 
-                                { First, load clockOptions and otherOptions. }
+                                { * Assumes DriverBlock Layout * }
+
                                 mov         _addr, par
-                                add         _addr, #12
-                                rdlong      clockOptions, _addr                     'clockOptions
-                                add         _addr, #4
-                                rdbyte      otherOptions, _addr                     'otherOptions
+
+                                { crow device address }
+                                add         _addr, #6
+                                rdbyte      _x, _addr
+                                movs        _RxVerifyAddress, _x
+
+                                { load otherOptions and shutdown if commanded, process other options later }
+                                add         _addr, #10
+                                rdword      _loadOtherOptions, _addr
+                                test        _loadOtherOptions, #cShutdownFlag   wc  'c=1 do shutdown
+                        if_c    movs        stateAndFlags, #cDriverShutdown
+                        if_c    wrbyte      stateAndFlags, stateAddr
+                        if_c    cogid       _x
+                        if_c    cogstop     _x
+
+                                { calculate break threshold in clocks }
+                                mov         _x, _loadClkfreq
+                                mov         _y, load1000
+                                call        #Divide                                 '_y = clocks per millisecond (should be >= 10 given minimum 10kHz clock)
+                                add         _addr, #2
+                                rdword      _x, _addr
+                                min         _x, #1                                  '_x = break threshold, in milliseconds, with minimum enforced
+                                call        #Multiply                               '_x = break threshold in clocks, _y unchanged
+                                mov         breakThreshold, _x                      'breakThreshold should be > 0 (will be zero only if clkfreq is zero)
+
+                                { calculate clocks per microsecond }
+                                mov         _x, _y
+                                mov         _y, load1000
+                                call        #Divide
+                                mov         _loadMicro, _y                          '_loadMicro may be zero
+
+{todo: recoveryTime should actually be some factor of cmdPorch, e.g. 16 or 32 }
+                                { load cmdPorch and ibTimeout as defined in 16-bit intervals }
+                                add         _addr, #2
+                                rdword      cmdPorch16Bits, _addr
+                                add         _addr, #2
+                                rdword      ibTimeout16Bits, _addr
+
+                                { baudrate: calculate the two bit period, in clocks (2*clkfreq/baudrate) }
+                                sub         _addr, #14
+                                rdlong      _loadBaud, _addr
+'todo: keep?                                min         _loadBaud, #300                                'enforce minimum 300 bps (required by design)
+                                mov         _y, _loadBaud
+                                mov         _x, _loadClkfreq
+                                shl         _x, #1
+                                call        #Divide                                 '_y = two bit period (used by next page)
+
+                                wrlong      _y, #12
+
+                                { execute SetBitPeriods, which will then execute the page given by _addr }
+                                mov         _addr, #cLoadSettings3_A
+                                mov         _page, #cSetBitPeriods_A                'SetBitPeriods considered as page 2 of LoadSettings group
+                                jmp         #ExecutePageA
+
+LoadSettings1_A_end
+load1000                        long    1000
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
 
 
+'1
+{ SetBitPeriods
+    Given a two-bit period in clocks (_y), this page updates all settings that depend on the bit period. It enforces
+  a minimum bit period of 33 clocks. The baudTooFast flag in stateAndFlags will be set according to whether this page
+  had to raise the bit period to 33 clocks (raising the bit period means the baudrate is too fast for the current 
+  system clock).
+    Although stopBitDuration depends on the bit period it is not calculated here. Either it is calculated as part of 
+  fixed mode once on another of the LoadSettings pages, or it is calculated in the continuous recalibration code before
+  a response is ever sent.
+    This page is designed to pass execution on to another page provided by the _addr variable.
+    Before: _addr - index of page to execute afterwards
+            _y = two bit period, in clocks
+    After:  baudTooFast in stateAndFlags: 1 - the baudrate is too fast (bit period had to be raised to 33 clocks)
+                                          0 - the baudrate is OK
+            guarantee: no general temporaries changed, besides _math*
+}
+org cPageA
+SetBitPeriods_A
+                                { todo: prove that it is not worth it to attempt 32 clock support (which tx code can handle). }
+
+                                { Limit bit period to at least 33 clocks and raise baudTooFast flag if raising the bit period was
+                                    required. Then determine if bit period is less than 34 clocks (a special case). } 
+                                min         _y, #66                         wc      'c=1 bit period less than 33 (baudrate too fast for clock)
+                                muxc        stateAndFlags, baudTooFastFlag
+                                cmp         _y, #68                         wc      'c=1 bit period is 33/33.5; c=0 34+
+
+                                { Two bit periods -- A and B -- are used to approximate the true bit period to half clock resolution. 
+                                    The transmit code can support 33 clocks without problems. }
+                                mov         txBitPeriodA, _y
+                                shr         txBitPeriodA, #1
+                                mov         txBitPeriodB, txBitPeriodA
+                                test        _y, #1                          wz      'z=0 the two bit period is odd, so bit period is x.5
+                        if_nz   add         txBitPeriodB, #1
+                                
+                                { For bit periods of 34+ the rx bit periods are the same as the tx ones. }
+                        if_nc   mov         rxBitPeriodA, txBitPeriodA
+                        if_nc   mov         rxBitPeriodB, txBitPeriodB
+                        if_nc   mov         startBitWait, rxBitPeriodB              'startBitWait = 1/2 bit period - 10 clocks (10 clocks are 'baked-in' to wait instrs)
+                        if_nc   shr         startBitWait, #1                        '(using B with the idea that truncation tends to underestimate true value)
+                        if_nc   sub         startBitWait, #10                       'must be >= 5, which it will be since rxBitPeriodA >= 34
+
+                                { Bit periods of 33/33.5 constitute a special case since the lowest supported bit period
+                                    for most steps in the receive loop is 34 clocks. Sampling the stop bit as early as possible
+                                    and using the lowest bit periods may allow it to work. }
+                                { Todo: test this. }
+                        if_c    mov         rxBitPeriodA, #34
+                        if_c    mov         rxBitPeriodB, #34
+                        if_c    mov         startBitWait, #5                        '5 is smallest supported
+
+                                { In both cases -- 33/33.5 or 34+ -- rxBitPeriod5 is txBitPeriodA, since the interval after sampling
+                                    bit 5 (the hubop interval) can be 33 clocks. Therefore, rxBitPeriod5 aliases txBitPeriodA. }
+
+                                { cmdPorch and ibTimeout are specified in multiples of 16-bit intervals (loaded previously). }
+                                shl         _y, #3                                  '_y = 16-bit period, in clocks
+                                mov         _x, cmdPorch16Bits
+                                call        #Multiply
+                                mov         recoveryTime, _x 
+                                mov         _x, ibTimeout16Bits
+                                call        #Multiply
+                                mov         ibTimeout, _x
+
+                                { Calculate breakMultiple (breakThresholdClocks/cmdPorch or 1, whichever is greater). }
+                                mov         _x, breakThreshold
+                                mov         _y, recoveryTime
+                                call        #Divide
+                                mov         breakMultiple, _y
+                                min         breakMultiple, #1
+                                
+                                { All done. Go to next page as specified by _addr. }
+                                mov         _page, _addr
+SetBitPeriods_A_end             jmp         #ExecutePageA
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
+
+
+'2
+{ LoadSettings3
+    This page is part of the LoadSettings* group. It follows SetBitPeriods.
+}
+org cPageA
+LoadSettings3_A
+                                { Mem-lock still retained from LoadSettings1. }
+
+                                { * Assumes DriverBlock Layout * }
+
+                                { todo: implement minResponseDeleay and postTransactionWait }
+                                
+                                mov         _addr, par
+
+                                { user code timeout, as multiple of user code polling loops }
+                                add         _addr, #36
+                                rdlong      _x, _addr                               '_x = user code timeout, in microseconds or clocks
+                                shl         _x, #1                          wc      'c=1 in clocks, c=0 microseconds
+                                shr         _x, #1
+                        if_c    jmp         #:haveTimeout
+                                mov         _y, _loadMicro
+                                call        #Multiply
+:haveTimeout                    mov         _y, loadClocksPerUCLoop                 'at this point _x = user code timeout, in clocks -- may be zero
+                                call        #Divide
+                                mov         ucTimeoutMultiple, _y
+                                min         ucTimeoutMultiple, #1                   'require at least one loop
+
+                                mov         _page, #cLoadSettings4_A
+                                jmp         #ExecutePageA
+LoadSettings3_A_end
+loadClocksPerUCLoop             long        40  'todo: determine
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
+
+
+'3
+{ LoadSettings4 
+}
+org cPageA
+LoadSettings4_A
+                                { * Assumes DriverBlock Layout * }
+
+                                mov         _addr, par
 
                                 { rx pin }
-                                mov         _addr, par
                                 add         _addr, #4
                                 rdbyte      _x, _addr
                                 mov         rxMask, #1
                                 shl         rxMask, _x
-                                movs        ctrb, _x                                'ctrb mode comes later (at rxLevelIsInverted)
-
+                                movs        ctra, _x
+                                movs        ctrb, _x
+                            
                                 { tx pin }
                                 add         _addr, #1
                                 rdbyte      _x, _addr
                                 mov         txMask, #1
-                                shl         txMask, _x                              'prepping outa comes later (at txLevelIsInverted)
-
-                                { crow device address }
-                                add         _addr, #1
-                                rdbyte      _x, _addr
-                                min         _x, #1
-                                max         _x, #31
-                                movs        _RxVerifyAddress, _x
-
-                                { use baudrate and clkfreq (LONG[0]) }
-                                add         _addr, #2
-                                rdword      _loadBaud, _addr
-
+                                shl         txMask, _x
+                                or          outa, txMask                            'prep line to avoid glitch when transaction starts
+              
+                                { set up counters } 
+                                movi        ctra, #cPosDetector
+                                movi        ctrb, #cNegDetector
+                                
+                                mov         _page, #cLoadSettings5_A
+LoadSettings4_A_end 
+                                jmp         #ExecutePageA
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
 
 
+'4
+{ LoadSettings5
+}
+org cPageA
+LoadSettings5_A
+                                { * Assumes DriverBlock Layout * }
 
-LoadSettingsStart_A_end
-fit cPageALimit 'On error: page is too big.
+                                mov         _addr, par
+                               
+                                { load clockOptions, and shift the current clock source's options into lower byte } 
+                                add         _addr, #12
+                                rdlong      _loadClockOptions, _addr
+                                mov         _x, _loadClkmode
+                                and         _x, #%111                       wz      'z=1 rcslow
+                        if_z    ror         _loadClockOptions, #24                  'use byte 3 for rcslow
+                        if_z    jmp         #:done
+                                cmp         _x, #%001                       wz      'z=1 rcfast
+                        if_z    ror         _loadClockOptions, #16                  'use byte 2 for rcfast
+                        if_z    jmp         #:done
+                                mov         _x, _loadClkmode
+                                and         _x, #%11_000                    wz      'z=1 xin, z=0 xtal
+                        if_z    ror         _loadClockOptions, #8                   'use byte 1 for xin, byte 0 for xtal
+
+                                { todo: load remotePermissions }
+
+:done                           mov         _page, #cLoadSettings6_A
+LoadSettings5_A_end
+                                jmp         #ExecutePageA
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
 
 
+'5
+{ LoadSettings6
+    This is the final page of the LoadSettings group. This page releases the mem-lock, finishes interpreting
+  the settings, decides the driver's state, and what to do next.
+}
+org cPageA
+LoadSettings6_A
+                                call        #ReleaseLock
+
+                                { todo: calculate phsb reset }
+
+                                { Enable or disable Crow-level error responses. }
+                                test        _loadOtherOptions, #cEnableErrorRspFlag     wc
+                        if_c    movs        _ErrorJmp, #ExecutePageA
+                        if_nc   movs        _ErrorJmp, #ReceiveCommand
+
+                                { Calculate stopBitDuration. This value will be superceded before sending
+                                    a response if we go into autobaud mode. }
+                                mov         _x, _loadClkfreq
+                                mov         _y, #10
+                                call        #Multiply
+                                mov         _y, _loadBaud
+                                call        #Divide
+                                mov         stopBitDuration, _y
+                                mov         _x, txBitPeriodA
+                                mov         _y, #5
+                                call        #Multiply
+                                sub         stopBitDuration, _x
+                                mov         _x, txBitPeriodB
+                                shl         _x, #2
+                                sub         stopBitDuration, _x
+                                test        _loadOtherOptions, useTwoStopBitsFlag   wc
+                        if_c    add         stopBitDuration, txBitPeriodB
+
+
+                                { Write the values just derived to the DriverBlock (in the Debugging section). 
+                                    Comment-out these lines in release version. }
+                                mov         _addr, par
+                                add         _addr, #132
+                                movd        :wrValue, #rxMask 
+                                mov         _y, #14
+:wrValue                        wrlong      0-0, _addr
+                                add         _addr, #4
+                                add         :wrValue, kOneInDField
+                                djnz        _y, #:wrValue
+                                wrlong      txBitPeriodA, _addr
+                                add         _addr, #4
+                                wrlong      txBitPeriodB, _addr
+
+
+                                'send test response packet
+                                mov         _addr, par
+                                add         _addr, #132
+                                mov         _count, #64
+                                or          dira, txMask
+                                or          flagsAndBadF16, isOpenFlag
+                                call        #SendFinalAndReturn 
+
+
+                                jmp        #ReceiveCommand
+
+
+                                'todo: implement logic
+'{
+'                                test        stateAndFlags, baudTooFast      wz      'z=0 baudrate is too fast (bit period would be < 33)
+'
+'
+'
+'
+'
+'                                { Determine if the driver should enter idle mode. The driver will enter idle mode if...
+'                                    - enableDriver=0
+'                                    - useSource=0 for clock source
+'                                    - baudrate is too fast and enableAutobaud=0 }
+'                                test        _loadOtherOptions, #cEnableDriver       wc  'c=0 driver disabled
+'                        if_c    test        _loadClockOptions, #cUseSource          wc  'c=0 clock source forbidden
+'                        if_c    test        stateAndFlags, baudTooFast              wz  'z=0 baudrate is too fast (bit period would be < 33)
+'               if_c_and_nz      test        _loadClockOptions, #cEnableAutobaud     wc  'c=0 autobaud features disabled for clock
+'                        if_nc   mov         _page, #cIdle_A
+'                        if_nc   jmp         #ExecutePageA
+'
+'
+'
+
+LoadSettings6_A_end
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
+
+
+
+'19
 { Idle_A
     This page MUST be executed only by LoadSettings (_idle* inherits/aliases some values from _load*).
     This page will change the reported driver status to IdleWithBD or IdleNoBD.
@@ -1171,7 +1504,7 @@ Idle_A
                                   Exiting the Idle page (not necessarily idle mode) occurs when:
                                     (1) the changedFlag is raised, or
                                     (2) the clkfreq or clkmode values change (compared to those used last time in LoadSettings), or
-                                    (3) a break was detected (requires enableBreakDetection, and depends on _idleBreakClocks and ctrb being setup).
+                                    (3) a break was detected (requires enableBreakDetection, and depends on breakThreshold and ctrb being set up).
 
                                   In cases 1 and 2 the page exits by executing the LoadSettingsStart page. In case 3 it exits by
                                     executing the BreakHandler page.
@@ -1183,26 +1516,25 @@ Idle_A
                                     for changes at an interval that should work at any anticipated clock speed.
                                 
                                   Since this page is called only from LoadSettings* we can inherit some values by aliasing:
-                                    _idleClkfreq = _loadClkfreq = clkfreq used in last LoadSettings,
-                                    _idleClkmode = _loadClkmode = clkmode used in last LoadSettings, and
-                                    _idleBreakClocks = _loadBreakClocks = clocks per break threshold interval (guaranteed non-zero).
+                                    _idleClkfreq = _loadClkfreq = clkfreq used in last LoadSettings, and
+                                    _idleClkmode = _loadClkmode = clkmode used in last LoadSettings.
 
                                   There are two subtypes of idle mode -- with and without break detection: 
                                     - With break detection the polling interval is given by the following formula:
-                                        pollClocks = max( min(idleMaxPollClocks, _idleBreakClocks/16), idleMinPollClocks)
+                                        pollClocks = max( min(idleMaxPollClocks, breakThreshold/16), idleMinPollClocks)
                                       where min and max have their conventional meanings (not the PASM instructions), and
                                         idleMaxPollClocks = some constant that is sufficiently low enough to keep the driver responsive
                                                           at any anticipated clock speed. A value of 5000 means that the driver should respond
                                                           within half-a-second at the lowest supported speed of 10kHz.
-                                        _idleBreakClocks/16 = 1/16th the break threshold in clocks, from the latest LoadSettings call.
+                                        breakThreshold/16 = 1/16th the break threshold in clocks, from the latest LoadSettings call.
                                         idleMinPollClocks = a constant that is sufficiently large enough to prevent the polling
                                                           loop from experiencing waitcnt rollover.
                                     - Without break detection idleMaxPollClocks is used. }
 
                                 { Determine the poll interval, in clocks, according to the formula in the notes above. }
                                 mov         _idlePoll, idleMaxPollClocks            'default if no break detection used
-                                test        stateAndFlags, #cEnableBreaks   wc
-                        if_c    mov         _x, _idleBreakClocks
+                                test        stateAndFlags, enableBreaksFlag   wc
+                        if_c    mov         _x, breakThreshold
                         if_c    shr         _x, #4                                  '_x is 1/16th of break threshold in clocks
                         if_c    max         _idlePoll, _x                           '(_x being zero is OK) 
                         if_c    min         _idlePoll, idleMinPollClocks
@@ -1212,13 +1544,13 @@ Idle_A
                         if_nc   movs        stateAndFlags, #cIdleNoBD
                                 wrbyte      stateAndFlags, stateAddr
 
-                                { A break condition is detected if _idleBreakClocks/_idlePoll consecutive polling intervals pass with
-                                    the rx line always at zero (or one interval when _idleBreakClocks < _idlePoll). }
-                        if_c    mov         _x, _idleBreakClocks                    '_idleBreakClocks is always non-zero by LoadSettings (but would be OK anyway)
+                                { A break condition is detected if breakThreshold/_idlePoll consecutive polling intervals pass with
+                                    the rx line always at zero (or one interval when breakThreshold < _idlePoll). }
+                        if_c    mov         _x, breakThreshold                      'breakThreshold is always non-zero by LoadSettings (but would be OK anyway)
                         if_c    mov         _y, _idlePoll                           '_idlePoll >= idleMinPollClocks > 0
                         if_c    call        #Divide                                 '_y = floor(_x-before/_y-before) = num poll intervals per break threshold
-                                test        stateAndFlags, #cEnableBreaks   wc      'reset c after Divide call
-                        if_c    mov         _idleBDReset, _y                wz      'z=1 result of division was zero (_idleBreakClocks < _idlePoll)
+                                test        stateAndFlags, enableBreaksFlag   wc    'reset c after Divide call
+                        if_c    mov         _idleBDReset, _y                  wz    'z=1 result of division was zero (breakThreshold < _idlePoll)
                   if_c_and_z    mov         _idleBDReset, #1                        '  require a minimum of one full interval in that case (would get djnz wraparound othws)
                         if_c    add         _idleBDReset, #1                        'add 1 since the djnz test occurs immediately after the reset
 
@@ -1250,215 +1582,24 @@ Idle_A
 
                                 { Reset break detection countdown if the line was non-zero at any point in the past interval. }
                         if_c    cmp         _idleCheck, _idleCurrCount      wz      'z=0 rx line was non-zero at some point
-                    if_c_and_nz mov         _idleBDCountdown, _idleBDReset
+                    if_c_and_nz mov         _idleCountdown, _idleBDReset
 
                                 { Now test if a break condition exists (only 'if_c'). }
-                        if_c    djnz        _idleBDCountdown, #:loop        wz      'exit (don't jump) if break condition detected (z=1)
+                        if_c    djnz        _idleCountdown, #:loop          wz      'exit (don't jump) if break condition detected (z=1)
                         if_nc   jmp         #:loop
 
                                 { REPEAT WARNING: don't change loop above without recalculating idleMinPollClocks. }
 
 :exit                   if_z    mov         _page, #cBreakHandler_A
-                        if_nz   mov         _page, #cLoadSettingsStart_A
+                        if_nz   mov         _page, #cLoadSettings1_A
                                 jmp         #ExecutePageA
 
 idleMinPollClocks     long    100       'based on instructions in loop; manual count gives 89, so 100 should be safe (todo: test)
 Idle_A_end
 idleMaxPollClocks     long    5000      'see notes at top of code page
-fit cPageALimit 'On error: page is too big.
+fit cPageALimit 'On error: page too big. Refer to Paging Constants.
 
 
-
-{ CalculateBitPeriods_A
-    This page calculates the bit periods based on currBaudrate and clkfreq (LONG[0]). It also calculates startBitWait.
-    It is designed to pass execution on to another page specified by the _addr variable. It sets _z before executing the
-  next page, which can allow another page to call this one and then return (assume _z is always set accordingly before
-  calling the other page). 
-    Before: _addr - index of page to execute afterwards
-            lock: assumed retained if data consistency is important (baudrate and clkfreq)
-    After:  _x bit 0 = 1 - bit period had to be raised to 33 clocks (baudrate too fast for clock),
-                       0 - bit period was not adjusted,
-               bits 1-31 undefined
-            _y = two bit period, in clocks
-            _z = 0 (required as flag for pages calling this one with the intention to return)
-            c-flag = 0 - bit period is 34+
-                     1 - bit period is 33/33.5
-            lock: status unchanged
-}
-org cPageA
-CalculateBitPeriods_A
-                                { * Assumes Lock Retained * }
-                                { * Assumes DriverBlock Layout * }
-
-                                { todo: redo}
-
-                                { todo: prove that it is not worth it to attempt 32 clock support (which tx code can handle). }
-
-                                { Calculate two bit period. }
-                                rdlong      _x, #0                                  '_x = clkfreq
-                                mov         _z, par
-                                add         _z, #8
-                                rdlong      _y, _z                                  '_y = currBaudrate
-                                min         _y, #300                                'silently enforce 300 bps minimum (can be supported at 10kHz < worst rcslow)
-                                shl         _x, #1
-                                call        #Divide                                 '_y = 2*clkfreq/baudrate = two bit period, in clocks
-                           
-                                { Limit bit period to at least 33 clocks and record if adjusted. Then determine if
-                                    bit period is less than 34 clocks (a special case). } 
-                                min         _y, #66                         wc      'c=1 bit period less than 33 (baudrate too fast for clock)
-                                muxc        _x, #1
-                                cmp         _y, #68                         wc      'c=1 bit period is 33/33.5; c=0 34+
-
-                                { Two bit periods -- A and B -- are used to approximate the true bit period to half clock resolution. 
-                                    The transmit code can support 33 clocks without problems. }
-                                mov         txBitPeriodA, _y
-                                shr         txBitPeriodA, #1
-                                mov         txBitPeriodB, txBitPeriodA
-                                test        _y, #1                          wz      'z=0 the two bit period is odd, so bit period is x.5
-                        if_nz   add         txBitPeriodB, #1
-                                
-                                { For bit periods of 34+ the rx bit periods are the same as the tx ones. }
-                        if_nc   mov         rxBitPeriodA, txBitPeriodA
-                        if_nc   mov         rxBitPeriodB, txBitPeriodB
-                        if_nc   mov         startBitWait, rxBitPeriodB              'startBitWait = 1/2 bit period - 10 clocks (10 clocks are 'baked-in' to wait instrs)
-                        if_nc   shr         startBitWait, #1                        '(using B with the idea that truncation tends to underestimate true value)
-                        if_nc   sub         startBitWait, #10                       'must be >= 5, which it will be since rxBitPeriodA >= 34
-
-                                { Bit periods of 33/33.5 constitute a special case since the lowest supported bit period
-                                    for most steps in the receive loop is 34 clocks. Sampling the stop bit as early as possible
-                                    and using the lowest bit periods may allow it to work. }
-                                { Todo: test this. }
-                        if_c    mov         rxBitPeriodA, #34
-                        if_c    mov         rxBitPeriodB, #34
-                        if_c    mov         startBitWait, #5                        '5 is smallest supported
-
-                                { In both cases -- 33/33.5 or 34+ -- rxBitPeriod5 is txBitPeriodA, since the interval after sampling
-                                    bit 5 (the hubop interval) can be 33 clocks. Therefore, rxBitPeriod5 aliases txBitPeriodA. }
-            
-                                { All done. }
-                                mov         _z, #0                                  '_z used as flag value by Idle page
-                                mov         _page, _addr
-CalculateBitPeriods_A_end       jmp         #ExecutePageA
-fit cPageALimit 'On error: page is too big.
-
-
-
-
-{ LoadSettingsStart_A
-
-}
-org cPageA
-LoadSettingsStart_A
-
-
-LoadSettingsStart_A_end
-fit cPageALimit 'On error: page is too big.
-
-
-{ LoadSettingsStart_A
-
-}
-org cPageA
-LoadSettingsStart_A
-
-
-LoadSettingsStart_A_end
-fit cPageALimit 'On error: page is too big.
-
-{ LoadSettingsFinish_A
-
-}
-org cPageA
-LoadSettingsFinish_A
-
-                                call        #ReleaseLock
-
-LoadSettingsFinish_A_end
-fit cPageALimit 'On error: page is too big.
-
-
-
-
-
-
-org cPageA
-Calc2
-                                mov         _x, _loadClkFreq
-                                mov         _y, #10
-                                call        #Multiply
-                                mov         _y, _loadBaud
-                                call        #Divide
-                                mov         stopBitDuration, _y
-                                mov         _x, bitPeriod0
-                                mov         _y, #5
-                                call        #Multiply
-                                sub         stopBitDuration, _x
-                                mov         _x, bitPeriod1
-                                shl         _x, #2
-                                sub         stopBitDuration, _x
-                                test        _loadOptions, #cUseTwoStopBits      wc
-                        if_c    add         stopBitDuration, bitPeriod1             'stopBitDuration ready                                
-
-                                mov         _x, _loadClkFreq
-                                mov         _y, k1000
-                                call        #Divide
-                                mov         _loadClkPerMS, _y                              'clocks per millisecond
-
-                                mov         _x, _loadIBTimeoutMS
-                                call        #Multiply
-                                mov         ibTimeout, _x                           'ibTimeout ready
-
-                                mov         recoveryTime, _loadTwoBit
-                                shl         recoveryTime, #3                        'recoveryTime ready
-
-                                mov         _x, _loadClkPerMS
-                                mov         _y, _loadBreakMS
-                                call        #Multiply
-                                mov         _y, recoveryTime
-                                call        #Divide
-                                min         _y, #1
-                                mov         breakMultiple, _y                       'breakMultiple ready
-
-                                mov         rxPhsbReset, #19
-                                add         rxPhsbReset, startBitWait
-                                add         rxPhsbReset, bitPeriod0                 'rxPhsbReset ready (= 5 + startBitWait + bitPeriod0 + 5 + 4 + 4 + 1)
-
-                                mov         _page, #cCalc3
-                                jmp         #ExecutePageA
-
-Calc2_end
-k1000                           long    1000
-
-fit cPageALimit 'On error: page is too big.
-
-org cPageA
-Calc3 
-
-                                { rxPin and txPin are one byte values in the control block. txPin is immediately
-                                    after rxPin. }
-
-                                mov         _addr, par                          'rxPin
-                                add         _addr, #32
-                                rdbyte      _x, _addr
-                                mov         rxMask, #1
-                                shl         rxMask, _x
-                                movs        ctrb, _x
-                                'movs        lowCounterMode, lowCounterMode
-'                                mov         ctrb, lowCounterMode
-
-                                add         _addr, #1                           'txPin (immediately after rxPin)
-                                rdbyte      _x, _addr
-                                mov         txMask, #1
-                                shl         txMask, _x 
-                                or          outa, txMask
-
-                                call        #Trace
-
-                                mov         _page, #cReceiveExtra_B
-                                call        #LoadPageB
-
-Calc3_end                       jmp         #RecoveryMode
-fit cPageALimit 'On error: page is too big.
 
 
 { Entry
@@ -1470,8 +1611,8 @@ Entry
                                 or          dira, pin27
                                 or          outa, pin27
 
-                                wrword      par, #8       'zero trace addresses
-                                wrlong      par, #12
+                                wrword      par, #6       'zero trace addresses
+                                wrlong      par, #8
                                 
                                 jmp         #FinishInit
 
@@ -1675,7 +1816,7 @@ FramingErrorHandler
   lock fast enough. In this case there would be three hubops: loading the next buffer set to use, checking
   if it is locked/owned, and then setting the buffer write instruction.
 }
-rxReadDriverLock                rdword      _rxLockingUser, driverLockAddr          'check if user code has driver lock (will be zero if unlocked)
+rxReadDriverLock                rdlong      _rxLockingUser, par                     'check if user code has driver lock (upper word will be zero if unlocked)
 rxWriteByte             if_z    wrbyte      _rxPrevByte, _rxAddr                    'Write 4 - write byte to command payload buffer (if writeVetoes are clear) 
 
 { todo: (3/28) can tx hubop be used to provide state information to ensure safety when out-cogs change clock rate? }
@@ -1759,7 +1900,7 @@ rxH1                            mov         payloadSize, _rxPrevByte            
                                 or          payloadSize, rxByte                     ' D
 
 rxH2                            mov         _rxRemaining, payloadSize               'A - _rxRemaining keeps track of how many payload bytes are left to receive
-                                mov         _rxAddr, cmdBufferResetAddr             ' B - reset address for writing command payload to hub
+                                mov         _rxAddr, cmdBuffResetAddr               ' B - reset address for writing command payload to hub
                                 mov         port_SH, #0                             ' C - set implicit port 0
                                 mov         token_SH, rxByte                        ' D - save token for responses
 rxH3
@@ -1774,7 +1915,9 @@ rxByte                          long    0-0                                     
                                 mov         port_SH, rxByte                         ' C - start saving explicit port
                                 shl         port_SH, #8                             ' D
 rxH5_Optional
+baudTooFastFlag
 kOneInUpperWord                 long    $0001_0000                                  'A - (spacer nop) used to increment upper word counts lowBitCount and badF16Count
+enableBreaksFlag
 kOneInDField                    long    |< 9                                        ' B - (spacer nop) 
 propCrowAdminPort               long    cPropCrowID                                 ' C - (spacer nop) cPropCrowID required to be two byte value
                                 or          port_SH, rxByte                         ' D - finished saving explicit port
@@ -1786,7 +1929,7 @@ rxH6_F16C0                      mov         _rxCountdown, _rxRemaining          
 rxH7_F16C1
                         if_z    mov         _RxStartWait, rxExit                    'A - ...exit receive loop if no bytes in first chunk (empty payload)
                                 mov         _RxHubop, rxWriteByte                   ' B - setup to write payload byte to buffer
-                                cmp         _rxLockingUser, #0              wz      ' C - test if the driver is locked; z=0 driver locked by _rxLockingUser
+                                test        _rxLockingUser, kUpperWordMask  wz      ' C - test if the driver is locked (in upper word); z=0 driver is locked
                                 muxnz       _rxMixed, driverLockedFlag              ' D - veto all buffer writes if driver is locked
 
 { rxP_0 - first payload byte of first chunk }
@@ -1798,7 +1941,7 @@ rxP_0                   if_z    mov         _rxOffset, #8                       
 { rxP_Repeating - any payload byte after the first in a chunk }
 rxP_Repeating           if_nz   mov         _rxOffset, #0                           'A - keep repeating if payload bytes in chunk (automatically go to RxP_F16C0 otherwise)
 writeVetoesMask                 long    $e000                                       ' B - (spacer nop) used for _rxMixed
-                                cmp         payloadSize, cmdBufferMaxSize   wz, wc  ' C - check if command payload size exceeds buffer capacity
+                                cmp         payloadSize, cmdBuffSize        wz, wc  ' C - check if command payload size exceeds buffer capacity
                 if_nc_and_nz    or          _rxMixed, tooBigFlag                    ' D - veto all remaining payload buffer writes if payload exceeds capacity
 
 { rxP_F16C0 - F16 C0 for a payload chunk }
@@ -1810,6 +1953,7 @@ rxP_F16C0                       or          _rxMixed, nonPayloadFlag            
 { rxP_F16C1 - F16 C1 for a payload chunk }
 rxP_F16C1                       add         _rxCountdown, #1                wz      'A - undo automatic decrement; check if _rxCountdown==0 (next chunk empty)
                         if_z    mov         _RxStartWait, rxExit                    ' B - ...exit receive loop if no bytes in next chunk (all bytes received)
+useTwoStopBitsFlag
 driverLockedFlag                long    |< 14                                       ' C - (spacer nop) part of writeVetoes in _rxMixed
 tooBigFlag                      long    |< 15                                       ' D - (spacer nop) part of writeVetoes in _rxMixed
 
@@ -1929,7 +2073,7 @@ ProcessCommand
                                 { admin command -- two admin ports open: 0 and propCrowAdminPort }
 
                                 cmp         port_SH, propCrowAdminPort      wz      'z=1 PropCrow admin command
-                        if_z    mov         _page, #cPropCrowAdmin
+                        if_z    mov         _page, #cPropCrowAdmin_A
                         if_z    jmp         #ExecutePageA
 
                                 cmp         port_SH, #0                     wz      'z=1 standard admin from Crow specification
@@ -1948,11 +2092,11 @@ StandardAdminStart
                         if_z    jmp         #SendFinalResponse                      'safe if muted -- sending routines won't send in that case
                         
                                 { for all other commands, first byte is command type }
-                                rdbyte      _x, rxBufferAddr
+                                rdbyte      _x, cmdBuffAddr
 
                                 { if type not 1 (echo/hostPresence) then continue on paged code }
                                 cmp         _x, #1                          wz
-                        if_nz   mov         _page, #cStandardAdminCont
+                        if_nz   mov         _page, #cStandardAdmin_A
                         if_nz   jmp         #ExecutePageA
 
                                 { echo/hostPresence require minimum of two bytes of payload }
@@ -1961,7 +2105,7 @@ StandardAdminStart
 
                                 { the difference between echo/hostPresence is that echo expects a response }
                                 test        flagsAndBadF16, isOpenFlag      wc      'c=1 open transaction => response expected
-                        if_c    mov         _page, #cSendEcho
+                        if_c    mov         _page, #cSendEcho_A
                         if_c    jmp         #ExecutePageA                           'echo handled with paged code
 
                                 { The command is hostPresence, for which nothing needs to be done. It is supported as a way for the host
@@ -1974,23 +2118,8 @@ StandardAdminStart
     This routine is called by ReceiveCommandFinish to invoke the user code registered to the port.
 }
 UserPortLookup
-                                mov         _page, #cUserCommand
+                                mov         _page, #cUserCommand_A
                                 jmp         #ExecutePageA
-
-
-
-{ LockSharedAccess
-  A call to LockSharedAcccess must be followed by a call to UnlockSharedAccess.
-}
-'LockSharedAccess
-                                'or      outa, pin27
-'LockSharedAccess_ret            ret
-
-{ UnlockSharedAccess
-}
-'UnlockSharedAccess
-                                'andn    outa, pin27
-'UnlockSharedAccess_ret          ret
 
 
 { TxSendBytes (call)
@@ -2287,7 +2416,7 @@ rxMixedReset            long    $3fff       'byteCount = -1, nonPayloadFlag = 1,
             call    #LoadPageB
 }
 LoadPageB
-:currPageB                      cmp         _page, #cInvalidPage            wz      'curr page B index stored in s-field (initially set to cInvalidPage)
+:currPageB                      cmp         _page, #cInvalidPage            wz      'curr page B in s-field (initially set to cInvalidPage); z=1 page already loaded
                         if_z    jmp         LoadPageB_ret                           'return -- page already loaded
 
                                 movs        :currPageB, _page
@@ -2295,7 +2424,7 @@ LoadPageB
                                 
                                 jmp         #_PageLookup
 ExecutePageA
-:currPageA                      cmp         _page, #cInvalidPage            wz      'curr page A index stored in s-field (initially set to cInvalidPage)
+:currPageA                      cmp         _page, #cInvalidPage            wz      'curr page A in s-field (initially set to cInvalidPage); z=1 page already loaded
                         if_z    jmp         #cPageA                                 'exit to page if already loaded
 
                                 movs        :currPageA, _page
@@ -2328,20 +2457,13 @@ CloseTransaction_ret            ret
 
 { ErrorHandler (jmp)
     Use this routine to process low-level errors -- errors that will be reported to the host using a 
-  Crow error response. This routine determines whether the error should be reported, and then calls the
-  sending code if necessary. In any case execution eventually goes to ReceiveCommand. 
+  Crow error response.
     Arguments/Results
         Before:  _x  = error code,
                 (_y) = extra data for some custom errors
-        After:  not applicable, execution goes to ReceiveCommand
 }
-ErrorHandler
-                                test        otherOptions, #cSendErrorFlag   wc      'c=0 error responses disabled
-                                test        flagsAndBadF16, isOpenFlag      wz      'z=1 no open transaction
-                   if_nc_or_z   jmp         #ReceiveCommand 
-
-                                mov         _page, #cSendError
-                                jmp         #ExecutePageA
+ErrorHandler                    mov         _page, #cSendError_A
+_ErrorJmp                       jmp         #ExecutePageA                           's-field set to ExecutePageA or ReceiveCommand by LoadSettings per enableErrorResponses
 
 
 { CopyString, CopyStringFromTable (both call)
@@ -2433,13 +2555,11 @@ traceCnt        long    0
 
 
 { Misc Variables and Constants}
-lowCounterMode      long    $3000_0000
-cmdBufferMaxSize    long    cCmdBufferMaxSize
 kUpperWordMask      long    $ffff_0000
 
 pin27 long |< 27
 
-pause long 40_000_000
+pause long 4_000_000
 
 { This is the end of permanent code. Initialization code, paged code, and res'd variables follow. (The
     initialization code -- FinishInit -- may actually start within the designated permanent code area.) }
@@ -2459,7 +2579,7 @@ FinishInit
                                 add         _addr, #1
                                 mov         stateAddr, _addr                        'stateAddr
 
-                                add         _addr, #96
+                                add         _addr, #95
                                 rdbyte      memLockID, _addr                        'memLockID
 
                                 { Disable the memory locking mechanism if no valid lock ID provided. }
@@ -2480,17 +2600,21 @@ FinishInit
                                 add         :load, kOneInDField
                                 djnz        _initTmp_SH, #:loop
 
+                                { The cmdBuffResetAddr (used in receive loop) is cmdBuffAddr-1 since pre-increment is used. }
+                                mov         cmdBuffResetAddr, cmdBuffAddr
+                                sub         cmdBuffResetAddr, #1
+
                                 { Write the cogID field. }
                                 add         _addr, #12
                                 cogid       _x
                                 wrbyte      _x, _addr
 
-                                { Misc }
+                                { One-time counter set up. }
+                                mov         frqa, #1
                                 mov         frqb, #1
 
                                 { Done with one-time initialization constants, now load settings. }
-
-                                mov         _page, #cLoadSettingsStart_A
+                                mov         _page, #cLoadSettings1_A
                                 jmp         #ExecutePageA
 
 initRetainLockSkip              jmp         RetainLock_ret
@@ -2520,52 +2644,55 @@ _pageAddr       res
 '_idleWait in SPRs
 
 
+{ General Temporaries
+
+
+}
+
+
 _idleBDReset
-_loadBaud
 _rcvyCurrPhsb
 _rxLastWait1
 _txMaxChunkRemaining    res
 
 _idlePoll
-_loadIBTimeoutMS
 _copyIndex
 _rxAddr         res
 
-_idleCountdown      'may alias _idleBreakClocks since _idleBreakClocks not used in loop
-_idleBreakClocks    'must alias _loadBreakClocks
-_loadBreakMS    'todo update
+_idleCountdown
 _copySize
+_loadBaud
 _rcvyPrevPhsb
 _txAddr         res
 
 _idlePrevCount
-_loadOptions
+_loadOtherOptions
 _copyMaxSize
 _rxCountdown
 _txCount        res
 
 _idleClkfreq     'must alias _loadClkfreq
-_loadClkFreq
+_loadClkfreq
 _copyCount
 _rxMixed  
 _txNextByte     res
 
 
 _idleClkmode     'must alias _loadClkmode
-_loadClkMode
+_loadClkmode
 _copyDestAddr
 _rxLockingUser
 _txByte         res
 
 _idleCheck
-_loadTwoBit
 _copySrcAddr
+_loadMicro
 _txF16L
 _rxPrevByte         res
 
 _idleCurrCount
-_loadClkPerMS
 _copyByte
+_loadClockOptions
 _txF16U
 _rxRemaining        res
 
@@ -2595,9 +2722,9 @@ payloadSize     res
 '
 '{ Constants (after initialization) }
 'accessLockID            res
-'rxBufferAddr            res
+'cmdBuffAddr            res
 'cmdBufferResetAddr      res
-'txBufferAddr            res
+'rspBuffAddr            res
 'numUserPortsAddr        res
 'maxUserPorts            res
 'userPortsAddr           res
@@ -2611,6 +2738,7 @@ payloadSize     res
     Starting with cmdBuffAddr, these must appear in the same order as in the driver block.
 }
 memLockID               res
+cmdBuffResetAddr        res
 cmdBuffAddr             res
 rspBuffAddr             res
 userPortsTableAddr      res
@@ -2623,29 +2751,35 @@ rspBuffSize             res
 maxNumUserPorts         res
 
 
+
 { Global Settings Variables
     These values are determined by the LoadSettings* pages.
     See also Fixed Location Global Settings Variables.
+
+    Debugging: these must appear in order as in DriverBlock.
 }
 rxMask              res
 txMask              res
 rxBitPeriodA        res
 rxBitPeriodB        res
-startBitWait        res
-stopBitDuration     res
-breakMultiple       res
+startBitWait        res     'in clocks; offset from start bit edge to start bit sampling (which should occur at start bit edge + 1/2 bit period)
+stopBitDuration     res     'in clocks; 5*txBitPeriodA + 4*txBitPeriodB + stopBitDuration = byte duration
+breakThreshold      res     'break threshold in clocks
+breakMultiple       res     'the number of command porch testing loops during which the rx line is always 0 before a break condition is declared (always >= 1) 
 recoveryTime        res
-ibTimeout           res
+ibTimeout           res     'interbyte timeout, in clocks
 rxPhsbReset         res
+ucTimeoutMultiple   res     'user
+cmdPorch16Bits      res     'as multiple of 16-bit periods; never zero
+ibTimeout16Bits     res     'the interbyte timeout as a multiple of 16-bit periods; may be zero
 
-minRspDelay         res
-userCodeTimeout     res
+
 
 { stateAndFlags
     byte 0 - the driver state; WriteState writes this byte to the driver block for diagnostic and runtime use by outside code
-    bit 9 - not used; this allows using movs to set the state
-    bit 10 - enableBreaksFlag
-
+    bit 8 - not used; this allows using movs to set the state
+    bit 9 - enableBreaksFlag
+    bit 16 - baudTooFastFlag, set by SetBitPeriods
 }
 stateAndFlags       res
 stateAddr           res
